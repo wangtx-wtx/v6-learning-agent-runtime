@@ -201,5 +201,14 @@ class GatewayClient:
 gateway = GatewayClient()
 
 
+async def aclose() -> None:
+    """关闭共享连接池（应用停机时调用，方案 3.1）。"""
+    global _pool
+    with _pool_lock:
+        if _pool is not None:
+            await _pool.aclose()
+            _pool = None
+
+
 # 兼容别名
 RetryableTimeout = RetryableModelError

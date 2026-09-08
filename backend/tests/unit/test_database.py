@@ -134,18 +134,23 @@ class TestWriteSemantics(DatabaseTestBase):
         self.assertEqual(len(db.fetch_all("SELECT * FROM courses")), 2)
 
     def test_multithreaded_write(self):
-        """每线程独立连接并发写入（方案 2.4）。"""
+        """多线程并发写入不冲突（方案 2.4：事务独占短连接）。"""
         db.init_db()
         errors = []
 
         def worker(tid):
             try:
-                conn = db.get_connection()  # 各线程独立连接
                 for i in range(20):
-                    with db.transaction():
+                    # 事务块内使用上下文返回的连接（与 BEGIN IMMEDIATE 同一连接）
+                    with db.transaction() as conn:
                         conn.execute(
                             "INSERT INTO courses (name) VALUES (?)", (f"t{tid}-{i}",)
                         )
+                    # 语句级原子写：短连接，也应成功
+                    db.execute(
+                        "UPDATE courses SET name=? WHERE name=?",
+                        (f"t{tid}-u{i}", f"t{tid}-{i}"),
+                    )
             except Exception as e:  # pragma: no cover
                 errors.append(e)
 
@@ -153,7 +158,7 @@ class TestWriteSemantics(DatabaseTestBase):
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=30)
+            t.join(timeout=60)
         self.assertEqual(errors, [])
         self.assertEqual(len(db.fetch_all("SELECT * FROM courses")), 80)
 

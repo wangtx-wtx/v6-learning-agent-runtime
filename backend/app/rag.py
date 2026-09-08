@@ -67,26 +67,44 @@ def rebuild_fts_all(conn: Optional[sqlite3.Connection] = None) -> int:
             conn.close()
 
 
-def fts_index_chunks(conn: sqlite3.Connection, rows: list[tuple[int, str]]) -> None:
-    """把新块写入 FTS（rowid=chunk_id, text）。须在 source_chunks 写入的同一事务中调用。"""
+def fts_index_chunks(conn: Optional[sqlite3.Connection], rows: list[tuple[int, str]]) -> None:
+    """把新块写入 FTS（rowid=chunk_id, text）。conn=None 时使用独立短连接提交。"""
     init_fts()
     if not rows:
         return
+    own = conn is None
+    if own:
+        from .database import create_connection
+        conn = create_connection()
     try:
         conn.executemany("INSERT INTO chunks_fts(rowid, text) VALUES (?,?)", rows)
+        if own:
+            conn.commit()
     except Exception as e:
         logger.warning(f"FTS 索引写入失败: {e}")
+    finally:
+        if own:
+            conn.close()
 
 
-def fts_delete_chunk_ids(conn: sqlite3.Connection, chunk_ids: list[int]) -> None:
-    """删除指定块的 FTS 行（材料重解析/删除时调用，方案 10.1）。"""
+def fts_delete_chunk_ids(conn: Optional[sqlite3.Connection], chunk_ids: list[int]) -> None:
+    """删除指定块的 FTS 行（材料重解析/删除时调用，方案 10.1）。conn=None 用独立短连接。"""
     init_fts()
     if not chunk_ids:
         return
+    own = conn is None
+    if own:
+        from .database import create_connection
+        conn = create_connection()
     try:
         conn.executemany("DELETE FROM chunks_fts WHERE rowid=?", [(i,) for i in chunk_ids])
+        if own:
+            conn.commit()
     except Exception as e:
         logger.warning(f"FTS 删除失败: {e}")
+    finally:
+        if own:
+            conn.close()
 
 
 async def embed_text(text: str) -> list[float]:

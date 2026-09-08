@@ -164,8 +164,13 @@ def ensure_schema(conn: sqlite3.Connection) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 连接管理：每线程独立连接（方案 2.4）
+# 连接管理（方案 2.4：查询线程本地；写入/事务独占短连接）
 # ---------------------------------------------------------------------------
+# 设计约束：FastAPI 异步端点全部运行在同一事件循环线程，多个协程会交错执行；
+# 若协程共享同一线程连接，各自 BEGIN IMMEDIATE 会互相冲突。因此：
+# - 读（fetch_*）：线程本地只读连接（WAL 下读者不阻塞）；
+# - 写（execute/insert/executemany）：每次调用独占短连接，语句级原子；
+# - 多步事务（transaction()）：块内独占一条短连接，统一提交/回滚。
 _thread_local = threading.local()
 _db_path_override: Optional[Path] = None
 _override_lock = threading.Lock()
@@ -184,8 +189,14 @@ def configure_db(path: str | Path) -> None:
     reset_connections()
 
 
+def is_override() -> bool:
+    """当前是否处于测试注入路径（lifespan 据此跳过真实备份等副作用）。"""
+    with _override_lock:
+        return _db_path_override is not None
+
+
 def reset_connections() -> None:
-    """关闭当前线程的连接（其他线程的连接由各自线程回收/进程退出释放）。"""
+    """关闭当前线程的读连接（各写短连接随语句结束即关闭）。"""
     conn = getattr(_thread_local, "conn", None)
     if conn is not None:
         try:
@@ -193,7 +204,6 @@ def reset_connections() -> None:
         except Exception:
             pass
     _thread_local.conn = None
-    _thread_local.in_tx = False
 
 
 def create_connection(path: str | Path | None = None) -> sqlite3.Connection:
@@ -201,17 +211,18 @@ def create_connection(path: str | Path | None = None) -> sqlite3.Connection:
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p), timeout=15.0)  # check_same_thread 默认 True：禁止跨线程共享
     conn.row_factory = sqlite3.Row
-    conn.executescript(
-        "PRAGMA journal_mode=WAL;"
-        "PRAGMA synchronous=NORMAL;"
-        "PRAGMA foreign_keys=ON;"
-        "PRAGMA busy_timeout=15000;"
-    )
+    # journal_mode 需要短暂排他锁：仅当尚未是 WAL 时设置，避免高并发下连接期报 locked
+    mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    if str(mode).lower() != "wal":
+        conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=15000")
     return conn
 
 
 def get_connection() -> sqlite3.Connection:
-    """返回当前线程的连接（首次使用时建立并校验 schema 版本）。"""
+    """当前线程的读连接（首次使用时建立并校验 schema 版本）。写操作请勿复用它。"""
     conn = getattr(_thread_local, "conn", None)
     if conn is None:
         conn = create_connection()
@@ -219,12 +230,11 @@ def get_connection() -> sqlite3.Connection:
         if report.get("newly_applied"):
             logger.info("schema 迁移: %s", report)
         _thread_local.conn = conn
-        _thread_local.in_tx = False
     return conn
 
 
 # ---------------------------------------------------------------------------
-# 事务（BEGIN IMMEDIATE + BUSY 重试）
+# 事务（独占短连接 + BEGIN IMMEDIATE + BUSY 重试）
 # ---------------------------------------------------------------------------
 _BUSY_RETRIES = 3
 
@@ -232,66 +242,74 @@ _BUSY_RETRIES = 3
 @contextmanager
 def transaction() -> Iterator[sqlite3.Connection]:
     """
-    多步写入原子性：块内所有写入共用当前线程连接，成功统一 COMMIT，失败 ROLLBACK。
-    块内调用 execute()/insert() 不会自行提交。
+    多步写入原子性：块内独占一条短连接，成功统一 COMMIT，失败 ROLLBACK 并关闭。
+    支持 SQLITE_BUSY 指数退避重试（最多 3 次）。
     """
-    conn = get_connection()
-    if getattr(_thread_local, "in_tx", False):
-        # 支持嵌套调用：内层复用外层事务
-        yield conn
-        return
+    last_err: Optional[Exception] = None
     for attempt in range(_BUSY_RETRIES):
+        conn = create_connection()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            break
         except sqlite3.OperationalError as e:
+            conn.close()
+            last_err = e
             if "locked" in str(e).lower() and attempt < _BUSY_RETRIES - 1:
                 time.sleep(0.2 * (attempt + 1))
                 continue
             raise
-    _thread_local.in_tx = True
-    try:
-        yield conn
-        conn.execute("COMMIT")
-    except Exception:
         try:
-            conn.execute("ROLLBACK")
+            yield conn
+            conn.execute("COMMIT")
+            return
         except Exception:
-            pass
-        raise
-    finally:
-        _thread_local.in_tx = False
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+    raise last_err or sqlite3.OperationalError("database busy")
 
 
 # ---------------------------------------------------------------------------
-# 统一数据访问（方案 2.5：语义拆分）
+# 统一数据访问（方案 2.5：语义拆分；写操作独占短连接，语句级原子）
 # ---------------------------------------------------------------------------
-def _finish(cur: sqlite3.Cursor) -> None:
-    """事务外自动提交；事务内由 transaction() 统一提交。"""
-    if not getattr(_thread_local, "in_tx", False):
-        get_connection().commit()
+def _write_conn() -> sqlite3.Connection:
+    return create_connection()
 
 
 def insert(sql: str, params: tuple = ()) -> int:
-    """仅用于 INSERT。返回 lastrowid。"""
-    cur = get_connection().execute(sql, params)
-    _finish(cur)
-    return int(cur.lastrowid)
+    """仅用于 INSERT。独占短连接，返回 lastrowid。"""
+    conn = _write_conn()
+    try:
+        cur = conn.execute(sql, params)
+        conn.commit()
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
 
 
 def execute(sql: str, params: tuple = ()) -> int:
-    """用于 UPDATE/DELETE/DDL。返回受影响行数（rowcount），不再返回残留 lastrowid。"""
-    cur = get_connection().execute(sql, params)
-    _finish(cur)
-    return int(cur.rowcount)
+    """用于 UPDATE/DELETE/DDL。独占短连接，返回受影响行数（rowcount）。"""
+    conn = _write_conn()
+    try:
+        cur = conn.execute(sql, params)
+        conn.commit()
+        return int(cur.rowcount)
+    finally:
+        conn.close()
 
 
 def executemany(sql: str, rows: list[tuple]) -> int:
-    """批量执行。返回影响行数合计。"""
-    conn = get_connection()
-    cur = conn.executemany(sql, rows)
-    _finish(cur)
-    return int(cur.rowcount or 0)
+    """批量执行。独占短连接，返回影响行数合计。"""
+    conn = _write_conn()
+    try:
+        cur = conn.executemany(sql, rows)
+        conn.commit()
+        return int(cur.rowcount or 0)
+    finally:
+        conn.close()
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict:

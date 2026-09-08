@@ -1,4 +1,4 @@
-﻿"""
+"""
 FastAPI 主应用 + API 路由。
 """
 import asyncio
@@ -21,6 +21,7 @@ from urllib.parse import quote
 from . import config
 from .config import OBSIDIAN_VAULT_ROOT, FRONTEND_PORT
 from .database import init_db, query, query_one, execute, fetch_one, insert
+from .lifecycle import lifespan
 from .gateway import gateway
 from .dag import DAGContext
 from .dag_lesson import build_lesson_dag
@@ -70,7 +71,12 @@ def _check_magic(data_head: bytes, ext: str) -> bool:
         return True  # 未登记的扩展名(已被 ALLOWED_EXTS 控制)
     return data_head.startswith(expected)
 
-app = FastAPI(title="v5.1 学习 Agent Runtime", description="以课程章节为核心、以证据链为约束的本地学习 Agent Runtime。", version="5.1.0")
+app = FastAPI(
+    title="v5.5 学习 Agent Runtime",
+    description="以课程章节为核心、以证据链为约束的本地学习 Agent Runtime。",
+    version="5.5.0",
+    lifespan=lifespan,
+)
 
 # ---------- CORS:收紧到明确白名单(避免任意 Origin 携带 Token) ----------
 ALLOWED_ORIGINS = [
@@ -135,23 +141,9 @@ async def mobile_token_check(request: Request, call_next):
     return await call_next(request)
 
 
-@app.on_event("startup")
-async def startup():
-    init_db()
-    # V5.5：schema 版本校验在 init_db()/get_connection() 内完成；
-    # 遗留库（无 schema_migrations）会抛 MigrationRequiredError 拒绝启动，
-    # 必须先运行 `python -m tools.migrate_database` 影子迁移（方案 2.2/2.3）。
-    # 运行时 ALTER 迁移体系已废弃，不再在启动阶段做结构变更。
-    ensure_vault_structure()
-    # 自动导入校历数据（幂等：已有数据则不重复导入）
-    try:
-        from .seed_data import seed_calendar
-        seed_calendar(force=False)
-    except Exception as e:
-        logger.warning(f"seed_calendar skipped: {e}")
-    from .backup import backup_database
-    backup_database()
-    logger.info("v5 后端启动完成，数据库已初始化")
+# 启动/关闭全部交给 lifespan（方案 3.1）：见 app/lifecycle.py。
+# V5.5：schema 版本校验在 init_db() 内完成；遗留库（无 schema_migrations）会抛
+# MigrationRequiredError 拒绝启动，必须先运行 `python -m tools.migrate_database`。
 
 
 class CourseCreate(BaseModel):
@@ -266,7 +258,7 @@ def _sha256_hex(data: bytes) -> str:
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "5.1.0"}
+    return {"status": "ok", "version": "5.5.0"}
 
 
 # ---------- 课程 ----------
@@ -615,10 +607,23 @@ async def delete_material(material_id: int):
     row = query_one("SELECT id FROM materials WHERE id=?", (material_id,))
     if not row:
         raise HTTPException(404, "材料不存在")
+    # 解析进行中不可删除（避免与 worker 竞态写 source_chunks）
+    running = query_one(
+        "SELECT id FROM parse_tasks WHERE material_id=? AND status='running'", (material_id,)
+    )
+    if running:
+        raise HTTPException(409, "材料正在解析中，请等待完成后再删除")
+    # 排队中的解析任务直接作废
+    execute(
+        "UPDATE parse_tasks SET status='cancelled', error='material deleted', "
+        " finished_at=datetime('now','localtime'), updated_at=datetime('now','localtime') "
+        "WHERE material_id=? AND status='queued'",
+        (material_id,),
+    )
     # 先删依赖其 RAG 块（source_chunks.material_id 无 CASCADE,须先手动清理）,再删材料记录
     execute("DELETE FROM source_chunks WHERE material_id=?", (material_id,))
     execute("DELETE FROM materials WHERE id=?", (material_id,))
-    # 物理文件清理交给后台 GC；此处仅删除记录与检索块
+    # 物理文件清理交给后台 GC（方案 5.x）；此处仅删除记录与检索块
     return {"id": material_id, "status": "deleted"}
 
 
@@ -701,25 +706,154 @@ async def run_events(request: Request, run_id: int):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-@app.post("/api/runs/{run_id}/rerun/{node_name}")
-async def rerun_node(run_id: int, node_name: str):
-    """从失败节点重跑：立即在前台执行（同步），更新该节点 output。"""
-    from .dag import DAGContext
-    from .workers import build_flow
+@app.post("/api/runs/{run_id}/cancel")
+async def cancel_run(run_id: int):
+    """取消任务（方案 3.4）。
+
+    queued → 直接 cancelled；running → 打 cancel_requested 标记并中断 asyncio 任务；
+    终态 → 409。已完成的节点记录保留，不删除任何材料或用户数据。
+    """
+    from .workers import worker_manager
+    run = query_one("SELECT status FROM workflow_runs WHERE id=?", (run_id,))
+    if not run:
+        raise HTTPException(404, "run 不存在")
+    status = run.get("status")
+    if status in ("completed", "failed", "cancelled"):
+        raise HTTPException(409, f"运行已结束（{status}），不能取消")
+    if status == "queued":
+        execute(
+            "UPDATE workflow_runs SET status='cancelled', updated_at=datetime('now','localtime') "
+            "WHERE id=? AND status IN ('queued','running')",
+            (run_id,),
+        )
+        execute(
+            "UPDATE run_tasks SET status='cancelled', error='cancelled by user', "
+            " finished_at=datetime('now','localtime'), updated_at=datetime('now','localtime') "
+            "WHERE run_id=? AND status IN ('queued','running')",
+            (run_id,),
+        )
+        worker_manager.notify()
+        return {"run_id": run_id, "status": "cancelled"}
+    # running：请求取消（节点边界 / 模型重试边界 / 硬中断三层保障）
+    execute("UPDATE workflow_runs SET cancel_requested=1, updated_at=datetime('now','localtime') WHERE id=?", (run_id,))
+    execute("UPDATE run_tasks SET cancel_requested=1, updated_at=datetime('now','localtime') WHERE run_id=?", (run_id,))
+    await worker_manager.cancel(run_id)
+    return {"run_id": run_id, "status": "cancellation_requested"}
+
+
+class RetryRunRequest(BaseModel):
+    from_node: Optional[str] = None
+    reuse_successful_dependencies: bool = True
+
+
+@app.post("/api/runs/{run_id}/retry")
+async def retry_run(run_id: int, body: RetryRunRequest):
+    """不可变重试（方案 3.5）：创建新 run（parent_run_id 指向原运行），
+    复制输入；可选复用已成功依赖产物，从指定节点重新排队。原运行不修改。"""
     run = query_one("SELECT * FROM workflow_runs WHERE id=?", (run_id,))
     if not run:
         raise HTTPException(404, "run 不存在")
-    dag = build_flow(run.get("workflow") or "")
-    if node_name not in dag.nodes:
-        raise HTTPException(404, f"节点 {node_name} 不存在")
-    ctx = DAGContext()
-    ctx.run_id = run_id
+    from .workers import build_flow, enqueue_workflow
+    workflow = run.get("workflow") or ""
+    dag = build_flow(workflow)  # 顺便校验 from_node 合法性
+    from_node = body.from_node
+    if from_node and from_node not in dag.nodes:
+        raise HTTPException(400, f"节点 {from_node} 不存在于 {workflow} 工作流")
+
+    new_id = insert(
+        "INSERT INTO workflow_runs (workflow, mode, course_id, lesson_id, chapter_id, status, "
+        " input_json, parent_run_id, created_at, updated_at) "
+        "VALUES (?,?,?,?,?, 'queued', ?, ?, datetime('now','localtime'), datetime('now','localtime'))",
+        (workflow, run.get("mode"), run.get("course_id"), run.get("lesson_id"),
+         run.get("chapter_id"),
+         json.dumps({**_run_input(run), "_retry": {
+             "parent_run_id": run_id,
+             "from_node": from_node,
+             "reuse": bool(body.reuse_successful_dependencies and from_node),
+         }}, ensure_ascii=False),
+         run_id),
+    )
+    enqueue_workflow(new_id)
+    return {
+        "run_id": new_id,
+        "parent_run_id": run_id,
+        "from_node": from_node,
+        "reuse_successful_dependencies": bool(body.reuse_successful_dependencies and from_node),
+        "status": "queued",
+    }
+
+
+@app.get("/api/runs/{run_id}/result")
+async def run_result(run_id: int):
+    """稳定业务 DTO（方案 12.4）：按工作流类型聚合最终 result，前端不解释 DAG 内部输出。"""
+    run = query_one("SELECT * FROM workflow_runs WHERE id=?", (run_id,))
+    if not run:
+        raise HTTPException(404, "run 不存在")
+    workflow = run.get("workflow") or ""
+    nodes = query(
+        "SELECT node_name, status, output_json FROM run_nodes WHERE run_id=? ORDER BY id",
+        (run_id,),
+    )
+    outputs = {}
+    for n in nodes:
+        try:
+            outputs[n["node_name"]] = json.loads(n["output_json"]) if n["output_json"] else {}
+        except Exception:
+            outputs[n["node_name"]] = {}
+    result: dict = {"workflow": workflow, "status": run.get("status"),
+                    "error": run.get("error")}
+    if workflow == "lesson":
+        note = query_one(
+            "SELECT id, title, status, body, markdown_path FROM notes WHERE lesson_id=? "
+            "ORDER BY id DESC LIMIT 1",
+            (run.get("lesson_id"),),
+        )
+        result["note"] = note
+        result["evidence"] = _evidence_for_owner("note", note["id"]) if note else []
+    elif workflow == "homework":
+        hw_id = _homework_id_of_run(run)
+        result["questions"] = query(
+            "SELECT id, question_no, text, student_answer, submitted_at, reveal_allowed FROM questions "
+            "WHERE homework_id=? ORDER BY question_no",
+            (hw_id,),
+        )
+        result["solutions"] = query(
+            "SELECT a.* FROM answer_items a JOIN questions q ON q.id=a.question_id "
+            "WHERE q.homework_id=? ORDER BY q.question_no",
+            (hw_id,),
+        )
+        result["conflicts"] = [s for s in result["solutions"]
+                               if (s.get("conflict") or "").lower() in ("1", "true", "conflict")]
+    elif workflow == "error":
+        result["error"] = query_one(
+            "SELECT * FROM errors ORDER BY id DESC LIMIT 1"
+        ) or None
+    elif workflow == "review":
+        result["review"] = query_one(
+            "SELECT id, kind, status, outline, self_test, score FROM reviews ORDER BY id DESC LIMIT 1"
+        ) or None
+    return {"run_id": run_id, **result}
+
+
+def _homework_id_of_run(run: dict) -> int:
+    return int(_run_input(run).get("homework_id") or 0)
+
+
+def _run_input(run: dict) -> dict:
     try:
-        ctx.input = json.loads(run.get("input_json") or "{}") if isinstance(run.get("input_json"), str) else (run.get("input_json") or {})
+        inp = json.loads(run.get("input_json") or "{}")
     except Exception:
-        ctx.input = {}
-    result = await dag.rerun_node(ctx, node_name)
-    return {"run_id": run_id, "node": node_name, "result": result}
+        inp = {}
+    return inp if isinstance(inp, dict) else {}
+
+
+def _evidence_for_owner(owner_type: str, owner_id: int) -> list[dict]:
+    return query(
+        "SELECT e.*, c.locator AS chunk_locator FROM evidence_links e "
+        "LEFT JOIN source_chunks c ON c.id=e.chunk_id "
+        "WHERE e.owner_type=? AND e.owner_id=?",
+        (owner_type, owner_id),
+    )
 
 
 @app.post("/api/migrate")

@@ -1,4 +1,4 @@
-﻿"""
+"""
 DAG 执行引擎（V5.4 重写）。
 
 对照审查报告整改：
@@ -50,13 +50,22 @@ class BusinessError(Exception):
     """业务级错误。直接失败，绝不重试。"""
 
 
+class RunCancelledError(BaseException):
+    """运行被用户取消（方案 3.4）。
+
+    继承 BaseException：避免被节点 handler 的 `except Exception` 吞掉或误转成
+    BusinessError，确保取消语义穿透整棵 DAG。
+    """
+
+
 # ---- 运行状态机 ----------------------------------------------------------------------
 ALLOWED_RUN_TRANSITIONS: dict[str, set[str]] = {
-    "queued":    {"running", "cancelled"},
-    "running":   {"completed", "failed", "cancelled"},
-    "completed": set(),
-    "failed":    set(),
-    "cancelled": set(),
+    "queued":     {"running", "cancelled", "failed"},
+    "running":    {"completed", "failed", "cancelled", "interrupted"},
+    "completed":  set(),
+    "failed":     set(),
+    "cancelled":  set(),
+    "interrupted": {"queued"},   # 重启后由 recover_interrupted_tasks 恢复
 }
 
 
@@ -149,19 +158,55 @@ class DAG:
             raise RuntimeError(f"DAG {self.name}: 仍存在环，无法分层")
         return layers
 
-    async def run(self, ctx: "DAGContext") -> dict[str, dict]:
+    async def run(self, ctx: "DAGContext", reuse_outputs: Optional[dict[str, dict]] = None,
+                  reuse_until: Optional[str] = None) -> dict[str, dict]:
+        """
+        按拓扑层级并发执行。
+
+        reuse_outputs + reuse_until（方案 3.5 重试）：从某个节点的层级之前全部复用
+        已成功产物（记录为 reused 节点，审计可见），该层级起正常执行。
+        """
         if not self._validated:
             self._validate()
         outputs: dict[str, dict] = {}
-        for layer in self.topological_layers():
-            coros = [self._run_node_wrapped(name, ctx) for name in layer]
+        reuse_map = dict(reuse_outputs or {})
+        layers = self.topological_layers()
+        cut_idx = len(layers)
+        if reuse_until is not None:
+            if reuse_until not in self.nodes:
+                raise BusinessError(f"重试起点节点不存在: {reuse_until}")
+            for i, layer in enumerate(layers):
+                if reuse_until in layer:
+                    cut_idx = i
+                    break
+        for li, layer in enumerate(layers):
+            await ctx.raise_if_cancelled()          # 取消检查：每拓扑层开始前
+            if li < cut_idx and reuse_map:
+                coros = [
+                    self._run_reused(name, ctx, reuse_map) if name in reuse_map
+                    else self._run_node_wrapped(name, ctx)
+                    for name in layer
+                ]
+            else:
+                coros = [self._run_node_wrapped(name, ctx) for name in layer]
             results = await asyncio.gather(*coros)
             for name, out in zip(layer, results):
                 outputs[name] = out
                 ctx.set_output(name, out)
         return outputs
 
+    async def _run_reused(self, name: str, ctx: "DAGContext", reuse_map: dict[str, dict]) -> dict:
+        """复用上一轮已成功产物，写一条 reused 节点记录（审计链不丢）。"""
+        node = self.nodes[name]
+        started = time.time()
+        node_id = ctx.start_node(node, LOCAL_MODEL, datetime.now().isoformat(), attempt=1)
+        out = dict(reuse_map.get(name) or {})
+        ctx.finish_node(node_id, "reused", out, started=started, attempt=1,
+                        latency_msf=0)
+        return out
+
     async def _run_node_wrapped(self, name: str, ctx: "DAGContext") -> dict:
+        await ctx.raise_if_cancelled()                  # 取消检查：每节点开始前
         node = self.nodes[name]
         if node.is_local:
             return await self._run_node(node, LOCAL_MODEL, ctx, attempt=1)
@@ -178,6 +223,7 @@ class DAG:
         last_err: Optional[BaseException] = None
         for idx, model_id in enumerate(candidates):
             attempt = idx + 1
+            await ctx.raise_if_cancelled()              # 取消检查：模型重试前
             try:
                 return await self._run_node(node, model_id, ctx, attempt)
             except (AuthError, BadRequestError, BusinessError):
@@ -215,6 +261,12 @@ class DAG:
             ctx.finish_node(node_id, "success", result, started=started, attempt=attempt,
                             latency_msf=int((time.time() - started) * 1000))
             return result
+        except (asyncio.CancelledError, RunCancelledError):
+            # 取消也要落节点记录，避免 run_nodes 永远停留在 running
+            ctx.finish_node(node_id, "cancelled", result={}, started=started,
+                            attempt=attempt, error="run cancelled",
+                            latency_msf=int((time.time() - started) * 1000))
+            raise
         except Exception as e:
             ctx.finish_node(node_id, "failed", result={}, started=started,
                             attempt=attempt, error=str(e),
@@ -268,6 +320,19 @@ class DAGContext:
 
     def mark_cancelled(self):
         self._write_status("cancelled")
+
+    def mark_interrupted(self, error: str = "interrupted_by_shutdown"):
+        self._write_status("interrupted", error=error)
+
+    async def raise_if_cancelled(self):
+        """取消检查点（方案 3.4）：运行任一节点/层/模型重试前调用。"""
+        if not self.run_id:
+            return
+        row = fetch_one(
+            "SELECT cancel_requested FROM workflow_runs WHERE id=?", (self.run_id,)
+        )
+        if row and row.get("cancel_requested"):
+            raise RunCancelledError(f"run {self.run_id} 已请求取消")
 
     def _write_status(self, status: str, output: dict = None, error: str = ""):
         cur = fetch_one("SELECT status FROM workflow_runs WHERE id=?", (self.run_id,))

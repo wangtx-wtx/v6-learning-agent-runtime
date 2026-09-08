@@ -21,6 +21,8 @@ const detailError = ref('')
 
 const filter = ref<string>('all')
 const pollTimer = ref<number | null>(null)
+const cancelState = ref<'idle' | 'pending' | 'done' | 'error'>('idle')
+const cancelMsg = ref('')
 
 async function load() {
   loading.value = true
@@ -48,6 +50,7 @@ const workflows = computed(() => {
 })
 
 async function selectRun(r: WorkflowRun) {
+  resetCancelState()
   selectedRun.value = r
   selectedNodes.value = []
   detailLoading.value = true
@@ -95,6 +98,32 @@ function stopPolling() {
     window.clearInterval(pollTimer.value)
     pollTimer.value = null
   }
+}
+
+const canCancel = computed(() =>
+  ['queued', 'running'].includes(selectedRun.value?.status || ''),
+)
+
+async function cancelRun() {
+  if (!selectedRun.value) return
+  cancelState.value = 'pending'
+  cancelMsg.value = ''
+  try {
+    await RunsApi.cancel(selectedRun.value.id)
+    cancelState.value = 'done'
+    cancelMsg.value = '已请求取消'
+    const detail = await RunsApi.get(selectedRun.value.id)
+    selectedRun.value = detail.run
+    selectedNodes.value = toDagNodes((detail.nodes || []) as any)
+  } catch (e: any) {
+    cancelState.value = 'error'
+    cancelMsg.value = e?.message || String(e)
+  }
+}
+
+function resetCancelState() {
+  cancelState.value = 'idle'
+  cancelMsg.value = ''
 }
 
 watch(selectedRun, () => startPollingIfRunning())
@@ -173,9 +202,21 @@ onMounted(async () => {
                   </div>
                   <div class="flex gap-2">
                     <StatusBadge :status="selectedRun.status">{{ statusLabel(selectedRun.status) }}</StatusBadge>
+                    <button
+                      v-if="canCancel"
+                      class="btn btn-ghost !px-2 !py-1 text-xs text-rose-300 disabled:opacity-50"
+                      :disabled="cancelState === 'pending'"
+                      @click="cancelRun"
+                    >
+                      {{ cancelState === 'pending' ? '正在取消…' : '取消运行' }}
+                    </button>
                     <button class="btn btn-ghost !px-2 !py-1 text-xs" @click="closeDetail">关闭</button>
                   </div>
                 </div>
+                <p v-if="cancelMsg" class="mb-2 rounded-lg px-3 py-2 text-xs"
+                   :class="cancelState === 'error' ? 'bg-rose-950/40 text-rose-200' : 'bg-emerald-950/40 text-emerald-200'">
+                  {{ cancelState === 'error' ? '取消失败：' : '' }}{{ cancelMsg }}
+                </p>
                 <DagFlow :nodes="selectedNodes" :loading="selectedRun.status === 'running'" />
                 <p v-if="selectedRun.error" class="mt-3 rounded-lg bg-rose-950/40 px-3 py-2 text-xs text-rose-200">
                   {{ selectedRun.error }}

@@ -261,6 +261,9 @@ export const ReviewWorkflowApi = {
 export const RunsApi = {
   list: (limit = 100) => api.get<WorkflowRun[]>('/runs', { limit }),
   get: (id: number) => api.get<{ run: WorkflowRun; nodes: RunNode[] }>(`/runs/${id}`),
+  cancel: (id: number) => api.post<{ run_id: number; status: string }>(`/runs/${id}/cancel`),
+  retry: (id: number, body?: { from_node?: string; reuse_successful_dependencies?: boolean }) =>
+    api.post<{ run_id: number; parent_run_id: number; status: string }>(`/runs/${id}/retry`, body ?? {}),
 }
 
 export const ModelsApi = {

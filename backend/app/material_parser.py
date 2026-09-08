@@ -89,6 +89,22 @@ def _parse_audio(path: str) -> list[tuple]:
     return [("audio", f"[音频材料待转写: {Path(path).name}]")]
 
 
+# ------------------------------- 取消支持 -------------------------------------
+class ParseCancelled(BaseException):
+    """解析被用户取消（方案 3.4）。继承 BaseException 防止被通用 except 吞掉。"""
+
+
+def raise_if_cancelled(material_id: int) -> None:
+    """分页/分段阶段取消检查：parse_tasks.cancel_requested=1 即中断。"""
+    row = fetch_one(
+        "SELECT cancel_requested FROM parse_tasks WHERE material_id=? "
+        "ORDER BY id DESC LIMIT 1",
+        (material_id,),
+    )
+    if row and row["cancel_requested"]:
+        raise ParseCancelled(f"material {material_id} 解析已取消")
+
+
 # ------------------------------- 主入口 ---------------------------------------
 async def run_parse_material(material_id: int) -> dict:
     row = fetch_one(
@@ -98,6 +114,7 @@ async def run_parse_material(material_id: int) -> dict:
     )
     if not row:
         raise RuntimeError(f"material {material_id} 不存在")
+    raise_if_cancelled(material_id)                      # 取消检查：开始前
     execute(
         "UPDATE materials SET parser_status='parsing', status='parsing', updated_at=datetime('now','localtime') WHERE id=?",
         (material_id,),
@@ -128,6 +145,8 @@ async def run_parse_material(material_id: int) -> dict:
     chunk_count = 0
     for locator, text in located:
         for seg in split_segments(text):
+            if chunk_count and chunk_count % 50 == 0:
+                raise_if_cancelled(material_id)          # 取消检查：每 50 段
             insert(
                 "INSERT INTO source_chunks (material_id, lesson_id, chapter_id, course_id, type, locator, text, "
                 " ocr_confidence, created_at) "
@@ -136,6 +155,7 @@ async def run_parse_material(material_id: int) -> dict:
                  kind or "text", locator, seg),
             )
             chunk_count += 1
+    raise_if_cancelled(material_id)                      # 取消检查：索引/落 ready 前
     _index_material(material_id)
     execute(
         "UPDATE materials SET parser_status='ready', status='ready', parse_error=NULL, "
@@ -154,19 +174,13 @@ def _fail(material_id: int, reason: str):
 
 
 def _index_material(material_id: int) -> None:
-    """登记 FTS5 检索索引。"""
-    from .rag import init_fts
-    try:
-        init_fts()
-    except Exception as e:
-        logger.warning(f"init_fts: {e}")
+    """登记 FTS5 检索索引（FTS5 虚拟表不支持 UPSERT：先删后插幂等）。"""
+    from .rag import fts_delete_chunk_ids, fts_index_chunks
     try:
         rows = fetch_all("SELECT id, text FROM source_chunks WHERE material_id=?", (material_id,))
-        for r in rows:
-            insert(
-                "INSERT INTO chunks_fts (rowid, text) VALUES (?, ?) "
-                "ON CONFLICT(rowid) DO UPDATE SET text=excluded.text",
-                (r["id"], r.get("text") or ""),
-            )
+        if not rows:
+            return
+        fts_delete_chunk_ids([r["id"] for r in rows])
+        fts_index_chunks([(r["id"], r["text"] or "") for r in rows])
     except Exception as e:
         logger.warning(f"FTS 索引写入失败: {e}")
