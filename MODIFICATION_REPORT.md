@@ -119,7 +119,17 @@ c8d3a9d feat(gateway/rag/evidence/schema): reliable model gateway + stage-4 refi
 - 对照 `.env`  的 `V5_MOBILE_TOKEN` 开启指南 + 首次启动迁移验证脚本入 CI。
 - 数据库 AUTH/CLP 方案（多用户、鉴权策略）后续审批后实现（当前为单用户+移动 Token 方案）。
 
-## 验证记录（一键复现）
+## 审计整改（第三方监督审计报告 20260908）
+
+审计结论：与修改方案高度一致、证据链完整，未发现实质性谎报（总体匹配 ~92%）。其中点名的「立刻修复」已完成：
+
+- ✅ `dag_review._self_test` 不再静默吞异常返回空自测：改为 `raise BusinessError`（含回归测试 `TestReviewSelfTestFailure`）。
+- ✅ `main.py` 上传 `os.replace` 后补孤儿文件清理：跟踪 `final_path`，INSERT/入队失败时删除已落盘文件。
+- ✅ 额外修复审计期间发现的实际 P1：删除**已解析**材料原本因 `source_chunks` FK 无 CASCADE 而 500；现会先删子块再删记录，删除成功并清空检索块。
+
+验证：`unittest` **14/14 通过**；上传（走 `os.replace` 路径）正常；DELETE 已解析材料返回 200、chunks 清零。
+
+## 最终验证记录（一键复现）
 
 ```bash
 # 后端
