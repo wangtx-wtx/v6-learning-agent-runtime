@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import logging
 
-from .dag import DAG, DAGContext, DAGNode
+from .dag import DAG, DAGContext, DAGNode, BusinessError
 from .database import execute, fetch_all, fetch_one
 
 logger = logging.getLogger(__name__)
@@ -85,8 +85,10 @@ async def _self_test(ctx: DAGContext, model: str) -> dict:
         data = extract_json(resp.get("content", "")) or {}
         return {"self_test": data.get("questions", []) or [], "tokens_in": resp.get("tokens_in", 0),
                 "tokens_out": resp.get("tokens_out", 0)}
-    except Exception:
-        return {"self_test": []}
+    except Exception as e:
+        # 审计指出：静默吞异常会让用户拿到“空自测”假成功。若缺失必填内容则显式失败，
+        # 由 DAG 引擎标记节点失败、前端可见错误，而非产出空的自测包。
+        raise BusinessError(f"自测题生成失败: {e}") from e
 
 
 async def _persist_node(ctx: DAGContext, model: str) -> dict:

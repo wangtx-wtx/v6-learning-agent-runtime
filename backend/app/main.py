@@ -463,6 +463,7 @@ async def upload_material(file: UploadFile = File(...), lesson_id: Optional[int]
 
     # 流式写临时文件 + 实时 SHA-256 / 大小统计
     tmp_path = None
+    final_path = None
     try:
         tmp = NamedTemporaryFile(prefix="up_", suffix=suf, delete=False, dir=str(UPLOAD_DIR))
         tmp_path = tmp.name
@@ -511,6 +512,7 @@ async def upload_material(file: UploadFile = File(...), lesson_id: Optional[int]
         target = UPLOAD_DIR / safe_name
         os.replace(tmp_path, str(target))
         tmp_path = None
+        final_path = str(target)  # 审计:移动成功后若后续 INSERT 失败,也要清理这个落盘文件
 
         kind = _kind_of(suf)
         rid = execute(
@@ -524,14 +526,19 @@ async def upload_material(file: UploadFile = File(...), lesson_id: Optional[int]
         # 入库即进解析队列（后台线程读取→切分→建索引）
         from .workers import enqueue_parse
         enqueue_parse(rid)
+        final_path = None  # 成功:不再需要清理
         return {"id": rid, "status": "uploaded", "kind": kind, "name": raw_name}
     except HTTPException:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
+        if final_path and os.path.exists(final_path):
+            os.remove(final_path)
         raise
     except Exception:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
+        if final_path and os.path.exists(final_path):
+            os.remove(final_path)
         raise
 
 
@@ -618,8 +625,10 @@ async def delete_material(material_id: int):
     row = query_one("SELECT id FROM materials WHERE id=?", (material_id,))
     if not row:
         raise HTTPException(404, "材料不存在")
+    # 先删依赖其 RAG 块（source_chunks.material_id 无 CASCADE,须先手动清理）,再删材料记录
+    execute("DELETE FROM source_chunks WHERE material_id=?", (material_id,))
     execute("DELETE FROM materials WHERE id=?", (material_id,))
-    # 物理文件清理交给后台 GC；此处仅删除记录
+    # 物理文件清理交给后台 GC；此处仅删除记录与检索块
     return {"id": material_id, "status": "deleted"}
 
 

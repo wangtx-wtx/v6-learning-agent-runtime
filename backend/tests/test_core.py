@@ -84,5 +84,32 @@ class TestAppBoosts(unittest.TestCase):
         self.assertGreaterEqual(len(app.routes), 60)
 
 
+class TestReviewSelfTestFailure(unittest.TestCase):
+    """审计修复回归：_self_test 不得静默返回空，网关失败应抛 BusinessError。"""
+
+    def test_gateway_failure_raises_business_error(self):
+        import asyncio
+        import app.gateway as _gws
+        from app.dag import BusinessError
+
+        class FakeGateway:
+            async def chat(self, *a, **k):
+                raise RuntimeError("网关 500")
+
+        ctx = type("ctx", (), {"outputs": {"aggregator": {"resources": {"confirmed_errors": []}}}})()
+        # _self_test 内部 `from .gateway import gateway`,指向 app.gateway.gateway
+        orig = _gws.gateway
+        _gws.gateway = FakeGateway()
+        try:
+            async def _go():
+                from app.dag_review import _self_test
+                return await _self_test(ctx, "deepseek_v4_free")
+
+            with self.assertRaises(BusinessError):
+                asyncio.run(_go())
+        finally:
+            _gws.gateway = orig
+
+
 if __name__ == "__main__":
     unittest.main()
