@@ -264,7 +264,64 @@ export const RunsApi = {
   cancel: (id: number) => api.post<{ run_id: number; status: string }>(`/runs/${id}/cancel`),
   retry: (id: number, body?: { from_node?: string; reuse_successful_dependencies?: boolean }) =>
     api.post<{ run_id: number; parent_run_id: number; status: string }>(`/runs/${id}/retry`, body ?? {}),
+  result: (id: number) => api.get<RunResultDto>(`/runs/${id}/result`),
 }
+
+// --------- 运行结果业务 DTO（方案 13.4：前端按 workflow 类型化消费） ---------
+
+export interface RunResultBase {
+  run_id: number
+  workflow: string
+  status: string
+}
+
+export interface LessonResultDto extends RunResultBase {
+  workflow: 'lesson'
+  note?: { id: number; title: string; body: string; status: string; markdown_path?: string | null } | null
+  evidence?: Array<{ chunk_id: number | null; quote: string; verified: boolean; locator?: string }>
+  chunks?: Array<{ chunk_id: number; text: string; locator?: string; source?: string }>
+  outline?: Array<{ topic?: string }> | string[]
+  tokens?: Record<string, number>
+  [key: string]: unknown
+}
+
+export interface HomeworkResultDto extends RunResultBase {
+  workflow: 'homework'
+  questions?: Array<{
+    id: number
+    question_no: number | string
+    text: string
+    student_answer?: string | null
+    submitted_at?: string | null
+    reveal_allowed?: number | boolean
+    answer?: {
+      final_answer: string
+      solution_plan?: string
+      detailed_solution?: string
+      teaching?: string
+      conflict?: string | null
+    }
+  }>
+  solutions?: Array<Record<string, unknown>>
+  conflicts?: Array<Record<string, unknown>>
+  [key: string]: unknown
+}
+
+export interface ReviewResultDto extends RunResultBase {
+  workflow: 'review'
+  questions?: Array<{ question_no?: string; q: string; answer?: string; answered?: boolean; student_answer?: string | null; correct?: boolean | null }>
+  package?: { outline?: unknown[]; materials?: string } | null
+  score?: number | null
+  [key: string]: unknown
+}
+
+export interface ErrorResultDto extends RunResultBase {
+  workflow: 'error'
+  provisional?: Array<{ id: number; question_text: string; causes?: string[] }>
+  [key: string]: unknown
+}
+
+export type RunResultDto = LessonResultDto | HomeworkResultDto | ReviewResultDto | ErrorResultDto
 
 export const ModelsApi = {
   list: () => api.get<ModelItem[]>('/models'),

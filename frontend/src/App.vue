@@ -1,178 +1,71 @@
 <script setup lang="ts">
-import { computed, markRaw, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import DashboardPage from './components/DashboardPage.vue'
-import CoursesPage from './components/CoursesPage.vue'
-import ChaptersPage from './components/ChaptersPage.vue'
-import UploadPage from './components/UploadPage.vue'
-import LessonFlowPage from './components/LessonFlowPage.vue'
-import HomeworkFlowPage from './components/HomeworkFlowPage.vue'
-import ErrorsPage from './components/ErrorsPage.vue'
-import ReviewPage from './components/ReviewPage.vue'
-import GraphPage from './components/GraphPage.vue'
-import ModelsPage from './components/ModelsPage.vue'
-import SyncPage from './components/SyncPage.vue'
-import RunsPage from './components/RunsPage.vue'
-import NotFoundPage from './components/NotFoundPage.vue'
-import MobileUploadPage from './components/MobileUploadPage.vue'
-import MobileTokenPage from './components/MobileTokenPage.vue'
+import { computed, onMounted, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import ToastHost from './components/widgets/ToastHost.vue'
 import { useHealthStore } from './stores/health'
 
-type PageKey =
-  | 'dashboard' | 'courses' | 'chapters' | 'upload' | 'lesson-flow'
-  | 'homework-flow' | 'errors' | 'review' | 'graph'
-  | 'models' | 'sync' | 'runs' | 'm-upload' | 'm-token' | '404'
-
-const KEY_TO_HASH: Record<PageKey, string> = {
-  dashboard: '#/',
-  courses: '#/courses',
-  chapters: '#/chapters',
-  upload: '#/upload',
-  'lesson-flow': '#/lesson-flow',
-  'homework-flow': '#/homework-flow',
-  errors: '#/errors',
-  review: '#/review',
-  graph: '#/graph',
-  models: '#/models',
-  sync: '#/sync',
-  runs: '#/runs',
-  'm-upload': '#/m-upload',
-  'm-token': '#/m-token',
-  '404': '#/404',
-}
-const HASH_TO_KEY: Record<string, PageKey> = Object.fromEntries(
-  Object.entries(KEY_TO_HASH).map(([k, h]) => [h, k as PageKey])
-)
-
-const current = ref<PageKey>('dashboard')
+const router = useRouter()
+const route = useRoute()
 const sidebarOpen = ref(false)
 
 const healthStore = useHealthStore()
 
-interface NavItem { key: PageKey; label: string; icon: string }
+onMounted(() => {
+  healthStore.check()
+})
+
+interface NavItem { path: string; label: string; icon: string }
 interface NavGroup { title: string; items: NavItem[] }
 const groups: NavGroup[] = [
   {
     title: '今日',
     items: [
-      { key: 'dashboard', label: '今日总览', icon: '🗓️' },
-      { key: 'errors', label: '待确认错题', icon: '❌' },
+      { path: '/', label: '今日总览', icon: '🗓️' },
+      { path: '/errors', label: '待确认错题', icon: '❌' },
     ],
   },
   {
     title: '课程',
     items: [
-      { key: 'courses', label: '课程与考试', icon: '📚' },
-      { key: 'chapters', label: '章节进度', icon: '🗂️' },
-      { key: 'lesson-flow', label: '听课流', icon: '📝' },
+      { path: '/courses', label: '课程与考试', icon: '📚' },
+      { path: '/chapters', label: '章节进度', icon: '🗂️' },
+      { path: '/lesson-flow', label: '听课流', icon: '📝' },
     ],
   },
   {
     title: '收件箱',
     items: [
-      { key: 'upload', label: '材料收件箱', icon: '📥' },
-      { key: 'homework-flow', label: '作业处理', icon: '✏️' },
+      { path: '/upload', label: '材料收件箱', icon: '📥' },
+      { path: '/homework-flow', label: '作业处理', icon: '✏️' },
     ],
   },
   {
     title: '复习',
     items: [
-      { key: 'review', label: '复习中心', icon: '🔁' },
+      { path: '/review', label: '复习中心', icon: '🔁' },
     ],
   },
   {
     title: '系统',
     items: [
-      { key: 'models', label: '模型与额度', icon: '🤖' },
-      { key: 'sync', label: 'Obsidian 同步', icon: '🔄' },
-      { key: 'runs', label: '运行日志', icon: '📜' },
-      { key: 'm-token', label: '远程访问凭证', icon: '🔐' },
-      { key: 'm-upload', label: '移动采集', icon: '📱' },
+      { path: '/models', label: '模型与额度', icon: '🤖' },
+      { path: '/sync', label: 'Obsidian 同步', icon: '🔄' },
+      { path: '/runs', label: '运行日志', icon: '📜' },
+      { path: '/m-token', label: '远程访问凭证', icon: '🔐' },
+      { path: '/m-upload', label: '移动采集', icon: '📱' },
     ],
   },
 ]
 
-const pageMap: Record<PageKey, any> = {
-  dashboard: markRaw(DashboardPage),
-  courses: markRaw(CoursesPage),
-  chapters: markRaw(ChaptersPage),
-  upload: markRaw(UploadPage),
-  'lesson-flow': markRaw(LessonFlowPage),
-  'homework-flow': markRaw(HomeworkFlowPage),
-  errors: markRaw(ErrorsPage),
-  review: markRaw(ReviewPage),
-  graph: markRaw(GraphPage),
-  models: markRaw(ModelsPage),
-  sync: markRaw(SyncPage),
-  runs: markRaw(RunsPage),
-  'm-upload': markRaw(MobileUploadPage),
-  'm-token': markRaw(MobileTokenPage),
-  '404': markRaw(NotFoundPage),
-}
-
-const activeMeta = computed(() => {
-  if (current.value === '404') {
-    return { key: '404' as PageKey, label: '页面未找到', icon: '❓' }
-  }
-  return groups.flatMap((group: NavGroup) => group.items).find((item: NavItem) => item.key === current.value)
+const activeMeta = computed<NavItem | undefined>(() => {
+  const path = route.path === '/404' ? '/404' : route.path
+  if (path === '/404') return { path: '/404', label: '页面未找到', icon: '❓' }
+  return groups.flatMap((g: NavGroup) => g.items).find((i: NavItem) => i.path === path)
 })
 
-function normalizeHash(hash: string): string {
-  // #/m-upload?token=xxx → #/m-upload（保留 hash 中的 query 用于组件自解析 token）
-  if (!hash) return '#/'
-  const qIdx = hash.indexOf('?')
-  return qIdx >= 0 ? hash.slice(0, qIdx) : hash
-}
-
-function setCurrent(key: string) {
-  if (key === current.value) return
-  // 只允许 PageKey,过滤掉意外值
-  if (!(key in pageMap)) return
-  current.value = key as PageKey
-  const targetHash = KEY_TO_HASH[key as PageKey] || '#/'
-  // 保留 hash 中的 query（如 ?token=xxx）,仅当基础 hash 不同才更新
-  const baseHash = normalizeHash(window.location.hash)
-  if (baseHash !== targetHash) {
-    const qIdx = window.location.hash.indexOf('?')
-    const query = qIdx >= 0 ? window.location.hash.slice(qIdx) : ''
-    window.location.hash = targetHash + query
-  }
+function navigate(path: string) {
+  if (route.path !== path) router.push(path)
   sidebarOpen.value = false
-}
-
-function syncFromHash() {
-  const h = normalizeHash(window.location.hash || '#/')
-  const key = HASH_TO_KEY[h]
-  current.value = key || '404'
-}
-
-function onHashChange() {
-  syncFromHash()
-}
-
-watch(current, () => {
-  // 同步 <title>
-  const label = activeMeta.value?.label || '控制台'
-  document.title = `${label} · v5 学习控制面板`
-})
-
-onMounted(() => {
-  // 初次加载:若 URL 没有 hash,补成 #/
-  if (!window.location.hash) {
-    history.replaceState(null, '', KEY_TO_HASH[current.value])
-  } else {
-    syncFromHash()
-  }
-  window.addEventListener('hashchange', onHashChange)
-  healthStore.check()
-})
-
-onBeforeUnmount(() => {
-  window.removeEventListener('hashchange', onHashChange)
-})
-
-function goHome() {
-  setCurrent('dashboard')
 }
 </script>
 
@@ -211,10 +104,10 @@ function goHome() {
           <div class="space-y-1">
             <button
               v-for="item in group.items"
-              :key="item.key"
-              @click="setCurrent(item.key)"
+              :key="item.path"
+              @click="navigate(item.path)"
               class="group flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
-              :class="current === item.key
+              :class="route.path === item.path
                 ? 'bg-blue-600/20 font-semibold text-blue-200 shadow-[inset_0_0_0_1px_rgba(59,130,246,.28)]'
                 : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'"
             >
@@ -264,10 +157,7 @@ function goHome() {
             </div>
           </div>
         </header>
-        <component :is="pageMap[current]" @navigate="setCurrent" />
-        <div v-if="current === '404'" class="mt-4 text-center">
-          <button class="btn btn-secondary" @click="goHome">返回首页</button>
-        </div>
+        <router-view />
       </div>
     </main>
 

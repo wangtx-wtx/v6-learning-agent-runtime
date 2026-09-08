@@ -1,19 +1,25 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import * as echarts from 'echarts'
-import { GraphApi } from '../api/endpoints'
+// ECharts 按需引入（方案 13.3）：只打包图类型/组件/渲染器，单独分包
+import * as echarts from 'echarts/core'
+import { GraphChart } from 'echarts/charts'
+import { TooltipComponent, LegendComponent } from 'echarts/components'
+import { CanvasRenderer } from 'echarts/renderers'
 import type { GraphEdge, GraphNode } from '../api/endpoints'
+import { GraphApi } from '../api/endpoints'
 import PageHeader from './widgets/PageHeader.vue'
 import States from './widgets/States.vue'
 import StatusBadge from './widgets/StatusBadge.vue'
 import { graphTypeLabel, prettyJson } from '../utils/format'
+
+echarts.use([GraphChart, TooltipComponent, LegendComponent, CanvasRenderer])
 
 const nodes = ref<GraphNode[]>([])
 const edges = ref<GraphEdge[]>([])
 const loading = ref(false)
 const error = ref('')
 const chartRef = ref<HTMLDivElement | null>(null)
-let chart: echarts.ECharts | null = null
+let chart: echarts.EChartsType | null = null
 const selected = ref<GraphNode | null>(null)
 
 const TYPE_COLOR: Record<string, string> = {

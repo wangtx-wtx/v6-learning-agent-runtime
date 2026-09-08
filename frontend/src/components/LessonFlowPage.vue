@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { ChaptersApi, CoursesApi, LessonWorkflowApi, LessonsApi, RunsApi } from '../api/endpoints'
-import type { Chapter, Course, Lesson, WorkflowRun } from '../api/endpoints'
+import { ChaptersApi, CoursesApi, LessonWorkflowApi, LessonsApi, MaterialsApi, RunsApi } from '../api/endpoints'
+import type { Chapter, Course, Lesson, Material, WorkflowRun } from '../api/endpoints'
 import PageHeader from './widgets/PageHeader.vue'
 import States from './widgets/States.vue'
 import StatusBadge from './widgets/StatusBadge.vue'
@@ -20,6 +20,9 @@ const chapterId = ref<number | ''>('')
 const lessonId = ref<number | ''>('')
 const transcript = ref('')
 const date = ref(new Date().toISOString().slice(0, 10))
+// 桌面端材料选择（方案 13.5）：可勾选已解析材料注入听课流（material_ids）
+const materials = ref<Material[]>([])
+const selectedMaterialIds = ref<number[]>([])
 
 const running = ref(false)
 const error = ref('')
@@ -41,9 +44,23 @@ async function loadMeta() {
     chapters.value = chs
     lessons.value = ls
     if (!courseId.value && cs.length) courseId.value = cs[0].id
+    // 已解析/解析中材料列表（供材料勾选）
+    try {
+      materials.value = await MaterialsApi.list()
+    } catch { /* 材料列表失败不阻塞主流程 */ }
   } catch (e: any) {
     error.value = e?.message || String(e)
   }
+}
+
+const parsedMaterials = computed(() =>
+  materials.value.filter(m => ['parsed', 'ready'].includes((m.parser_status || m.status || '').toLowerCase())),
+)
+
+function toggleMaterial(id: number) {
+  const i = selectedMaterialIds.value.indexOf(id)
+  if (i >= 0) selectedMaterialIds.value.splice(i, 1)
+  else selectedMaterialIds.value.push(id)
 }
 
 const filteredChapters = computed(() =>
@@ -78,6 +95,7 @@ async function runFlow() {
       lesson_no: lesson?.lesson_no,
       date: date.value,
       transcript: transcript.value,
+      material_ids: selectedMaterialIds.value.length ? [...selectedMaterialIds.value] : undefined,
     })
     currentRunId.value = r.run_id
     await fetchRun(r.run_id)
@@ -217,6 +235,27 @@ onMounted(async () => {
           </div>
         </div>
       </div>
+
+      <!-- 桌面端材料选择（方案 13.5）：注入已解析材料 chunk 作为检索候选 -->
+      <div v-if="parsedMaterials.length" class="mt-3">
+        <label class="label">关联课程材料（可选，{{ selectedMaterialIds.length }}/{{ parsedMaterials.length }} 已选）</label>
+        <div class="flex flex-wrap gap-2">
+          <button
+            v-for="m in parsedMaterials.slice(0, 24)"
+            :key="m.id"
+            type="button"
+            class="rounded-full border px-3 py-1 text-xs transition"
+            :class="selectedMaterialIds.includes(m.id)
+              ? 'border-blue-500 bg-blue-600/20 text-blue-200'
+              : 'border-slate-700 bg-slate-900 text-slate-400 hover:border-slate-500'"
+            :title="m.display_name || m.name || `材料 #${m.id}`"
+            @click="toggleMaterial(m.id)"
+          >
+            #{{ m.id }} {{ (m.display_name || m.name || '').slice(0, 18) || '未命名' }}
+          </button>
+        </div>
+      </div>
+
       <p v-if="error" class="mt-2 text-xs text-rose-300">{{ error }}</p>
     </section>
 

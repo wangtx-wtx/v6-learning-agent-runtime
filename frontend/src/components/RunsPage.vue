@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { CoursesApi, RunsApi } from '../api/endpoints'
-import type { Course, WorkflowRun } from '../api/endpoints'
+import type { Course, RunNode, WorkflowRun } from '../api/endpoints'
 import PageHeader from './widgets/PageHeader.vue'
 import States from './widgets/States.vue'
 import StatusBadge from './widgets/StatusBadge.vue'
@@ -9,6 +9,7 @@ import DagFlow from './widgets/DagFlow.vue'
 import NodeDetail from './widgets/NodeDetail.vue'
 import { toDagNodes } from './widgets/dag-types'
 import { fmtRelative, statusLabel } from '../utils/format'
+import { useRunEvents } from '../composables/useRunEvents'
 
 const runs = ref<WorkflowRun[]>([])
 const courses = ref<Course[]>([])
@@ -18,9 +19,11 @@ const selectedRun = ref<WorkflowRun | null>(null)
 const selectedNodes = ref<ReturnType<typeof toDagNodes>>([])
 const detailLoading = ref(false)
 const detailError = ref('')
+// SSE 实时订阅（useRunEvents 内置指数退避重连与轮询降级，方案 13.2）
+const runEvents = useRunEvents()
+const liveMode = ref<'sse' | 'polling' | 'off'>('off')
 
 const filter = ref<string>('all')
-const pollTimer = ref<number | null>(null)
 const cancelState = ref<'idle' | 'pending' | 'done' | 'error'>('idle')
 const cancelMsg = ref('')
 
@@ -64,6 +67,21 @@ async function selectRun(r: WorkflowRun) {
   } finally {
     detailLoading.value = false
   }
+  // 运行中 → 订阅实时事件（SSE 优先，断线自动退避/降级轮询）
+  if (['queued', 'running'].includes(r.status)) {
+    runEvents.subscribe(r.id, (run: WorkflowRun, nodes: RunNode[]) => {
+      selectedRun.value = run
+      selectedNodes.value = toDagNodes((nodes || []) as any)
+      liveMode.value = runEvents.mode.value
+      if (['completed', 'failed', 'cancelled'].includes(run.status)) {
+        void load()   // 刷新列表状态
+      }
+    })
+    liveMode.value = runEvents.mode.value
+  } else {
+    runEvents.stop()
+    liveMode.value = 'off'
+  }
 }
 
 function courseName(id?: number | null) {
@@ -72,32 +90,10 @@ function courseName(id?: number | null) {
 }
 
 function closeDetail() {
+  runEvents.stop()
+  liveMode.value = 'off'
   selectedRun.value = null
   selectedNodes.value = []
-}
-
-function startPollingIfRunning() {
-  stopPolling()
-  if (!selectedRun.value) return
-  if (selectedRun.value.status !== 'running') return
-  pollTimer.value = window.setInterval(async () => {
-    if (!selectedRun.value) return
-    try {
-      const detail = await RunsApi.get(selectedRun.value.id)
-      selectedRun.value = detail.run
-      selectedNodes.value = toDagNodes((detail.nodes || []) as any)
-      if (detail.run.status !== 'running') stopPolling()
-    } catch {
-      stopPolling()
-    }
-  }, 2000)
-}
-
-function stopPolling() {
-  if (pollTimer.value !== null) {
-    window.clearInterval(pollTimer.value)
-    pollTimer.value = null
-  }
 }
 
 const canCancel = computed(() =>
@@ -126,10 +122,8 @@ function resetCancelState() {
   cancelMsg.value = ''
 }
 
-watch(selectedRun, () => startPollingIfRunning())
-
 onBeforeUnmount(() => {
-  stopPolling()
+  runEvents.stop()
 })
 
 onMounted(async () => {
@@ -202,6 +196,11 @@ onMounted(async () => {
                   </div>
                   <div class="flex gap-2">
                     <StatusBadge :status="selectedRun.status">{{ statusLabel(selectedRun.status) }}</StatusBadge>
+                    <span
+                      v-if="liveMode !== 'off'"
+                      class="inline-flex items-center gap-1 rounded-full border border-blue-500/40 bg-blue-950/40 px-2 py-0.5 text-[10px] text-blue-300"
+                      :title="liveMode === 'sse' ? 'SSE 实时推送已连接' : 'SSE 不可用，已降级为轮询'"
+                    >{{ liveMode === 'sse' ? '实时' : '轮询中' }}</span>
                     <button
                       v-if="canCancel"
                       class="btn btn-ghost !px-2 !py-1 text-xs text-rose-300 disabled:opacity-50"
