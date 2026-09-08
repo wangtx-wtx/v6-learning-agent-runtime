@@ -418,6 +418,146 @@ async def list_reviews():
     return query("SELECT * FROM reviews ORDER BY id DESC LIMIT 100")
 
 
+# ---------- 复习作答与 SM-2 闭环（方案 5.3/5.4） ----------
+
+def _self_test_questions(review: dict) -> list[dict]:
+    try:
+        data = json.loads(review.get("self_test") or "[]")
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+@app.get("/api/reviews/{review_id}")
+async def get_review(review_id: int, reveal: bool = False):
+    """复习包详情。自测题答案默认隐藏：该题已作答或显式 reveal=1 才返回。"""
+    review = query_one("SELECT * FROM reviews WHERE id=?", (review_id,))
+    if not review:
+        raise HTTPException(404, "复习包不存在")
+    attempts = query(
+        "SELECT * FROM review_attempts WHERE review_id=? ORDER BY id", (review_id,))
+    answered_nos = {a["question_no"] for a in attempts if a["question_no"]}
+    questions = []
+    for i, q in enumerate(_self_test_questions(review), 1):
+        qno = str(q.get("question_no") or i)
+        item = {"q": q.get("q", ""), "question_no": qno}
+        if reveal or qno in answered_nos:
+            item["answer"] = q.get("answer", "")
+        item["answered"] = qno in answered_nos
+        questions.append(item)
+    return {"review": {k: review[k] for k in (
+        "id", "chapter_id", "course_id", "kind", "status", "score", "outline",
+        "review_materials", "created_at") if k in review},
+            "questions": questions,
+            "attempts": [{"question_no": a["question_no"], "user_answer": a["user_answer"],
+                          "is_correct": a["is_correct"], "self_rating": a["self_rating"],
+                          "mastery_after": a["mastery_after"]} for a in attempts]}
+
+
+class ReviewAttemptRequest(BaseModel):
+    question_no: str
+    user_answer: str
+    self_rating: int = 3
+
+
+@app.post("/api/reviews/{review_id}/attempts")
+async def submit_review_attempt(review_id: int, body: ReviewAttemptRequest):
+    """提交自测作答：确定性判分 + 简化 SM-2 更新（方案 5.3/5.4）。"""
+    import datetime as _dt
+    from .database import fetch_all
+    from .review_service import (grade_answer, next_interval_days, next_mastery,
+                                 consecutive_wrong_count, current_interval_days)
+    review = query_one("SELECT * FROM reviews WHERE id=?", (review_id,))
+    if not review:
+        raise HTTPException(404, "复习包不存在")
+    if review.get("status") not in ("generated", "in_progress"):
+        raise HTTPException(409, f"复习包状态为 {review.get('status')}，不能作答")
+
+    all_questions = _self_test_questions(review)
+    q = None
+    for i, x in enumerate(all_questions, 1):
+        if str(x.get("question_no") or i) == str(body.question_no):
+            q = x
+            break
+    if not q:
+        raise HTTPException(404, f"题目 {body.question_no} 不存在")
+    expected = q.get("answer", "")
+    is_correct = grade_answer(expected, body.user_answer)
+
+    error_id = q.get("error_id")
+    err = fetch_one("SELECT * FROM errors WHERE id=?", (error_id,)) if error_id else None
+    # 基准（before）优先级：错题表现值 → 本题上次作答的 after 快照 → 默认首次
+    last = fetch_one(
+        "SELECT interval_after, mastery_after FROM review_attempts "
+        "WHERE review_id=? AND question_no=? ORDER BY id DESC LIMIT 1",
+        (review_id, str(body.question_no)),
+    )
+    if err:
+        mastery_before = float(err["mastery"])
+        interval_before = current_interval_days(err["next_review_at"])
+    elif last:
+        mastery_before = float(last["mastery_after"] or 0.5)
+        interval_before = float(last["interval_after"] or 1.0)
+    else:
+        mastery_before = 0.5
+        interval_before = 1.0
+
+    prior = fetch_all(
+        "SELECT is_correct FROM review_attempts WHERE error_id=? ORDER BY id", (error_id,))
+    consec_wrong = consecutive_wrong_count(prior) + (0 if is_correct else 1)
+    rating = max(0, min(5, int(body.self_rating)))
+    interval_after = next_interval_days(interval_before, rating, consec_wrong)
+    mastery_after = next_mastery(mastery_before, is_correct)
+    now = _dt.datetime.now()
+    next_review_at = (now + _dt.timedelta(days=interval_after)).isoformat(timespec="seconds")
+
+    attempt_id = insert(
+        "INSERT INTO review_attempts (review_id, question_no, question_text, user_answer, "
+        " is_correct, mastery_after, error_id, expected_answer, self_rating, score, feedback, "
+        " mastery_before, interval_before, interval_after, reviewed_at, next_review_at, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now','localtime'))",
+        (review_id, str(body.question_no), q.get("q", ""), body.user_answer,
+         1 if is_correct else 0, mastery_after, error_id, expected, rating,
+         1.0 if is_correct else 0.0,
+         ("正确" if is_correct else f"期望答案：{expected}"),
+         mastery_before, interval_before, interval_after,
+         now.isoformat(timespec="seconds"), next_review_at),
+    )
+
+    if err:
+        execute(
+            "UPDATE errors SET mastery=?, next_review_at=?, review_stage=review_stage+1 "
+            "WHERE id=?",
+            (mastery_after, next_review_at, error_id),
+        )
+    execute("UPDATE reviews SET status='in_progress' WHERE id=? AND status='generated'", (review_id,))
+
+    return {"attempt_id": attempt_id, "question_no": body.question_no,
+            "is_correct": is_correct, "expected_answer": expected,
+            "mastery_before": mastery_before, "mastery_after": mastery_after,
+            "interval_after_days": interval_after, "next_review_at": next_review_at}
+
+
+@app.post("/api/reviews/{review_id}/complete")
+async def complete_review(review_id: int):
+    """结束本次复习：汇总作答表现，更新复习包状态与得分。"""
+    review = query_one("SELECT status FROM reviews WHERE id=?", (review_id,))
+    if not review:
+        raise HTTPException(404, "复习包不存在")
+    if review.get("status") in ("completed",):
+        raise HTTPException(409, "复习已完成")
+    attempts = query("SELECT * FROM review_attempts WHERE review_id=?", (review_id,))
+    total = len(attempts)
+    correct = sum(1 for a in attempts if int(a["is_correct"] or 0) == 1)
+    score = round(correct / total, 4) if total else 0.0
+    execute(
+        "UPDATE reviews SET status='completed', score=? WHERE id=?",
+        (score, review_id),
+    )
+    return {"review_id": review_id, "attempts": total, "correct": correct,
+            "score": score, "status": "completed"}
+
+
 # ---------- 材料上传 ----------
 
 @app.post("/api/materials/upload")

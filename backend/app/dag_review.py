@@ -1,4 +1,4 @@
-﻿"""
+"""
 复习流 DAG（V5.4 重写，对应方案 7.4）。
 
 链路：
@@ -96,6 +96,10 @@ async def _persist_node(ctx: DAGContext, model: str) -> dict:
     package = ctx.outputs.get("writer", {}).get("review_package", {})
     self_test = ctx.outputs.get("self_test", {}).get("self_test", [])
     insuff = ctx.outputs.get("writer", {}).get("insufficient_data", False)
+    # 稳定题号：LLM 可能不返回 question_no，落库前统一补齐（方案 5.3）
+    for i, q in enumerate(self_test, 1):
+        if isinstance(q, dict) and not q.get("question_no"):
+            q["question_no"] = str(i)
     auditor = json.dumps({"auditor": "skip"} if insuff else {"auditor": "ok"}, ensure_ascii=False)
     rid = insert(
         "INSERT INTO reviews (course_id, chapter_id, kind, exam_date, scope_json, outline, review_materials, "
@@ -114,10 +118,8 @@ async def _persist_node(ctx: DAGContext, model: str) -> dict:
     return {"review_id": rid, "status": "insufficient_data" if insuff else "generated"}
 
 
-async def _grade_node(ctx: DAGContext, model: str) -> dict:
-    """占位：用户提交作答后写入 review_attempts（接口另行实现）。"""
-    review_id = ctx.outputs.get("persist_review", {}).get("review_id")
-    return {"review_id": review_id, "pending_attempts": True}
+# 复习作答（grade）不再是工作流节点：用户作答走独立接口
+# POST /api/reviews/{id}/attempts + POST /api/reviews/{id}/complete（方案 5.3/5.4）。
 
 
 def build_review_dag() -> DAG:
@@ -130,5 +132,4 @@ def build_review_dag() -> DAG:
                     preferred_models=["qwen3_flash", "deepseek_v4_free"],
                     depends_on=["writer"], kind="llm"))
     dag.add(DAGNode("persist_review", "local", _persist_node, depends_on=["self_test"], kind="local"))
-    dag.add(DAGNode("grade", "local", _grade_node, depends_on=["persist_review"], kind="local"))
     return dag
