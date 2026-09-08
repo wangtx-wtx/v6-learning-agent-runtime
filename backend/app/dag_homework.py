@@ -42,10 +42,12 @@ async def resolve_input_node(ctx: DAGContext, model: str) -> dict:
     splitted: list[str] = []
     if homework_text:
         splitted = _split_questions(homework_text)
-    for idx, img in enumerate(images):
-        text = await _ocr_image(gateway, ctx, model, img)
-        if text:
-            splitted.extend(_split_questions(text))
+    if images:
+        from .gateway import gateway
+        for idx, img in enumerate(images):
+            text = await _ocr_image(gateway, ctx, model, img)
+            if text:
+                splitted.extend(_split_questions(text))
     dedup = []
     seen = set()
     for q in splitted:
@@ -76,10 +78,11 @@ def _split_questions(text: str) -> list[str]:
 
 
 async def _ocr_image(gateway, ctx, model: str, img) -> str:
-    """对单张图片调用视觉模型识别文字。"""
+    """对单张图片调用视觉模型识别文字（prompt 外置 + schema 绑定）。"""
     import base64
     from pathlib import Path
-    from .reasoning import extract_json
+    from .integrations.prompts import render_prompt
+    from .integrations.schemas import OcrOut, parse_model_output
     from .dag import RetryableModelError
 
     image_b64 = ""
@@ -96,17 +99,17 @@ async def _ocr_image(gateway, ctx, model: str, img) -> str:
             return ""
     if not image_b64:
         return ""
-    prompt = "请识别图中题目文字（保留题号/数学符号），只输出 JSON：{\"text\":\"...\"}"
+    p = render_prompt("homework/ocr", "v1")
     try:
         resp = await gateway.chat(model, [
-            {"role": "system", "content": "你是 OCR 助手，只输出 JSON。"},
+            {"role": "system", "content": p["text"]},
             {"role": "user", "content": [
-                {"type": "text", "text": prompt},
+                {"type": "text", "text": "识别图中题目文字。"},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
             ]},
         ], temperature=0.2)
-        data = extract_json(resp.get("content", ""))
-        return (data or {}).get("text", "") or ""
+        data = parse_model_output(OcrOut, resp.get("content", ""), "ocr")
+        return data.get("text", "") or ""
     except Exception as e:
         raise RetryableModelError(f"ocr 失败: {e}")
 
@@ -159,26 +162,22 @@ async def risk_classifier_node(ctx: DAGContext, model: str) -> dict:
 
 async def solver_node(ctx: DAGContext, model: str) -> dict:
     from .gateway import gateway
-    from .reasoning import extract_json
+    from .integrations.prompts import render_prompt
+    from .integrations.schemas import SolverOut, parse_model_output
     from .dag import SchemaValidationError, RetryableModelError
 
     risk_items = ctx.outputs.get("risk_classifier", {}).get("risk_items", [])
     answers = []
     total_in = total_out = 0
+    p = render_prompt("homework/solver", "v1", question_text="")
     for it in risk_items:
-        prompt = (
-            "请解答下面的题，输出 JSON：\n"
-            '{"final_answer": "...", "solution_plan": "...", "detailed_solution": "..."}'
-        )
         resp = await gateway.chat(model, [
-            {"role": "system", "content": "你是解题助手，只输出 JSON。"},
-            {"role": "user", "content": f"{prompt}\n\n题目：\n{it.get('text','')}"},
+            {"role": "system", "content": p["text"]},
+            {"role": "user", "content": f"题目：\n{it.get('text','')}"},
         ], temperature=0.3)
         total_in += resp.get("tokens_in", 0)
         total_out += resp.get("tokens_out", 0)
-        data = extract_json(resp.get("content", ""))
-        if not data:
-            raise SchemaValidationError(f"solver JSON 失败 (q{it.get('question_no')})")
+        data = parse_model_output(SolverOut, resp.get("content", ""), f"solver(q{it.get('question_no')})")
         answers.append({**it, "final_answer": data.get("final_answer", ""),
                         "solution_plan": data.get("solution_plan", ""),
                         "detailed_solution": data.get("detailed_solution", ""),
@@ -187,26 +186,25 @@ async def solver_node(ctx: DAGContext, model: str) -> dict:
 
 
 async def parallel_solver_node(ctx: DAGContext, model: str) -> dict:
-    """高风险题独立第二解（与 solver 并发）。"""
+    """高风险题独立第二解（与 solver 并发，prompt 外置 + schema 绑定）。"""
     from .gateway import gateway
-    from .reasoning import extract_json
+    from .integrations.prompts import render_prompt
+    from .integrations.schemas import ParallelSolverOut, parse_model_output
     from .dag import SchemaValidationError, RetryableModelError
 
     risk_items = ctx.outputs.get("risk_classifier", {}).get("risk_items", [])
     high = [it for it in risk_items if it.get("risk") == "high"]
     parallel = []
     total_in = total_out = 0
+    p = render_prompt("homework/parallel_solver", "v1", question_text="")
     for it in high:
-        prompt = "请用不同思路重新解答下题，输出 JSON：{\"final_answer\": \"...\", \"solution_plan\": \"...\", \"detailed_content\": \"...\"}"
         resp = await gateway.chat(model, [
-            {"role": "system", "content": "你是独立思路解题助手，只输出 JSON。"},
-            {"role": "user", "content": f"{prompt}\n\n题目：\n{it.get('text','')}"},
+            {"role": "system", "content": p["text"]},
+            {"role": "user", "content": f"题目：\n{it.get('text','')}"},
         ], temperature=0.7)
         total_in += resp.get("tokens_in", 0)
         total_out += resp.get("tokens_out", 0)
-        data = extract_json(resp.get("content", ""))
-        if not data:
-            raise SchemaValidationError(f"parallel_solver JSON 失败 (q{it.get('question_no')})")
+        data = parse_model_output(ParallelSolverOut, resp.get("content", ""), f"parallel_solver(q{it.get('question_no')})")
         parallel.append({"question_no": it.get("question_no"), "final_answer": data.get("final_answer", ""),
                          "model_used": model})
     return {"parallel_answers": parallel, "count": len(parallel), "tokens_in": total_in, "tokens_out": total_out}
@@ -216,7 +214,6 @@ async def adjudicator_node(ctx: DAGContext, model: str) -> dict:
     """比较 solver 与 parallel_solver：最终答案、关键步骤、数值结果。
     冲突时输出 requires_human_review（方案 7.2/12.2），不做静默取舍。"""
     from .gateway import gateway
-    from .reasoning import extract_json
 
     solver_items = {a["question_no"]: a for a in ctx.outputs.get("solver", {}).get("answers", [])}
     parallel_items = {p["question_no"]: p for p in ctx.outputs.get("parallel_solver", {}).get("parallel_answers", [])}
@@ -232,37 +229,44 @@ async def adjudicator_node(ctx: DAGContext, model: str) -> dict:
             decisions.append({"question_no": qno, "decision": "agree", "conflict": False,
                               "requires_human_review": False, "reason": "两解一致"})
             continue
-        # 二次审查裁决
+        # 二次审查裁决（prompt 外置 + schema 绑定）
         judgement, reason = "needs_review", "两解不一致"
         if model != "local":
+            from .integrations.prompts import render_prompt
+            from .integrations.schemas import AdjudicatorOut, parse_model_output
+            pj = render_prompt("homework/adjudicator", "v1",
+                               answer_a=s.get("final_answer"), answer_b=p.get("final_answer"))
             resp = await gateway.chat(model, [
-                {"role": "system", "content": "你裁决两模型答案。只输出 JSON：{\"decision\":\"agree\"|\"needs_review\",\"reason\":\"...\"}"},
+                {"role": "system", "content": pj["text"]},
                 {"role": "user", "content": f"甲:{s.get('final_answer')}\n乙:{p.get('final_answer')}"},
             ], temperature=0.2)
-            data = extract_json(resp.get("content", ""))
-            if data and data.get("decision") == "agree":
+            data = parse_model_output(AdjudicatorOut, resp.get("content", ""), "adjudicator")
+            if data.get("decision") == "agree":
                 judgement, reason = "agree", data.get("reason", "复核后一致")
             else:
-                reason = (data or {}).get("reason", reason)
+                reason = data.get("reason", reason)
         decisions.append({"question_no": qno, "decision": judgement, "conflict": True,
                           "requires_human_review": judgement == "needs_review", "reason": reason})
     return {"decisions": decisions}
 
 
 async def teaching_explainer_node(ctx: DAGContext, model: str) -> dict:
-    """教学化讲解（学生向）+ 证据。"""
+    """教学化讲解（学生向）+ 证据（prompt 外置 + schema 绑定）。"""
     from .gateway import gateway
-    from .reasoning import extract_json
+    from .integrations.prompts import render_prompt
+    from .integrations.schemas import TeachingOut, parse_model_output
 
     answers = ctx.outputs.get("solver", {}).get("answers", [])
+    pt = render_prompt("homework/teaching", "v1", answer_json="")
     out = []
     for it in answers:
         resp = await gateway.chat(model, [
-            {"role": "system", "content": "你是教学讲解助手，只输出 JSON。"},
-            {"role": "user", "content": f"把解题过程改写成学生能听懂的讲解：{json.dumps({'answer': it.get('final_answer'), 'plan': it.get('solution_plan')}, ensure_ascii=False)}"},
+            {"role": "system", "content": pt["text"]},
+            {"role": "user", "content": json.dumps(
+                {"answer": it.get("final_answer"), "plan": it.get("solution_plan")}, ensure_ascii=False)},
         ], temperature=0.4)
-        data = extract_json(resp.get("content", ""))
-        out.append({**it, "teaching": (data or {}).get("teaching", "")})
+        data = parse_model_output(TeachingOut, resp.get("content", ""), f"teaching(q{it.get('question_no')})")
+        out.append({**it, "teaching": data.get("teaching", "")})
     return {"items": out}
 
 

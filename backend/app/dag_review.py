@@ -45,45 +45,44 @@ async def _writer(ctx: DAGContext, model: str) -> dict:
         return {"insufficient_data": True, "reason": "该范围内尚无笔记或已确认错题，无法生成复习包"}
 
     from .gateway import gateway
-    from .reasoning import extract_json
+    from .integrations.prompts import render_prompt
+    from .integrations.schemas import ReviewWriterOut, parse_model_output
     from .dag import RetryableModelError
 
     notes_txt = "\n".join(f"- {n.get('title','')}: {(n.get('body') or '')[:400]}" for n in notes[:10])
     err_txt = "\n".join(f"- {e.get('question_text','')[:200]}" for e in errors[:20])
-    prompt = (
-        "生成结构化复习材料，只输出 JSON：\n"
-        '{"outline": ["..."], "materials": "..."}'
-    )
+    p = render_prompt("review/writer", "v1", notes_text=notes_txt, errors_text=err_txt)
     try:
         resp = await gateway.chat(model, [
-            {"role": "system", "content": "你是复习规划助手，只输出 JSON。"},
-            {"role": "user", "content": f"{prompt}\n\n笔记：\n{notes_txt}\n\n错题：\n{err_txt}"},
+            {"role": "system", "content": p["text"]},
+            {"role": "user", "content": f"笔记：\n{notes_txt}\n\n错题：\n{err_txt}"},
         ], temperature=0.4)
-        data = extract_json(resp.get("content", ""))
-        return {"review_package": data or {}, "insufficient_data": False,
+        data = parse_model_output(ReviewWriterOut, resp.get("content", ""), "review_writer")
+        return {"review_package": data, "insufficient_data": False,
+                "prompt_checksum": p["checksum"],
                 "tokens_in": resp.get("tokens_in", 0), "tokens_out": resp.get("tokens_out", 0)}
     except Exception as e:
         raise RetryableModelError(f"review_writer 失败: {e}")
 
 
 async def _self_test(ctx: DAGContext, model: str) -> dict:
-    """生成带答案但默认隐藏答案的自测题。"""
+    """生成带答案但默认隐藏答案的自测题（prompt 外置 + schema 绑定）。"""
     from .gateway import gateway
-    from .reasoning import extract_json
+    from .integrations.prompts import render_prompt
+    from .integrations.schemas import SelfTestOut, parse_model_output
 
     resources = ctx.outputs.get("aggregator", {}).get("resources", {})
     errors = resources.get("confirmed_errors", [])
-    prompt = (
-        "生成自测题（答案默认隐藏），只输出 JSON：\n"
-        '{"questions": [{"q": "...", "answer": "..."}]}'
-    )
+    p = render_prompt("review/self_test", "v1",
+                      errors_json=json.dumps([e.get("question_text") for e in errors[:10]], ensure_ascii=False))
     try:
         resp = await gateway.chat(model, [
-            {"role": "system", "content": "你是自测题出题助手，只输出 JSON。"},
-            {"role": "user", "content": f"{prompt}\n\n错题：\n{json.dumps([e.get('question_text') for e in errors[:10]], ensure_ascii=False)}"},
+            {"role": "system", "content": p["text"]},
+            {"role": "user", "content": f"错题：\n{json.dumps([e.get('question_text') for e in errors[:10]], ensure_ascii=False)}"},
         ], temperature=0.5)
-        data = extract_json(resp.get("content", "")) or {}
-        return {"self_test": data.get("questions", []) or [], "tokens_in": resp.get("tokens_in", 0),
+        data = parse_model_output(SelfTestOut, resp.get("content", ""), "self_test")
+        return {"self_test": data.get("questions", []), "prompt_checksum": p["checksum"],
+                "tokens_in": resp.get("tokens_in", 0),
                 "tokens_out": resp.get("tokens_out", 0)}
     except Exception as e:
         # 审计指出：静默吞异常会让用户拿到“空自测”假成功。若缺失必填内容则显式失败，

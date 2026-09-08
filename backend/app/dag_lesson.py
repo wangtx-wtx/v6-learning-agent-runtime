@@ -96,12 +96,13 @@ async def retrieve_context_node(ctx: DAGContext, model: str) -> dict:
                                    "text": r["text"] or "", "source": "run_parsed"})
                 seen.add(r["id"])
 
-    # 2) 全局 RAG 候选补充
+    # 2) 全局 RAG 候选补充（hybrid 检索 + retrieval_runs 落库）
     try:
         results = await retrieve_chunks(
             prompt_text,
             chapter_id=ctx.input.get("chapter_id"), lesson_id=ctx.input.get("lesson_id"),
-            top_k=8,
+            top_k=8, run_id=ctx.run_id,
+            mode=(ctx.input.get("retrieval_mode") or "hybrid"),
         )
     except Exception as e:
         logger.warning(f"retrieve_chunks: {e}")
@@ -117,34 +118,37 @@ async def retrieve_context_node(ctx: DAGContext, model: str) -> dict:
 
 
 async def lesson_outline_node(ctx: DAGContext, model: str) -> dict:
+    """课堂大纲（真实模型调用，prompt 外置 + schema 绑定）。"""
     from .gateway import gateway
-    from .reasoning import extract_json
-    from .dag import SchemaValidationError, RetryableModelError
+    from .integrations.prompts import render_prompt
+    from .integrations.schemas import LessonOutlineOut, parse_model_output
+    from .dag import RetryableModelError
 
-    candidates = ctx.outputs.get("retrieve_context", {}).get("candidates", [])
-    cand_text = "\n".join(f"[{c['chunk_id']}] {c['text'][:300]}" for c in candidates[:8])
-    prompt = (
-        "根据课程材料，梳理课堂大纲。只输出 JSON：\n"
-        '{"outline": [{"topic": "...", "duration_hint": ""}]}'
-    )
+    chunks = ctx.outputs.get("parse", {}).get("chunks", [])
+    rows = []
+    ids = [c["chunk_id"] for c in chunks if c.get("chunk_id")]
+    if ids:
+        q = ",".join("?" * len(ids))
+        rows = fetch_all(f"SELECT id, text FROM source_chunks WHERE id IN ({q})", tuple(ids))
+    material_blocks = "\n".join(f"CHUNK#{r['id']}: {(r['text'] or '')[:300]}" for r in rows[:20]) or "（无材料）"
     try:
+        p = render_prompt("lesson/lesson_outline", "v1", material_blocks=material_blocks)
         resp = await gateway.chat(model, [
-            {"role": "system", "content": "你是课堂结构分析助手，只输出 JSON。"},
-            {"role": "user", "content": f"{prompt}\n\n材料片段：\n{cand_text}"},
+            {"role": "system", "content": p["text"]},
+            {"role": "user", "content": f"材料片段：\n{material_blocks}"},
         ], temperature=0.3)
-        data = extract_json(resp.get("content", ""))
-        if not data:
-            raise SchemaValidationError("lesson_outline JSON 解析失败")
-        return {"outline": data.get("outline", []), "tokens_in": resp.get("tokens_in", 0), "tokens_out": resp.get("tokens_out", 0)}
-    except (SchemaValidationError, RetryableModelError):
-        raise
+        data = parse_model_output(LessonOutlineOut, resp.get("content", ""), "lesson_outline")
+        return {"outline": data.get("outline", []),
+                "prompt_checksum": p["checksum"],
+                "tokens_in": resp.get("tokens_in", 0), "tokens_out": resp.get("tokens_out", 0)}
     except Exception as e:
-        raise RetryableModelError(str(e))
+        raise RetryableModelError(f"lesson_outline 失败: {e}")
 
 
 async def note_writer_node(ctx: DAGContext, model: str) -> dict:
     from .gateway import gateway
-    from .reasoning import extract_json
+    from .integrations.prompts import render_prompt
+    from .integrations.schemas import NoteWriterOut, parse_model_output
     from .dag import SchemaValidationError, RetryableModelError
 
     candidates = ctx.outputs.get("retrieve_context", {}).get("candidates", [])
@@ -155,27 +159,21 @@ async def note_writer_node(ctx: DAGContext, model: str) -> dict:
     revise_hint = ""
     issues = ctx.input.get("_critic_issues") or []
     if issues:
-        revise_hint = ("\n\n评审指出以下问题，请针对性修订笔记（其他内容保持稳定）：\n- "
+        revise_hint = ("评审指出以下问题，请针对性修订笔记（其他内容保持稳定）：\n- "
                        + "\n- ".join(issues))
-    prompt = (
-        "请根据下面的材料候选（只能引用其中的 CHUNK#id），整理一份正式听课笔记。\n"
-        "要求：\n"
-        '1. 输出 JSON：{"title": "...", "body": "...", "evidence": [{"chunk_id": <id|null>, "quote": "...", "locator": "...", "source_type": "..."}]}\n'
-        "2. evidence 的 chunk_id 只能是候选里出现的 CHUNK 编号之一，不能虚构。\n"
-        "3. 能引用课程材料的 source_type='course_source'；无法对应任何材料的推导性内容 source_type='derived_reasoning'（chunk_id 填 null）。\n"
-        "4. 若无法从候选材料中找到任何可引用片段，evidence 允许为空数组，但不得编造。\n"
-        "只输出 JSON。"
-    )
-    messages = [
-        {"role": "system", "content": "你是课堂笔记助手，只输出 JSON。"},
-        {"role": "user", "content": f"{prompt}{revise_hint}\n\n课堂大纲：{json.dumps(outline, ensure_ascii=False)}\n\n材料候选：\n{cand_block}"},
-    ]
+    else:
+        revise_hint = "（首次撰写）"
+    p = render_prompt("lesson/note_writer", "v1", revise_section=revise_hint,
+                      outline_json=json.dumps(outline, ensure_ascii=False),
+                      material_blocks=cand_block)
     try:
-        resp = await gateway.chat(model, messages, temperature=0.35)
-        data = extract_json(resp.get("content", ""))
-        if not data:
-            raise SchemaValidationError(f"note_writer JSON 解析失败: {resp['content'][:200]}")
-        return {"note": data, "tokens_in": resp.get("tokens_in", 0), "tokens_out": resp.get("tokens_out", 0),
+        resp = await gateway.chat(model, [
+            {"role": "system", "content": p["text"]},
+            {"role": "user", "content": f"材料候选：\n{cand_block}"},
+        ], temperature=0.35)
+        data = parse_model_output(NoteWriterOut, resp.get("content", ""), "note_writer")
+        return {"note": data, "prompt_checksum": p["checksum"],
+                "tokens_in": resp.get("tokens_in", 0), "tokens_out": resp.get("tokens_out", 0),
                 "revised": bool(issues)}
     except (SchemaValidationError, RetryableModelError):
         raise
@@ -205,9 +203,10 @@ CRITIC_SCHEMA_HINT = (
 
 
 async def _critic_llm_call(ctx: DAGContext, model: str, ev: dict) -> dict:
-    """真实 critic 模型调用（带 schema 约束），失败退化为保守结论。"""
+    """真实 critic 模型调用（prompt 外置 + schema 绑定），失败退化为保守结论。"""
     from .gateway import gateway
-    from .reasoning import extract_json
+    from .integrations.prompts import render_prompt
+    from .integrations.schemas import CriticOut, parse_model_output
 
     note = ev.get("note", {}) or {}
     verified = ev.get("verified", [])
@@ -215,25 +214,24 @@ async def _critic_llm_call(ctx: DAGContext, model: str, ev: dict) -> dict:
     ev_block = "\n".join(
         f"- [{'通过' if v.get('verified') else '未通过'}] {v.get('quote', '')[:80]}" for v in verified
     ) or "（无证据）"
-    prompt = (
-        "审查以下听课笔记的质量（准确性、条理、证据支撑），给出结论。\n"
-        f"{CRITIC_SCHEMA_HINT}\n\n"
-        f"笔记标题：{note.get('title', '')}\n"
-        f"笔记正文：\n{(note.get('body') or '')[:2000]}\n"
-        f"证据校验：{ev_ok}\n{ev_block}"
-    )
     try:
+        p = render_prompt("lesson/critic", "v1",
+                          note_title=note.get("title", ""),
+                          note_body=(note.get("body") or "")[:2000],
+                          evidence_ok=str(ev_ok),
+                          evidence_blocks=ev_block)
         resp = await gateway.chat(model, [
-            {"role": "system", "content": "你是严格的笔记质量审查专家。" + CRITIC_SCHEMA_HINT},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": p["text"]},
+            {"role": "user", "content": f"笔记标题：{note.get('title','')}\n证据校验：{ev_ok}"},
         ], temperature=0.2)
-        data = extract_json(resp.get("content", "")) or {}
-        issues = [str(x) for x in (data.get("issues") or [])][:8]
+        data = parse_model_output(CriticOut, resp.get("content", ""), "critic")
+        issues = [str(x) for x in data.get("issues", [])][:8]
         return {"issues": issues,
                 "quality_review": {"score": float(data.get("score", 0.6 if not ev_ok else 0.8)),
                                    "passed": bool(data.get("passed", False)) and ev_ok,
                                    "issues": issues},
                 "tokens_in": resp.get("tokens_in", 0), "tokens_out": resp.get("tokens_out", 0),
+                "prompt_checksum": p["checksum"],
                 "model_used": model}
     except Exception as e:
         logger.warning(f"critic 模型调用失败，退化为证据校验结论: {e}")

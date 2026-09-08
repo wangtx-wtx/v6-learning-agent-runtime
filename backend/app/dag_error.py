@@ -26,9 +26,10 @@ logger = logging.getLogger(__name__)
 
 
 async def error_vision_reader(ctx: DAGContext, model: str) -> dict:
-    """真实调用视觉模型提取题目与手写作答。"""
+    """真实调用视觉模型提取题目与手写作答（prompt 外置 + schema 绑定）。"""
     from .gateway import gateway
-    from .reasoning import extract_json
+    from .integrations.prompts import render_prompt
+    from .integrations.schemas import VisionOut, parse_model_output
 
     images = ctx.input.get("images") or []
     results = []
@@ -48,16 +49,16 @@ async def error_vision_reader(ctx: DAGContext, model: str) -> dict:
         if not image_b64:
             results.append({"image": img, "question_text": "[图片不可读]", "student_answer": "", "confidence": 0.0})
             continue
-        prompt = "识别这张错题图片：题目、学生作答、批改痕迹。只输出 JSON：{\"question_text\":\"...\",\"student_answer\":\"...\",\"mark_grades\":\"...\"}"
+        p = render_prompt("error/vision", "v1")
         try:
             resp = await gateway.chat(model, [
-                {"role": "system", "content": "你是错题识别助手，只输出 JSON。"},
+                {"role": "system", "content": p["text"]},
                 {"role": "user", "content": [
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": "识别这张错题图片。"},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
                 ]},
             ], temperature=0.2)
-            data = extract_json(resp.get("content", "")) or {}
+            data = parse_model_output(VisionOut, resp.get("content", ""), "error_vision_reader")
             results.append({"image": img, "question_text": data.get("question_text", ""),
                             "student_answer": data.get("student_answer", ""), "confidence": 0.9})
         except Exception as e:
@@ -66,9 +67,10 @@ async def error_vision_reader(ctx: DAGContext, model: str) -> dict:
 
 
 async def error_analyst(ctx: DAGContext, model: str) -> dict:
-    """错因分析：现象、直接原因、根本原因、知识缺口。"""
+    """错因分析：现象、直接原因、根本原因、知识缺口（prompt 外置 + schema 绑定）。"""
     from .gateway import gateway
-    from .reasoning import extract_json
+    from .integrations.prompts import render_prompt
+    from .integrations.schemas import AnalystOut, parse_model_output
 
     vision_results = ctx.outputs.get("vision_reader", {}).get("results", [])
     if not vision_results:
@@ -77,20 +79,18 @@ async def error_analyst(ctx: DAGContext, model: str) -> dict:
                            "confidence": 1.0}]
     analyses = []
     total_in = total_out = 0
+    pa = render_prompt("error/analyst", "v1",
+                       question_text="", student_answer="", correct_answer="")
     for item in vision_results:
-        prompt = (
-            "分析以下错题的分层错因，只输出 JSON：\n"
-            '{"phenomenon": "...", "direct_cause": "...", "root_cause": "...", "knowledge_gaps": ["..."], "possible_causes": ["..."]}'
-        )
         resp = await gateway.chat(model, [
-            {"role": "system", "content": "你是教学错因分析助手，只输出 JSON。"},
-            {"role": "user", "content": f"{prompt}\n\n题目：{item.get('question_text','')}\n学生作答：{item.get('student_answer','')}\n正确答案：{ctx.input.get('correct_answer','')}"},
+            {"role": "system", "content": pa["text"]},
+            {"role": "user", "content": (f"题目：{item.get('question_text','')}\n"
+                                         f"学生作答：{item.get('student_answer','')}\n"
+                                         f"正确答案：{ctx.input.get('correct_answer','')}")},
         ], temperature=0.4)
         total_in += resp.get("tokens_in", 0)
         total_out += resp.get("tokens_out", 0)
-        data = extract_json(resp.get("content", ""))
-        if not data:
-            raise SchemaValidationError("error_analyst JSON 解析失败")
+        data = parse_model_output(AnalystOut, resp.get("content", ""), "error_analyst")
         analyses.append({"question_text": item.get("question_text", ""),
                          "student_answer": item.get("student_answer", ""),
                          "ai_error_analysis": data, "model_used": model})
@@ -104,15 +104,18 @@ async def error_cross_check(ctx: DAGContext, model: str) -> dict:
 
     analyses = ctx.outputs.get("analyst", {}).get("analysis", [])
     candidates = []
+    from .integrations.prompts import render_prompt
+    from .integrations.schemas import CrossCheckOut, parse_model_output
+    pc = render_prompt("error/cross_check", "v1", question_text="", possible_causes_json="[]")
     for ana in analyses:
         po = ana.get("ai_error_analysis") or ana.get("ai_error") or {}
-        prompt = "独立审查以下错因候选的合理性。只输出 JSON：{\"confirmed_causes\": [...], \"uncertain\": \"...\"}"
         try:
             resp = await gateway.chat(model, [
-                {"role": "system", "content": "你是错因审查专家，只输出 JSON。"},
-                {"role": "user", "content": f"{prompt}\n\n题目：{ana.get('question_text','')}\n候选：{json.dumps(po.get('possible_causes', []), ensure_ascii=False)}"},
+                {"role": "system", "content": pc["text"]},
+                {"role": "user", "content": (f"题目：{ana.get('question_text','')}\n"
+                                             f"候选：{json.dumps(po.get('possible_causes', []), ensure_ascii=False)}")},
             ], temperature=0.2)
-            data = extract_json(resp.get("content", "")) or {}
+            data = parse_model_output(CrossCheckOut, resp.get("content", ""), "error_cross_check")
         except Exception as e:
             data = {"confirmed_causes": po.get("possible_causes", []), "uncertain": f"审查失败: {e}"}
         candidates.append({

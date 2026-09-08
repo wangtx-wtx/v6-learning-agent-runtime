@@ -12,6 +12,7 @@ V5.4 模型网关客户端（只读访问 http://127.0.0.1:8080）。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import threading
@@ -154,26 +155,40 @@ class GatewayClient:
         if response_format:
             payload["response_format"] = response_format
         started = time.time()
-        code, data, trace = await self.post_json("/v1/chat/completions", payload)
-        if code != 200:
-            _map_status_error(code, json.dumps(data, ensure_ascii=False))
-            # 若仍未抛出（理论上不会），兜底
-            raise RetryableModelError(f"chat 非 200: {code}")
-        choice = (data.get("choices") or [{}])[0]
-        msg = choice.get("message", {}) or {}
-        usage = data.get("usage", {}) or {}
-        content = msg.get("content", "") or ""
-        if not content.strip():
-            raise RetryableModelError("网关返回空内容")
-        elapsed = int((time.time() - started) * 1000)
-        return {
-            "content": content,
-            "reasoning_content": msg.get("reasoning_content") or "",
-            "tokens_in": usage.get("prompt_tokens", 0),
-            "tokens_out": usage.get("completion_tokens", 0),
-            "model": spec.gateway_model,
-            "elapsed_ms": elapsed,
-        }
+        messages_text = json.dumps(messages, ensure_ascii=False, default=str)
+        trace = ""
+        error_code = ""
+        try:
+            code, data, trace = await self.post_json("/v1/chat/completions", payload)
+            if code != 200:
+                error_code = f"http_{code}"
+                _map_status_error(code, json.dumps(data, ensure_ascii=False))
+                raise RetryableModelError(f"chat 非 200: {code}")
+            choice = (data.get("choices") or [{}])[0]
+            msg = choice.get("message", {}) or {}
+            usage = data.get("usage", {}) or {}
+            content = msg.get("content", "") or ""
+            if not content.strip():
+                error_code = "empty_content"
+                raise RetryableModelError("网关返回空内容")
+            elapsed = int((time.time() - started) * 1000)
+            tokens_in = usage.get("prompt_tokens", 0)
+            tokens_out = usage.get("completion_tokens", 0)
+            _audit_model_call(model_id, spec.gateway_model, messages_text, started,
+                              "ok", "", tokens_in, tokens_out, trace)
+            return {
+                "content": content,
+                "reasoning_content": msg.get("reasoning_content") or "",
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "model": spec.gateway_model,
+                "elapsed_ms": elapsed,
+            }
+        except Exception as e:
+            # 所有失败（网络/熔断/非200/空内容）都留一行审计
+            _audit_model_call(model_id, spec.gateway_model, messages_text, started,
+                              "error", error_code or type(e).__name__, 0, 0, trace)
+            raise
 
     async def get_usage(self) -> dict:
         client = _get_client()
@@ -199,6 +214,52 @@ class GatewayClient:
 
 
 gateway = GatewayClient()
+
+
+# ---------------------------------------------------------------------------
+# 模型调用审计（方案 11.3）：contextvar 由 DAG 引擎设置（run_id/node/attempt），
+# render_prompt 追加 prompt_name/version；gateway.chat 每次调用写一行 model_calls。
+# ---------------------------------------------------------------------------
+import contextvars  # noqa: E402
+
+_call_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "model_call_context", default=None)
+
+
+def set_call_context(**fields) -> contextvars.Token:
+    """合并式设置当前调用的审计上下文（在协程任务内使用）。"""
+    cur = dict(_call_context.get() or {})
+    cur.update(fields)
+    return _call_context.set(cur)
+
+
+def reset_call_context(token: contextvars.Token) -> None:
+    _call_context.reset(token)
+
+
+def _audit_model_call(model_id: str, gateway_model: str, messages_text: str,
+                      started: float, status: str, error_code: str,
+                      tokens_in: int, tokens_out: int, trace: str) -> None:
+    try:
+        from .database import insert
+        from datetime import datetime
+        info = _call_context.get() or {}
+        insert(
+            "INSERT INTO model_calls (run_id, node_id, attempt, model_id, gateway_model, trace_id, "
+            " prompt_name, prompt_version, tokens_in, tokens_out, latency_ms, status, error_code, "
+            " input_digest, input_chars, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (info.get("run_id"), info.get("node_id"), info.get("attempt", 1),
+             model_id, gateway_model, trace,
+             info.get("prompt_name"), info.get("prompt_version"),
+             tokens_in, tokens_out, int((time.time() - started) * 1000),
+             status, error_code[:64],
+             hashlib.sha256(messages_text.encode()).hexdigest()[:16],
+             len(messages_text),
+             datetime.now().isoformat(timespec="seconds")),
+        )
+    except Exception as e:  # 审计失败不影响主流程
+        logger.warning(f"model_calls 审计写入失败: {e}")
 
 
 async def aclose() -> None:

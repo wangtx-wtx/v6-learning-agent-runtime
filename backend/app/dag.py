@@ -249,10 +249,12 @@ class DAG:
     async def _run_node(self, node: DAGNode, model_id: str, ctx: "DAGContext",
                         attempt: int, fix: bool = False) -> dict:
         """单次模型尝试：记录 started/finished 节点，写入全量 output_json。"""
+        from .gateway import set_call_context, reset_call_context
         started = time.time()
         started_iso = datetime.now().isoformat()
         node_id = ctx.start_node(node, model_id, started_iso, attempt)
         ctx.fix_requested = fix
+        token = set_call_context(run_id=ctx.run_id, node_id=node.name, attempt=attempt)
         try:
             result = await node.handler(ctx, model_id)
             result.setdefault("node_name", node.name)
@@ -272,6 +274,8 @@ class DAG:
                             attempt=attempt, error=str(e),
                             latency_msf=int((time.time() - started) * 1000))
             raise
+        finally:
+            reset_call_context(token)
 
     async def rerun_node(self, ctx: "DAGContext", name: str, model_id: Optional[str] = None) -> dict:
         node = self.nodes[name]

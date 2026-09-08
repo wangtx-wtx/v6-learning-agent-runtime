@@ -12,7 +12,7 @@ from typing import Optional
 
 import numpy as np
 
-from .database import query
+from .database import query, execute
 from .gateway import gateway
 
 logger = logging.getLogger(__name__)
@@ -161,14 +161,74 @@ def _bonus_phrase_score(query_text: str, doc_text: str) -> float:
     return min(hits * 0.1, 0.5)
 
 
+def _bm25_scores(query_text: str, docs: list[str], k1: float = 1.5, b: float = 0.75) -> list[float]:
+    """轻量 BM25：在候选集内计算，返回每篇的原始分（不做全局 IDF 归一）。"""
+    import math
+    from collections import Counter
+    q_tokens = [t for t in _tokenize_list(query_text)]
+    if not q_tokens or not docs:
+        return [0.0] * len(docs)
+    doc_tokens = [_tokenize_list(d) for d in docs]
+    avgdl = sum(len(t) for t in doc_tokens) / max(len(doc_tokens), 1)
+    df: Counter = Counter()
+    for toks in doc_tokens:
+        for term in set(toks):
+            df[term] += 1
+    n = len(docs)
+    scores = []
+    for toks in doc_tokens:
+        tf = Counter(toks)
+        score = 0.0
+        for term in q_tokens:
+            if term not in tf:
+                continue
+            idf = math.log(1 + (n - df[term] + 0.5) / (df[term] + 0.5))
+            score += idf * (tf[term] * (k1 + 1)) / (tf[term] + k1 * (1 - b + b * len(toks) / max(avgdl, 1)))
+        scores.append(score)
+    return scores
+
+
+def _tokenize_list(text: str) -> list[str]:
+    """分词为列表（BM25 需要词频，不能用集合）。"""
+    import re as _re
+    tokens: list[str] = []
+    s = str(text)
+    if _HAS_JIEBA and _re.search(r"[一-鿿]", s):
+        for word in jieba.cut_for_search(s):
+            clean = _re.sub(r"[^\w一-鿿]", "", word).strip()
+            if clean:
+                tokens.append(clean.lower())
+    else:
+        for word in s.split():
+            clean = _re.sub(r"[^\w一-鿿]", "", word).strip()
+            if clean:
+                tokens.append(clean.lower())
+    return tokens
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    import math
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    return dot / max(na * nb, 1e-9)
+
+
 async def retrieve_chunks(
     query_text: str,
     chapter_id: Optional[int] = None,
     lesson_id: Optional[int] = None,
     top_k: int = 5,
+    run_id: Optional[int] = None,
+    mode: str = "hybrid",
 ) -> list[dict]:
-    """从 source_chunks 检索最相关块(BM25-like + 关键词加成 + 可扩充向量)"""
-    sql = "SELECT id, type, locator, text FROM source_chunks WHERE 1=1"
+    """混合检索（方案 10.5）：
+    score = 0.45*BM25 + 0.40*向量余弦 + 0.10*层级匹配 + 0.05*短语命中
+    - embedding 不可用时自动降级 keyword_only（BM25+层级+短语）；
+    - 每次检索写一行 retrieval_runs（可归因：输出差是检索问题还是生成问题）。"""
+    sql = "SELECT id, type, locator, text, chapter_id, lesson_id, embedding FROM source_chunks WHERE 1=1"
     params: list = []
     if chapter_id:
         sql += " AND chapter_id=?"
@@ -177,18 +237,65 @@ async def retrieve_chunks(
         sql += " AND lesson_id=?"
         params.append(lesson_id)
     chunks = query(sql, tuple(params))
+    filters_json = json.dumps({"chapter_id": chapter_id, "lesson_id": lesson_id}, ensure_ascii=False)
+
+    def _persist(selected: list[dict], final_mode: str) -> None:
+        try:
+            execute(
+                "INSERT INTO retrieval_runs (workflow_run_id, query_text, filters_json, retrieval_mode, "
+                " candidate_count, selected_chunk_ids) VALUES (?,?,?,?,?,?)",
+                (run_id, query_text[:500], filters_json, final_mode, len(chunks),
+                 json.dumps([c.get("chunk_id") for c in selected], ensure_ascii=False)),
+            )
+        except Exception as e:
+            logger.warning(f"retrieval_runs 写入失败: {e}")
 
     if not chunks:
         return []
 
-    query_tokens = _tokenize(query_text)
+    # ---- BM25 归一化 ----
+    bm25_raw = _bm25_scores(query_text, [c.get("text") or "" for c in chunks])
+    max_bm25 = max(bm25_raw) if bm25_raw else 0.0
+
+    # ---- 向量（hybrid 时才调用 embedding；失败自动降级） ----
+    q_vec: list[float] = []
+    final_mode = mode
+    if mode == "hybrid":
+        q_vec = await embed_text(query_text)
+        if not q_vec:
+            final_mode = "keyword_only"   # 降级：embedding 不可用
+
+    def _hierarchy(c: dict) -> float:
+        if lesson_id and c.get("lesson_id") == lesson_id:
+            return 1.0
+        if chapter_id and c.get("chapter_id") == chapter_id:
+            return 0.6
+        return 0.2
+
     scored: list[dict] = []
-    for c in chunks:
+    for i, c in enumerate(chunks):
         doc_text = c.get("text") or ""
-        doc_tokens = _tokenize(doc_text)
-        jac = jaccard(query_tokens, doc_tokens)
-        bonus = _bonus_phrase_score(query_text, doc_text)
-        score = jac + bonus
+        bm25_n = (bm25_raw[i] / max_bm25) if max_bm25 > 0 else 0.0
+        vec_score = 0.0
+        if q_vec:
+            emb = c.get("embedding")
+            doc_vec = None
+            if emb:
+                try:
+                    doc_vec = json.loads(emb) if isinstance(emb, str) else emb
+                except Exception:
+                    doc_vec = None
+            if doc_vec:
+                vec_score = max(_cosine(q_vec, doc_vec), 0.0)
+            elif final_mode == "hybrid":
+                # 无块向量：hybrid 下该分量缺失，自动按 keyword_only 权重处理
+                pass
+        hier_n = _hierarchy(c)          # 已归一 0..1
+        phrase_n = min(_bonus_phrase_score(query_text, doc_text) / 0.5, 1.0)
+        if final_mode == "hybrid":
+            score = 0.45 * bm25_n + 0.40 * vec_score + 0.10 * hier_n + 0.05 * phrase_n
+        else:
+            score = 0.60 * bm25_n + 0.30 * hier_n + 0.10 * phrase_n
         if score > 0:
             scored.append({
                 "chunk_id": c.get("id"),
@@ -199,4 +306,6 @@ async def retrieve_chunks(
             })
 
     scored.sort(key=lambda x: x["score"], reverse=True)
-    return scored[:top_k]
+    selected = scored[:top_k]
+    _persist(selected, final_mode)
+    return selected
