@@ -102,6 +102,11 @@ _PUBLIC_PATHS = {
 async def mobile_token_check(request: Request, call_next):
     path = request.url.path
     if not path.startswith("/api/"):
+        # P0 安全:远程(Funnel/广域网)情况下关闭调试文档,避免暴露 API 全貌
+        if path in ("/docs", "/redoc", "/openapi.json", "/api/openapi.json") and config.MOBILE_TOKEN:
+            client_host = request.client.host if request.client else ""
+            if client_host not in ("127.0.0.1", "::1"):
+                return JSONResponse(status_code=403, content={"detail": "调试文档仅在本地开放"})
         return await call_next(request)
 
     # admin token 管理路径有独立 localhost 校验
@@ -1291,9 +1296,17 @@ if _FRONTEND_DIST.exists():
     async def serve_spa(full_path: str):
         """兜底路由:返回前端 SPA 的 index.html,交由前端 hash 路由处理。"""
         # API 路径已被上面的 @app.get 捕获;此处只处理静态文件 + SPA 兜底
-        if full_path.startswith("api/"):
+        if not full_path or full_path.startswith("api/") or full_path == "api":
             raise HTTPException(404, "API 不存在")
-        candidate = _FRONTEND_DIST / full_path
+        # P0 安全:拒绝路径穿越,并强制将路径锚定到 dist 根目录内
+        if ".." in full_path or "\\" in full_path:
+            raise HTTPException(400, "非法路径")
+        dist_root = _FRONTEND_DIST.resolve()
+        candidate = (dist_root / full_path).resolve()
+        try:
+            candidate.relative_to(dist_root)
+        except ValueError:
+            raise HTTPException(400, "非法路径")
         if candidate.is_file():
             return FileResponse(str(candidate))
         return FileResponse(str(_FRONTEND_DIST / "index.html"))
