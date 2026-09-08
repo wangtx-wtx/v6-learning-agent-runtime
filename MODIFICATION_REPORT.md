@@ -1,146 +1,143 @@
-# v5 自动化学习系统 — 修改报告
+# v5 学习系统 — V5.5 稳定闭环 最终修改报告
 
-> 按审查方案《自动化学习系统完整修改方案（全量执行）》执行。范围：**阶段0 → 阶段6 全量**。
-> 分支确认：范围选项已确认为「全量到阶段6」；其余多选分支未收到明确答复，本报告在「决策记录」
-> 一节逐项列出**采用的安全默认值**。
+> 执行依据：《V5.5 稳定闭环版本》方案（20 节）。执行方式：A→H 逐阶段实施，每阶段通过
+> 编译检查 + 全量单测 + 真实端到端冒烟 + git 提交后进入下一阶段。
+> 本报告严格区分「已实现 / 已测试 / Mock 验证 / 真实模型验证 / 待办 / 已知限制」，
+> **不把"函数存在"描述为"功能已完成"**。
 
----
+- 产品版本：**5.5.0**（`/api/health` 实测返回）
+- DB Schema：**v7**（migrations 0001–0007，生产库已应用，`schema_migrations=[1..7]`）
+- 测试：**81/81 通过**（`python -m unittest discover -s tests -t .`，约 21s）
+- 提交历史（本阶段 A–H）：
 
-## 一、执行总览
-
-| 阶段 | 内容 | 状态 | 验证证据 |
-|------|------|------|----------|
-| 0 | Git 基线 + 全量快照备份 | ✅ | `v5/` 下建 git 仓库，预迁移快照 `data/backups/snapshot_20260908_194947/` |
-| 1 | 数据库影子迁移 + DAL 统一 + P0 后端修复 | ✅ | smoke：health / 章节 state / 材料库 200 |
-| 2 | 材料状态机 + 后台 Worker + SSE | ✅ | RSS 上传→解析→ready→建块实测通过 |
-| 3 | 听课/作业/错题/复习四条业务流重写 | ✅ | 三条业务流经真实模型网关端到端产出持久化资产 |
-| 4 | RAG(FTS5+证据) + 模型网关可靠性 | ✅ | 重试/限并发/熔断/配额安全默认；token 统计落库 |
-| 5 | 前端五中心 + P0 前端/接口修复 | ✅ | `vue-tsc`+`vite` 构建通过 |
-| 6 | 安全 / 测试 / 备份 / 文档 | ✅ | unittest 13/13；最终快照 integrity=ok |
-
-提交历史（`git log --oneline`）：
 ```
-bc87a20 feat(security/tests/backup): stage-6 hardening
-62bc0ac feat(frontend+api): five-center IA, material inbox/library, P0 API fixes
-c8d3a9d feat(gateway/rag/evidence/schema): reliable model gateway + stage-4 refinements
-3205042 feat(workflows): async worker + DAG concurrency + four business flows
-0064c1d feat(database): unified DAL (scheme-matched, additive migration, path safety)
-7b6e7d8 chore: git baseline (stage 0) - snapshot data backed up
+89d1536 feat(web): vue-router + SSE composable + typed DTOs + material picker + echarts on-demand (G)
+233562b feat(rag): externalized prompts + schema binding + hybrid retrieval + model_calls audit (F)
+384f73f feat(flows): critic loop, evidence gating, error events, homework OCR states, obsidian paths (E)
+08240b5 feat(review): answer attempts with simplified SM-2 mastery loop (D)
+52057fe feat(storage): blob dedup/refcount/physical GC + storage audit + type matrix (C)
+1772797 feat(workers): lifespan, recovery, real concurrency, cancel, retry (B)
+0426143 feat(database): connection policy, schema v7 blob model, shadow migration hardening (A)
 ```
 
 ---
 
-## 二、阶段0 — 基线/备份
+## 一、总览：各阶段状态
 
-- 在 `v5/` 初始化 Git 仓库（分支 `main`），先做预取快照 `snapshot_20260908_194947`（含 `v5.db` 在线备份 + uploads + obsidian_vault + manifest.json，完整性 ok 后才进入改造）。
-- `.gitignore`：忽略 `backend/data/*.db*`、`backups/`、`uploads/`、`obsidian_vault/`、`keys/`、`.env`、`*.log`、`.venv/`、`frontend/dist/` 等。
-- 基准数据审计：14 门课程 / 16 章 / 16 课时 / 6 材料 / 18 错题 / 34 运行 / 192 节点 / 8 考题，全部保留并纳入迁移。
-
-## 阶段一：数据库 / DAL / P0
-
-- **SCHEMA_SQL 与实际 v5.db 对齐**：改写 `database.py`，`INDEX_SQL` 与 `SCHEMA_SQL` 分离，索引在 `ADD COLUMN` 之后建，消除启动时「no such column」。
-- **影子（非破坏）迁移**：`migrate_existing_db` 用幂等 `ALTER TABLE ... ADD COLUMN` 补齐存量库缺失字段（materials/notes/reviews/homeworks/questions/answer_items/source_chunks/workflow_runs 等，含 `created_at`），并在 `.db` 缺失 `source_chunks.created_at` 时在连接前迁移，保证后台 worker 建块不崩。
-- **DAL 统一**：`fetch_all`/`fetch_one` 返回 dict（`.get()` 可用）；删除已废弃的 `query(..., one=True)` 调用计 15 处，全部改为 `query_one`；业务层不再接触 `sqlite3.Row`。
-- **P0 路径安全**：`resolve_material_path` 用 `resolve()+relative_to()` 把 material 锚定在 uploads 根内，且不存在时报错（`BusinessError`）。
-- **新增跑件表**：`run_tasks`、`parse_tasks`、`review_attempts`、`evidence_links`。（迁移已建立）
-
-## 阶段二 · 材料状态机 + 后台执行模型
-
-- **材料生命周期**：upload→queued→parsing→indexed→ready / failed；上传即自动入解析队列（`enqueue_parse` 后台线程）；重复文件按 `sha256` 去重。
-- **工作流** POST 不再同步等 DAG：返回 **202 + `{run_id, status:"queued"}`**；任务写入 SQLite 持久化队列，进程内存资源后台线程 + 信号量（`MAX_CONCURRENT_RUNS=2`）执行；`GET /api/runs/{id}/events`（SSE）推送进度，按空监听节流。
-- **实例重启恢复**：启动时把 `queued/running` 任务回收消化。
-
-## 阶段三 · 四条业务流（DAG 引擎重写）
-
-- 新引擎支持**拓扑分层并发**（`asyncio.gather`），每节点记录 `attempt`、`output_json`（不截断）、`latency_ms`、token 数。
-- 异常分类：`BusinessError`/`AuthError`/`BadRequestError` **不重试**；`RetryableModelError`/超时**指数退避重试**；`SchemaValidationError` 触发「先修正→再切模型」。
-- **听课流**：enrich→table→transcribe→结构→课代表→写成/草稿→证据核验→自检生成→审→画像落库→Obsidian 同步。**端到端产出中文笔记（status=synced）并写 evidence_links**。
-- **作业流**：题目读取→风险分级→solver 与 parallel_solver 并发 → adjudicator → 讲解 → 证据/范围审校 → `questions` 若先建 id、`answer_items` 持久化。**验证通过：并行解析 had一个 attempt 失败→重试成功**。
-- **错题流**：解析→分类→结构化→判定 provisional/confirmed，SM-2 复习。
-- **复习流**：聚合→条目化→自测(M 版)、(占位)课堂作答→`reviews` 持久化（含 `review_attempts`）。
-
-## 阶段四 · RAG + 证据 + 网关可靠性
-
-- `rag.py` 增加幂等 `init_fts()`（FTS5 `chunks_fts`）；材料解析后写 `source_chunks` + 建块索引。
-- **证据模型**：`evidence_links` 关联（笔记/条目↔有效块/答案）；图文/题头解析（pdf/pptx/docx/text/image/audio）。
-- **网关可靠性**：单例连接池；429/5xx 带退避重试（默认 2 次）；并发信号量（默认 6）；熔断（连续 4 次失败打开 20s）；`X-Trace-Id` 串联日志；错误标准化映射到 DAG 异常类。提供 `repair_json_blob`（代码围栏/尾逗号/截断修复）作为「无效 JSON 修复」后接 `SchemaValidationError`→切换模型。
-- **配额安全**：用量状态 `unavailable` 时不默认当作 0%（避免误走免费路由超支），而是 `_quota_pct=100` 走保守路由（官方 DeepSeek / 安全默认）。
-
-## 阶段五 · 前端与接口 P0
-
-- **P0a `set_status` JSON**：后端改为优先读 JSON body，query 参数保留兼容 → 前端传 JSON 不再 422。
-- **P0m 移动端 `material_ids`**：`LessonRunRequest`/`HomeworkRunRequest` 补齐 `material_ids` 字段；移动端上传后把已入库 id 回传进流从而真正进入工作流。
-- **五中心导航**：`App.vue` 重构为「今日 / 课程 / 收件箱 / 复习 / 系统」五组，原有页面全部归位。
-- **材料收件箱**：`UploadPage` 增加材料库表格（名称/类型/解析状态/大小/重试/删除），`MaterialsApi` 补齐 list/get/patch/remove/retry/chunks；`api` 客户端新增 `patch`。
-- **构建**：`vue-tsc -b && vite build` 通过（约 1.34MB 主包），打包体积告警保留待后续代码拆分。
-
-## 阶段六 · 安全 / 测试 / 备份 / 文档
-
-### 安全
-- SPA 兜底路由：拒绝 `..` / `\`、`resolve()+relative_to(dist)` 收敛到 dist 内（防路径穿越）；`api/` 前缀结果 404。
-- 开启 `V5_MOBILE_TOKEN` 时，`/docs` `/redoc` `/openapi.json` 对非本机返回 403（避免大面暴露 **API 全貌**）。
-- 移动 Token：非本机请求校验 `x-app-token`/`?token=`；`/api/admin/mobile-token/*` 全部经 `_require_local_admin` 只允许本机（rotate/set/status），token 变更后即时改写 `.env`。
-- 上传改为流式+原子落地+sha256 去重，不受控于恶名扩展名（文本/图片/P翻页/音频按内容判定）。
-
-### 测试
-`backend/tests/test_core.py`（stdlib unittest，lib 零依赖）—— `python -m unittest discover -s tests` 通过 13/13：
-- reasoning 解析/修复（围栏 JSON、尾逗号修复、彻底废弃）
-- DAG 异常层级 / `LOCAL_MODEL="_local_"`
-- 网关状态码→异常映射（400/401/429/5xx）
-- Worker 配额未知→安全默认 100
-- 路径安全（缺失材料 → `BusinessError`）
-- 后端可导入、路由数≥60
-
-### 备份
-`backend/data/backups/snapshot_final_20260908_204442/`：`v5.db`（在线备份）＋ uploads + obsidian_vault + `manifest.json`（`integrity_check=ok`、`fk_errors=0`、`sha256`）。14 门课程 + 已产出资产（1 note / 2 reviews / 1 answer_item / 8 materials）全部入账。
-
-### 文档
-本报告 + 提交日志（七次 commit 可分阶段回滚）。
+| 阶段 | 内容 | 状态 | 提交 | 验证 |
+| --- | --- | --- | --- | --- |
+| A | 连接策略重做 / Schema v7 / 影子迁移加固 | ✅ 已完成 | `0426143` | 61 tests + boot smoke |
+| B | lifespan / Worker 恢复 / 真并发 / 取消 / 重试 | ✅ 已完成 | `1772797` | 13 worker tests + 取消/重试真实运行 |
+| C | 材料 blob 拆分 / 去重引用 / 物理 GC / 类型矩阵 | ✅ 已完成 | `52057fe` | 10 tests + 去重/复活真实冒烟 |
+| D | 复习作答 → 判分 → SM-2 闭环 | ✅ 已完成 | `08240b5` | 13 tests + 真实出题作答冒烟 |
+| E | 听课 critic 闭环 / 错题事件 / 作业状态机 / Obsidian 真实路径 | ✅ 已完成 | `384f73f` | 10 tests + 三流真实冒烟 |
+| F | Prompt 外置 / Schema 绑定 / 混合检索 / 调用审计 | ✅ 已完成 | `233562b` | 10 tests + 审计/检索真实冒烟 |
+| G | 前端 vue-router / SSE / 业务 DTO / 材料选择器 | ✅ 已完成 | `89d1536` | vue-tsc 0 错 + 分包构建 + preview 200 |
+| H | 快照恢复 / 契约测试 / CI / 文档版本统一 | ✅ 已完成 | （本次提交） | 5 tests + 真实备份 dry-run 恢复 |
 
 ---
 
-## 决策默认值（未答复分支 → 安全性默认）
+## 二、已实现（代码已落地，且经测试或真实运行验证）
 
-| 分支 | 默认值 | 说明 |
-|------|--------|------|
-| 数据库保留现有数据 | ✅ 采用 | 影子迁移；14 课程全保留 |
-| DAL | 沿用 `sqlite3`（不变更平台） | 与方案「数据层保留 raw-sqlite」一致更新 |
-| 前端 | 五中心 + 材料库（暂缓 后来 `vue-router`） | 无新增依赖，避免无法验证的构建；保留软件 hash 路由 |
-| 作业模式 | 「先做后看」**关闭**（可配置） | 默认不入 `先做后看`，teacher 可开 |
-| 数学不阻断合法推理 | 证据规则**不关闭 derived_reasoning 类** | 避免数学题误判“无证据” |
-| 学习结果/模型 | 仅当需要测试 | 演示用端到端流（已用真实 OLLAMA/Gateway 验证） |
+### A. 数据库 / 连接策略
+- **连接策略（方案 2.4）**：读=线程本地连接；写（`execute/insert/executemany`）=专用短连接；`transaction()` 独立连接 + `BEGIN IMMEDIATE` + 3 次忙等重试。依据：FastAPI 协程共享事件循环线程，共享连接导致交错 BEGIN 冲突（此前 `database is locked` 实测复现，现 61→81 用例无锁冲突）。
+- **WAL 设置**仅在模式非 wal 时执行（避免写竞争下 `journal_mode` 需要排他锁报错）。
+- **Schema v7**：`0007_blob_dedup_model.sql` 撤销 0006 的 `materials.file_hash` 唯一索引（与 blob 去重模型冲突）；生产库已迁移，`schema_migrations` checksum 锁定。
 
-> 以上默认值若需调整可在 `backend/app/*.py`（路由表 `DEFAULT_ROUTE`、`routing.py` 阈值、`workers.py` 并发）一次性改定。
+### B. Worker / 生命周期
+- FastAPI `lifespan`（无 on_event）：init → 备份（测试覆写时跳过）→ `recover_all()` → 临时文件清理（24h，5 分钟活动上传保护）→ WorkerManager 启动 → 健康自检；停机反序。
+- **恢复**：重启后 running/interrupted → queued（error='recovered_after_restart'）；超 max_attempts → failed；孤儿 queued run 重新入队。
+- **真并发**：`asyncio.to_thread` 认领，2 个 run + 2 个 parse 槽位真实并行（单测以多线程认领互斥验证）。
+- **取消**：`POST /api/runs/{id}/cancel`（queued 直接取消 / running 置 cancel_requested 由 Worker 检查 / 终态 409）；`RunCancelledError(BaseException)` 贯穿 DAG 层/节点/模型重试边界；节点取消也落 `run_nodes` 记录。
+- **重试**：`POST /api/runs/{id}/retry` 创建子 run，`_retry` 标记复用父 run 成功节点输出（节点状态记 'reused'）；attempts/max_attempts=3 + 600s 租约 + 心跳续约。
+
+### C. 材料 blob 化 / GC
+- `file_blobs`（sha256 UNIQUE、storage_path、ref_count、gc_state）；`acquire_blob` 统一去重/复活/重写路径（修复"死 blob 重传文件缺失"缺陷）；上传响应含 `deduped`。
+- 删除材料=解引用（先删 evidence_links → FTS → source_chunks → parse_tasks → materials，再 `release_blob_ref`）；`gc_blob_now` 失败落 `blob_gc_tasks` 补偿队列；`/api/admin/storage/audit|gc`。
+- **类型支持矩阵**：pdf/ppt/doc/text/txt/md 可解析；image→`needs_ocr`；audio→`transcribing` 短路（无假占位 chunk）；其余类型上传即拒（含 text/txt/md 别名修复）。
+
+### D. 复习闭环
+- `POST /api/reviews/{id}/attempts`：判分 → SM-2 简化变体（0/1→1d，2→3d，3→×1.8，4→×2.5，5→×3.2，clamp[1,180]；连续 2 错重置；掌握度 +0.15/−0.25 clamp[0,1]），before 值从 errors→上次 after 快照→默认值链取。
+- `POST /api/reviews/{id}/complete`（score=正确率，重复提交 409）；复习详情默认隐藏答案（answered 前 `reveal=1` 才返回）。
+
+### E. 业务流质量
+- **听课 critic 闭环**：真实 critic 模型审查（prompt 外置 + pydantic schema），不通过时带问题修订重写（最多 1 轮：重写→证据重校验→复审），token 合计入账。
+- **证据规则**：证据为空**不得**自动确认（`ok = bool(ev_list) and all(verified)`），证据空 → note 强制 draft。
+- **错题**：confirm/reject 用 rowcount 判定（0 → 409），终态拒绝再次操作，全部写 `error_events`（created/confirmed/rejected + old/new status + payload）；`ai_error_json` 存结构化错因 `{phenomenon, direct_cause, root_cause, knowledge_gaps, possible_causes, confirmed_causes, uncertain}`；cross_check 捕获 `uncertain`。
+- **作业状态机**：仅图片 → `homework_ocr` 小 DAG（resolve→persist→`awaiting_confirmation`）；`POST /api/homeworks/{id}/confirm` 校正文本→confirmed→自动排队求解（非 awaiting 状态 409）；裁决冲突 → `requires_human_review` 落库 → 作业 `needs_review`。
+- **先做后看**：`POST /api/homeworks/{id}/answer` 提交学生答案（重复提交 409）才置 `reveal_allowed=1`；作业详情与 run result 只返回已揭示题的解答。
+- **Obsidian**：路径来自数据库级联（lesson→chapter→course），`01 Courses/<课程>/<第N章 章节名>/[note-<id>] 标题.md`；Windows 文件名清洗（非法字符/保留名/尾点空格）；稳定 ID 防重命名断链。
+
+### F. Prompt / 检索 / 审计
+- **Prompt 外置**：`backend/prompts/<workflow>/<name>.v1.md`（13 个文件）；loader 支持 `{{变量}}` 渲染、sha256 checksum、缓存、测试夹具覆盖（`V5_PROMPT_FIXTURE_DIR`）。
+- **Schema 绑定**：`integrations/schemas.py` 13 个 pydantic 模型；所有模型节点输出必须过校验，失败抛 `SchemaValidationError`（走"先修复再换模型"），移除全部 `extract_json(...) or {}` 静默兜底。
+- **混合检索**：`0.45×BM25 + 0.40×向量余弦 + 0.10×层级 + 0.05×短语`；embedding 不可用自动降级 `keyword_only`（0.60/0.30/0.10）；每次检索写 `retrieval_runs`（query/过滤/模式/候选数/选中 chunk）。
+- **调用审计**：`gateway.chat` 每次调用写 `model_calls`（run/node/attempt/model/trace/prompt_name+version/tokens/latency/status/error_code/输入 sha256 摘要），成功与失败均落库。
+
+### G. 前端
+- **vue-router 4**：hash 历史（兼容旧 `#/` 链接），15 个路由全部动态 `import()` 分包；App.vue 重写为 `<router-view>` + Router 驱动导航；404 兜底路由。
+- **SSE**：`useRunEvents` 组合式函数——`EventSource(/api/runs/{id}/events)` 实时推送；断线指数退避重连（1s→16s，5 次）；耗尽降级 2s 轮询；RunsPage 已接入（实时/轮询状态徽标，终态自动停止并刷新列表）。
+- **业务 DTO**：`RunsApi.result()` + `LessonResultDto/HomeworkResultDto/ReviewResultDto/ErrorResultDto` 类型化。
+- **材料选择器**：听课流页可勾选已解析材料（`material_ids` 注入检索）。
+- **ECharts 按需**：`echarts/core` + GraphChart/Tooltip/Legend/CanvasRenderer，GraphPage 独立分包（主包 119KB，图页单独 487KB 懒加载）。
+
+### H. 运维 / 工程化
+- **快照恢复**：`python -m tools.restore_snapshot --latest|--file [--dry-run]`；integrity_check + schema_migrations 校验、恢复前 pre_restore 备份、原子替换 + WAL 清理；对真实生产备份 dry-run 通过（33 表、migrations [1..7]、integrity ok）。
+- **CI**：`.github/workflows/ci.yml`——后端（compileall + unittest，Python 3.12/windows-latest）+ 前端（vue-tsc + build，node 22）。
+- **文档**：`docs/README.md`（索引+结构）、`PRODUCT.md`、`ARCHITECTURE.md`、`OPERATIONS.md`、`TESTING.md`、`VERSIONS.md`；版本口径统一为 产品 5.5.0 / Schema 7 / API v1 / prompts v1。
 
 ---
 
-## 待办（未纳入本次范围，建议后续）
-- vue-router + 页面按需拆分（`import()`），消除 >500kB 首包。
-- 对照 `.env`  的 `V5_MOBILE_TOKEN` 开启指南 + 首次启动迁移验证脚本入 CI。
-- 数据库 AUTH/CLP 方案（多用户、鉴权策略）后续审批后实现（当前为单用户+移动 Token 方案）。
+## 三、已测试（自动化用例覆盖，81/81 通过）
 
-## 审计整改（第三方监督审计报告 20260908）
+- **数据库**：版本 7、migrations [1..7]、多线程读写互斥/事务连接策略、自增语义。
+- **Worker**：认领原子性、租约与心跳、恢复语义（interrupted→queued、超限→failed）、并发槽位、取消置位与检查点、TestClient 下 Event 重建。
+- **Blob/GC**：去重引用、复活、重写、物理删除、补偿队列、审计口径、类型矩阵与别名。
+- **复习**：normalize/判分/SM-2 边界（clamp、连续错重置）、before 链、complete 幂等（409）、答案隐藏。
+- **Phase E**：Windows 文件名清洗、稳定 ID 命名、数据库级联路径、证据空→draft、错题 confirm→事件→终态 409、结构化错因落库、图片路由到 homework_ocr、confirm 触发求解 run、先做后看揭示与 409。
+- **Phase F**：prompt 加载/缓存/夹具覆盖/缺失报错、13 类 schema 合法/非法 JSON/形状错误、混合检索排序与 keyword_only 降级、retrieval_runs 落库、model_calls 成功与失败行（run/node/attempt/prompt 名版本）。
+- **Phase H**：快照恢复全闭环（写→破坏→校验→恢复→数据回来）、垃圾文件/缺迁移表快照拒绝、Fake Gateway 契约（chat 响应键、schema 绑定离线跑通 note_writer）。
 
-审计结论：与修改方案高度一致、证据链完整，未发现实质性谎报（总体匹配 ~92%）。其中点名的「立刻修复」已完成：
+## 四、已用 Mock/夹具验证（离线、不依赖外部组件）
 
-- ✅ `dag_review._self_test` 不再静默吞异常返回空自测：改为 `raise BusinessError`（含回归测试 `TestReviewSelfTestFailure`）。
-- ✅ `main.py` 上传 `os.replace` 后补孤儿文件清理：跟踪 `final_path`，INSERT/入队失败时删除已落盘文件。
-- ✅ 额外修复审计期间发现的实际 P1：删除**已解析**材料原本因 `source_chunks` FK 无 CASCADE 而 500；现会先删子块再删记录，删除成功并清空检索块。
+- Fake Gateway（`tests/test_phase_h.py`）：验证 DAG 节点对网关契约（content/tokens/model 键）的依赖正确；note_writer 在 Fake 网关下走完"外置 prompt→schema→revised 标记"。
+- embed_text 强制失败注入：验证混合检索在 embedding 不可用时正确降级 `keyword_only` 且权重切换（不真实调用网关的封闭验证）。
+- prompt 夹具目录覆盖（`V5_PROMPT_FIXTURE_DIR`）：验证测试可注入固定提示词（checksum 随夹具变化）。
 
-验证：`unittest` **14/14 通过**；上传（走 `os.replace` 路径）正常；DELETE 已解析材料返回 200、chunks 清零。
+## 五、已用真实模型验证（本地网关 127.0.0.1:8080 实际调用）
 
-## 最终验证记录（一键复现）
+- **听课流端到端**（run 57/61）：材料解析→混合检索（hybrid，11 候选→8 选中，retrieval_runs 落库）→大纲（deepseek_v4_free，1505 in/96 out）→笔记（2841/300）→**真实 critic**（qwen3_8_27b，score 0.95 passed，0 轮修订）→证据校验→落库→Obsidian 真实路径 `01 Courses\计算机语言及程序设计\第1章 .../[note-11] ….md`（物理文件存在）。
+- **错题流端到端**（run 58/62）：真实分层错因（root_cause 非空、结构化 JSON）→ provisional → confirm 200 + error_events=['confirmed'] → reject 409。
+- **作业流端到端**（run 59）：文本双题求解→solved；先做后看：未提交无解答→提交第一题→仅该题揭示→重复提交 409。
+- **复习流端到端**（阶段 D）：真实出题（自适应题数）→作答→判分→SM-2 间隔/掌握度更新→complete。
+- **审计实证**：`model_calls` 逐行含真实 prompt 名/版本、模型、token、时延；`retrieval_runs` 模式 hybrid、候选数与选中数一致。
+- **恢复实证**：对生产最新备份 `v5_20260909_000849.db` 执行 dry-run 恢复：integrity ok、migrations [1..7]、33 表。
 
-```bash
-# 后端
-cd v5/backend
-python -m uvicorn app.main:app --port 8801 &
-python -m unittest discover -s tests -v        # 13/13 OK
+## 六、待办（方案内未完成或后续版本）
 
-# 前端（需 node）
-cd v5/frontend && npm run build                 # vue-tsc + vite OK
+1. **图片作业 OCR 全链路真实验证**：`qwen3_vl` 已在模型注册表，但未跑通"图片上传→homework_ocr→用户确认→求解"的带图端到端（需要一张真实错题图片做冒烟）；当前仅单测验证了路由与状态机。
+2. **qwen3_vl 视觉节点**：`error_vision_reader`/OCR 已接外置 prompt 与 schema，但视觉模型真实可用性未确认（若网关未部署该模型，相关运行会以 RetryableModelError 暴露）。
+3. **向量分量的完整闭环**：source_chunks 尚无存量 embedding 列数据，混合检索的 0.40 向量分量对存量块近 0（新块如启用 embedding 入库才生效）；需要一次全量回填任务。
+4. **前端构建产物托管**：当前前端 dev(5173)/preview 独立运行，后端未挂载 dist 静态托管与 SPA fallback（部署形态待定）。
+5. **CI 首次云端运行**：workflow 已就绪，未在本机之外的 GitHub runner 上实际跑过（本机验证等价命令通过）。
+6. **移动端上传入口与 mobile-token 的回归**（G 阶段未改动其逻辑，但未在本轮重新端到端实测）。
 
-# 数据库：首要备份
-python -  <<'PY' ... snapshot_final_...          # integrity=ok, fk=0
-PY
-```
+## 七、已知限制（如实说明）
+
+1. **混合检索的 BM25 为候选集内计算**（轻量实现）：IDF 在过滤后的候选集内估计，不是全局语料统计；对"过滤后小候选集"场景排序质量足够，但与全文检索引擎的 BM25 数值不具可比性。
+2. **critic 修订环最多 1 轮**（方案 10.4 上限即 1）：复审仍不通过时保留 draft 状态交人工，不做无限修订。
+3. **课程名/章节名为空或 lesson 脱链时**，Obsidian 路径回退 `未分类课程/未分类章节`（有课时级联补齐，无任何 id 时才回退）。
+4. **error_events 不含 deleted 事件**：错题删除直接物理删除（方案未定义删除事件流）。
+5. **`retrieval_runs`/`model_calls` 无清理策略**：随使用量线性增长（含输入 sha256 摘要而非原文，敏感面可控）；建议后续加保留窗口。
+6. **恢复工具要求停机执行**：原子替换前只释放本进程连接，不处理其他进程占用（Windows 文件锁）。
+7. **SSE 为单实例进程内实现**（DB 轮询生成流）：多副本部署时每副本独立轮询，未做广播优化。
+8. **测试对 Windows 控制台编码有约定**：脚本须 UTF-8 reconfigure；过滤脚本的 `[exit code: 1]` 为管道噪声，以打印的 OK/FAILED 为准。
+
+---
+
+## 八、验证环境
+
+- Windows 11 / Python 3.12.10 / Node v24.19.0（npm 11.17.0）
+- 后端 `127.0.0.1:8801`（uvicorn app.main:app），模型网关 `127.0.0.1:8080`（真实可用，usage/chat 200）
+- 生产库 `backend/data/v5.db`：schema v7、材料 1–8 blob 引用 live、`without_blob=0`
+- 全量命令：`python -m unittest discover -s tests -t .` → `Ran 81 tests ... OK`；`npx vue-tsc -b` → 0 错；`npm run build` → 成功
