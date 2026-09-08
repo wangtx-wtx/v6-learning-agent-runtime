@@ -1,21 +1,25 @@
 """
-v5.4 数据库层：统一数据访问 + 一致性 schema + 增量迁移。
+V5.5 数据库层：线程本地连接 + 版本化迁移 + 明确的写入语义。
 
-对比 V5.3 审查结论的整改：
-- query() 不再支持 one=True，统一用 fetch_one() / query_one()（返回 dict）。
-- 所有查询返回 dict 或领域对象，绝不向业务层泄漏 sqlite3.Row（修复 RAG/证据/状态机的 .get() 崩溃）。
-- 所有业务调用走本模块，禁止业务代码自行构造连接。
-- 多步写入用 transaction() 上下文，失败整体回滚。
-- 建表/迁移走版本化 migrate()，不再用 CREATE TABLE IF NOT EXISTS 充当迁移工具。
-- 路径基于配置的绝对 UPLOAD_DIR / DB_PATH，不出现相对 "data/..."。
-
-主动安全：PRAGMA foreign_keys=ON、busy_timeout、WAL、单例连接。
+对比 V5.4 的整改（方案 2.1-2.5）：
+- 【2.1】外键修正：lessons.chapter_id REFERENCES chapters(id)（旧 schema 错指向 lessons(id)）。
+- 【2.2】Schema 版本化：backend/migrations/0001..0006 按版本执行并记录 schema_migrations
+  （含 checksum 校验）；不再使用运行时 ALTER 充当迁移工具；遗留库拒绝启动并要求执行
+  影子迁移工具（backend/tools/migrate_database.py）。
+- 【2.4】连接管理：每线程独立连接（threading.local），WAL + busy_timeout=15000；
+  写事务 BEGIN IMMEDIATE，SQLITE_BUSY 最多重试 3 次；禁止跨线程共享连接。
+- 【2.5】写入语义拆分：insert() 返回 lastrowid（仅 INSERT）；execute() 返回 rowcount
+  （UPDATE/DELETE/DDL）；executemany() 返回影响行数。查询一律返回 dict。
+- 事务上下文 transaction()：块内 execute/insert 不自行 commit，由上下文统一提交/回滚。
+- 测试可注入临时库：configure_db(path) + reset_connections()。
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -25,265 +29,78 @@ from .config import DB_PATH, DATA_DIR
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 目标 schema（与现有 v5.db 实际结构一致，并补齐方案要求的字段）
+# 版本化迁移（方案 2.2）
 # ---------------------------------------------------------------------------
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS courses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
+
+SCHEMA_MIGRATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
-    code TEXT, semester TEXT, teacher TEXT, schedule_json TEXT,
-    created_at TEXT DEFAULT (datetime('now','localtime'))
-);
-CREATE TABLE IF NOT EXISTS chapters (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-    chapter_no INTEGER, title TEXT NOT NULL, syllabus_ref TEXT,
-    status TEXT DEFAULT 'not_started',
-    review_status TEXT DEFAULT 'none',
-    completed_at TEXT, reviewed_at TEXT,
-    created_at TEXT DEFAULT (datetime('now','localtime'))
-);
-CREATE TABLE IF NOT EXISTS lessons (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chapter_id INTEGER REFERENCES lessons(id) ON DELETE CASCADE,
-    course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-    lesson_no TEXT, title TEXT, date TEXT,
-    status TEXT DEFAULT 'not_started',
-    note_id INTEGER, summary TEXT,
-    created_at TEXT DEFAULT (datetime('now','localtime'))
-);
-CREATE TABLE IF NOT EXISTS materials (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    lesson_id INTEGER REFERENCES lessons(id) ON DELETE SET NULL,
-    chapter_id INTEGER REFERENCES chapters(id) ON DELETE SET NULL,
-    course_id INTEGER REFERENCES courses(id) ON DELETE SET NULL,
-    file_path TEXT, file_hash TEXT, type TEXT, kind TEXT,
-    display_name TEXT, name TEXT, mime TEXT,
-    sha256 TEXT, size_bytes INTEGER DEFAULT 0,
-    parser_status TEXT DEFAULT 'uploaded',
-    parse_error TEXT,
-    status TEXT DEFAULT 'uploaded',
-    created_at TEXT DEFAULT (datetime('now','localtime')),
-    updated_at TEXT
-);
-CREATE TABLE IF NOT EXISTS source_chunks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    material_id INTEGER REFERENCES materials(id) ON DELETE CASCADE,
-    lesson_id INTEGER REFERENCES lessons(id) ON DELETE CASCADE,
-    chapter_id INTEGER REFERENCES chapters(id) ON DELETE CASCADE,
-    course_id INTEGER REFERENCES courses(id) ON DELETE CASCADE,
-    type TEXT, locator TEXT, text TEXT,
-    image_file TEXT, ocr_confidence REAL DEFAULT 1.0,
-    topics_json TEXT, embedding TEXT,
-    created_at TEXT DEFAULT (datetime('now','localtime'))
-);
-CREATE TABLE IF NOT EXISTS notes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    lesson_id INTEGER REFERENCES lessons(id) ON DELETE CASCADE,
-    chapter_id INTEGER REFERENCES chapters(id) ON DELETE CASCADE,
-    course_id INTEGER REFERENCES courses(id) ON DELETE CASCADE,
-    title TEXT, body TEXT,
-    markdown_path TEXT, status TEXT DEFAULT 'draft',
-    version INTEGER DEFAULT 1,
-    evidence_json TEXT, model_used TEXT,
-    created_at TEXT DEFAULT (datetime('now','localtime'))
-);
-CREATE TABLE IF NOT EXISTS homeworks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT, status TEXT DEFAULT 'pending',
-    lesson_id INTEGER REFERENCES lessons(id) ON DELETE CASCADE,
-    chapter_id INTEGER REFERENCES chapters(id) ON DELETE CASCADE,
-    course_id INTEGER REFERENCES courses(id) ON DELETE CASCADE,
-    mode TEXT, date TEXT, input_dir TEXT,
-    created_at TEXT DEFAULT (datetime('now','localtime'))
-);
-CREATE TABLE IF NOT EXISTS questions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    homework_id INTEGER REFERENCES homeworks(id) ON DELETE CASCADE,
-    question_no INTEGER, text TEXT,
-    image_file TEXT, knowledge_points_json TEXT,
-    scope_json TEXT, risk_json TEXT,
-    created_at TEXT DEFAULT (datetime('now','localtime'))
-);
-CREATE TABLE IF NOT EXISTS answer_items (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    question_id INTEGER REFERENCES questions(id) ON DELETE CASCADE,
-    final_answer TEXT, solution_plan TEXT, detailed_solution TEXT,
-    confidence REAL, model_used TEXT, parallel_solution TEXT,
-    teaching TEXT, evidence_json TEXT,
-    status TEXT DEFAULT 'draft', out_of_scope_risk TEXT,
-    conflict TEXT,
-    created_at TEXT DEFAULT (datetime('now','localtime'))
-);
-CREATE TABLE IF NOT EXISTS errors (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    course_id INTEGER REFERENCES courses(id) ON DELETE SET NULL,
-    chapter_id INTEGER REFERENCES chapters(id) ON DELETE SET NULL,
-    lesson_id INTEGER REFERENCES lessons(id) ON DELETE SET NULL,
-    question_text TEXT, image_file TEXT,
-    student_answer TEXT, correct_answer TEXT, user_explanation TEXT,
-    ai_error_json TEXT, final_error_json TEXT,
-    mastery REAL DEFAULT 0.0,
-    status TEXT DEFAULT 'provisional',
-    next_review_at TEXT, review_stage INTEGER DEFAULT 0,
-    created_at TEXT DEFAULT (datetime('now','localtime'))
-);
-CREATE TABLE IF NOT EXISTS reviews (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chapter_id INTEGER REFERENCES chapters(id) ON DELETE CASCADE,
-    course_id INTEGER REFERENCES courses(id) ON DELETE CASCADE,
-    kind TEXT, exam_date TEXT, scope_json TEXT,
-    outline TEXT, review_materials TEXT, self_test TEXT,
-    auditor_result TEXT, score REAL,
-    status TEXT DEFAULT 'pending', outputs_json TEXT,
-    created_at TEXT DEFAULT (datetime('now','localtime'))
-);
-CREATE TABLE IF NOT EXISTS review_attempts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    review_id INTEGER REFERENCES reviews(id) ON DELETE CASCADE,
-    question_no TEXT, question_text TEXT, user_answer TEXT,
-    is_correct INTEGER, mastery REAL,
-    created_at TEXT DEFAULT (datetime('now','localtime'))
-);
-CREATE TABLE IF NOT EXISTS workflow_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    workflow TEXT NOT NULL, mode TEXT,
-    course_id INTEGER REFERENCES courses(id) ON DELETE SET NULL,
-    lesson_id INTEGER REFERENCES lessons(id) ON DELETE SET NULL,
-    chapter_id INTEGER REFERENCES chapters(id) ON DELETE SET NULL,
-    status TEXT DEFAULT 'pending',
-    input_json TEXT, output_json TEXT, error TEXT,
-    created_at TEXT DEFAULT (datetime('now','localtime')),
-    updated_at TEXT
-);
-CREATE TABLE IF NOT EXISTS run_nodes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
-    node_name TEXT, agent_role TEXT, model TEXT, status TEXT,
-    attempt INTEGER DEFAULT 1,
-    started_at TEXT, finished_at TEXT,
-    tokens_in INTEGER DEFAULT 0, tokens_out INTEGER DEFAULT 0,
-    latency_ms INTEGER DEFAULT 0,
-    input_ref TEXT, output_ref TEXT, output_json TEXT, error TEXT
-);
-CREATE TABLE IF NOT EXISTS sync_jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    target TEXT, asset_id INTEGER, asset_path TEXT,
-    content_hash TEXT, status TEXT DEFAULT 'pending',
-    retries INTEGER DEFAULT 0, last_error TEXT, synced_at TEXT
-);
-CREATE TABLE IF NOT EXISTS graph_nodes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    course_id INTEGER REFERENCES courses(id) ON DELETE CASCADE,
-    title TEXT, node_type TEXT DEFAULT 'topic', meta_json TEXT
-);
-CREATE TABLE IF NOT EXISTS graph_edges (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_id INTEGER REFERENCES graph_nodes(id) ON DELETE CASCADE,
-    target_id INTEGER REFERENCES graph_nodes(id) ON DELETE CASCADE,
-    relation TEXT, status TEXT DEFAULT 'confirmed'
-);
-CREATE TABLE IF NOT EXISTS academic_calendar (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    course_id INTEGER REFERENCES courses(id) ON DELETE SET NULL,
-    event_type TEXT, title TEXT, date TEXT, detail TEXT,
-    created_at TEXT DEFAULT (datetime('now','localtime'))
-);
-CREATE TABLE IF NOT EXISTS evidence_links (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner_type TEXT, owner_id INTEGER,
-    chunk_id INTEGER REFERENCES source_chunks(id) ON DELETE SET NULL,
-    source_type TEXT, quote TEXT, locator TEXT,
-    evidence_kind TEXT, verify_status TEXT, verify_method TEXT,
-    model TEXT, prompt_version TEXT,
-    created_at TEXT DEFAULT (datetime('now','localtime'))
-);
-CREATE TABLE IF NOT EXISTS run_tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER UNIQUE REFERENCES workflow_runs(id) ON DELETE CASCADE,
-    status TEXT DEFAULT 'queued',
-    error TEXT,
-    created_at TEXT DEFAULT (datetime('now','localtime')),
-    finished_at TEXT
-);
-CREATE TABLE IF NOT EXISTS parse_tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    material_id INTEGER UNIQUE REFERENCES materials(id) ON DELETE CASCADE,
-    status TEXT DEFAULT 'queued',
-    error TEXT,
-    created_at TEXT DEFAULT (datetime('now','localtime')),
-    finished_at TEXT
+    checksum TEXT NOT NULL,
+    applied_at TEXT NOT NULL
 );
 """
 
-# 索引单独维护：必须在表/列补齐之后创建（避免旧库缺列时 CREATE INDEX 失败）。
-INDEX_SQL = """
-CREATE INDEX IF NOT EXISTS idx_chapters_course ON chapters(course_id);
-CREATE INDEX IF NOT EXISTS idx_lessons_chapter ON lessons(chapter_id);
-CREATE INDEX IF NOT EXISTS idx_lessons_course ON lessons(course_id);
-CREATE INDEX IF NOT EXISTS idx_materials_lesson ON materials(lesson_id);
-CREATE INDEX IF NOT EXISTS idx_materials_course ON materials(course_id);
-CREATE INDEX IF NOT EXISTS idx_materials_hash ON materials(sha256);
-CREATE INDEX IF NOT EXISTS idx_chunks_material ON source_chunks(material_id);
-CREATE INDEX IF NOT EXISTS idx_chunks_chapter ON source_chunks(chapter_id);
-CREATE INDEX IF NOT EXISTS idx_notes_lesson ON notes(lesson_id);
-CREATE INDEX IF NOT EXISTS idx_questions_homework ON questions(homework_id);
-CREATE INDEX IF NOT EXISTS idx_answer_items_question ON answer_items(question_id);
-CREATE INDEX IF NOT EXISTS idx_errors_chapter_status ON errors(chapter_id, status);
-CREATE INDEX IF NOT EXISTS idx_run_nodes_run ON run_nodes(run_id);
-CREATE INDEX IF NOT EXISTS idx_runs_workflow ON workflow_runs(workflow, status);
-CREATE TABLE IF NOT EXISTS review_attempts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    review_id INTEGER REFERENCES reviews(id) ON DELETE CASCADE,
-    question_no TEXT, question_text TEXT, user_answer TEXT,
-    is_correct INTEGER, mastery_after REAL,
-    created_at TEXT DEFAULT (datetime('now','localtime'))
-);
-"""
 
-# 幂等列补充：{表: [(列, 类型, 默认值或 None, 是否 NOT NULL)]}
-# 用于「CREATE TABLE IF NOT EXISTS 不会补列」的脚本化演进（影子迁移后跑一次）。
-ADDITIVE_MIGRATIONS: list[tuple[str, str, str]] = []
+class MigrationRequiredError(RuntimeError):
+    """遗留数据库（无 schema_migrations）：必须先运行影子迁移工具。"""
 
 
-def _row_to_dict(row: sqlite3.Row) -> dict:
-    if row is None:
-        return {}
-    return {k: row[k] for k in row.keys()}
+class SchemaOutdatedError(RuntimeError):
+    """迁移文件比已应用版本新：启动前需应用（或运行迁移工具）。"""
 
 
-_lock = threading.Lock()
-_conn: Optional[sqlite3.Connection] = None
+class SchemaTamperedError(RuntimeError):
+    """已应用迁移的 checksum 与文件不符：迁移文件被改动。"""
 
 
-def _get_conn() -> sqlite3.Connection:
-    global _conn
-    with _lock:
-        if _conn is None:
-            DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=15.0)
-            conn.row_factory = sqlite3.Row
-            conn.executescript(SCHEMA_SQL)
-            # 补齐存量库缺失字段，再建索引（索引可能在 ADD COLUMN 之后才能创建）
-            _migrate_conn(conn)
-            conn.executescript(INDEX_SQL)
-            conn.executescript(
-                "PRAGMA journal_mode=WAL;"
-                "PRAGMA synchronous=NORMAL;"
-                "PRAGMA foreign_keys=ON;"
-                "PRAGMA busy_timeout=15000;"
-            )
-            _conn = conn
-        return _conn
+class NotFoundError(LookupError):
+    """UPDATE/DELETE 影响 0 行时的业务语义错误。"""
 
 
-@contextmanager
-def transaction() -> Iterator[sqlite3.Connection]:
-    """多步写入原子性：全部成功提交，失败整体回滚。"""
-    conn = _get_conn()
+def _migration_files() -> list[dict]:
+    """返回 [{version, name, checksum, sql}]，按版本号升序。缺失目录视为空（纯内存测试）。"""
+    if not MIGRATIONS_DIR.exists():
+        return []
+    out = []
+    for p in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        stem = p.stem  # e.g. 0001_baseline
+        try:
+            version = int(stem.split("_", 1)[0])
+        except ValueError:
+            raise RuntimeError(f"迁移文件名必须以版本号开头: {p.name}")
+        sql = p.read_text(encoding="utf-8")
+        out.append({
+            "version": version,
+            "name": stem,
+            "checksum": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+            "sql": sql,
+        })
+    return out
+
+
+def _split_statements(sql: str) -> list[str]:
+    """
+    把迁移 SQL 拆成单条语句（迁移文件仅允许 DDL/DML，不允许触发器与
+    字符串内分号——executescript 会隐式 COMMIT，无法用于事务化迁移）。
+    """
+    lines = [ln for ln in sql.splitlines() if not ln.strip().startswith("--")]
+    cleaned = "\n".join(lines)
+    return [s.strip() for s in cleaned.split(";") if s.strip()]
+
+
+def _apply_migration(conn: sqlite3.Connection, mig: dict) -> None:
+    """在单个事务中应用一个迁移并记录版本。失败整体回滚并向上抛出（拒绝启动）。"""
+    conn.execute("BEGIN IMMEDIATE")
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        yield conn
+        for stmt in _split_statements(mig["sql"]):
+            conn.execute(stmt)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, checksum, applied_at) "
+            "VALUES (?, ?, ?, datetime('now','localtime'))",
+            (mig["version"], mig["name"], mig["checksum"]),
+        )
         conn.execute("COMMIT")
     except Exception:
         try:
@@ -293,23 +110,203 @@ def transaction() -> Iterator[sqlite3.Connection]:
         raise
 
 
+def ensure_schema(conn: sqlite3.Connection) -> dict:
+    """
+    校验并按需应用迁移。返回报告 dict。
+    - 全新库（无用户表）：按版本顺序应用全部迁移。
+    - 已应用库：校验 checksum；有未应用的新版本 → 自动前向应用（lifespan 内、服务前）。
+    - 遗留库（有表但无 schema_migrations）→ MigrationRequiredError（拒绝启动）。
+    """
+    conn.executescript(SCHEMA_MIGRATIONS_DDL)
+    conn.commit()
+    tables = {
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    }
+    applied = {
+        r["version"]: dict(r) for r in
+        conn.execute("SELECT * FROM schema_migrations").fetchall()
+    }
+    files = _migration_files()
+
+    # checksum 校验：已应用版本不得被修改
+    for mig in files:
+        if mig["version"] in applied and applied[mig["version"]]["checksum"] != mig["checksum"]:
+            raise SchemaTamperedError(
+                f"迁移 {mig['version']}({mig['name']}) 的 checksum 与已应用记录不一致，"
+                "已应用的迁移文件不允许修改"
+            )
+
+    user_tables = tables - {"schema_migrations"}
+    if not user_tables and not applied:
+        # 全新库
+        for mig in files:
+            _apply_migration(conn, mig)
+        conn.commit()
+        return {"mode": "fresh_init", "applied": [m["version"] for m in files]}
+
+    if not applied:
+        raise MigrationRequiredError(
+            "检测到遗留数据库（无 schema_migrations 记录）。"
+            "请先运行: python -m tools.migrate_database 执行影子迁移；"
+            "应用拒绝在未迁移的库上启动。"
+        )
+
+    pending = [m for m in files if m["version"] not in applied]
+    if pending:
+        for mig in pending:
+            _apply_migration(conn, mig)
+        conn.commit()
+        logger.info("前向迁移完成: %s", [m["version"] for m in pending])
+    return {"mode": "ok", "applied_versions": sorted(applied.keys()),
+            "newly_applied": [m["version"] for m in pending]}
+
+
 # ---------------------------------------------------------------------------
-# 统一数据访问（返回 dict，不泄漏 sqlite3.Row）
+# 连接管理：每线程独立连接（方案 2.4）
 # ---------------------------------------------------------------------------
-def execute(sql: str, params: tuple = (), *, returning_lastrowid: bool = False):
-    cur = _get_conn().execute(sql, params)
-    _get_conn().commit()
-    lid = cur.lastrowid
-    return lid if returning_lastrowid else (lid if lid else cur.rowcount)
+_thread_local = threading.local()
+_db_path_override: Optional[Path] = None
+_override_lock = threading.Lock()
+
+
+def _active_db_path() -> Path:
+    with _override_lock:
+        return Path(_db_path_override) if _db_path_override else Path(DB_PATH)
+
+
+def configure_db(path: str | Path) -> None:
+    """测试注入：切换数据库路径并清空连接池。"""
+    global _db_path_override
+    with _override_lock:
+        _db_path_override = Path(path)
+    reset_connections()
+
+
+def reset_connections() -> None:
+    """关闭当前线程的连接（其他线程的连接由各自线程回收/进程退出释放）。"""
+    conn = getattr(_thread_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    _thread_local.conn = None
+    _thread_local.in_tx = False
+
+
+def create_connection(path: str | Path | None = None) -> sqlite3.Connection:
+    p = Path(path) if path else _active_db_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(p), timeout=15.0)  # check_same_thread 默认 True：禁止跨线程共享
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        "PRAGMA journal_mode=WAL;"
+        "PRAGMA synchronous=NORMAL;"
+        "PRAGMA foreign_keys=ON;"
+        "PRAGMA busy_timeout=15000;"
+    )
+    return conn
+
+
+def get_connection() -> sqlite3.Connection:
+    """返回当前线程的连接（首次使用时建立并校验 schema 版本）。"""
+    conn = getattr(_thread_local, "conn", None)
+    if conn is None:
+        conn = create_connection()
+        report = ensure_schema(conn)
+        if report.get("newly_applied"):
+            logger.info("schema 迁移: %s", report)
+        _thread_local.conn = conn
+        _thread_local.in_tx = False
+    return conn
+
+
+# ---------------------------------------------------------------------------
+# 事务（BEGIN IMMEDIATE + BUSY 重试）
+# ---------------------------------------------------------------------------
+_BUSY_RETRIES = 3
+
+
+@contextmanager
+def transaction() -> Iterator[sqlite3.Connection]:
+    """
+    多步写入原子性：块内所有写入共用当前线程连接，成功统一 COMMIT，失败 ROLLBACK。
+    块内调用 execute()/insert() 不会自行提交。
+    """
+    conn = get_connection()
+    if getattr(_thread_local, "in_tx", False):
+        # 支持嵌套调用：内层复用外层事务
+        yield conn
+        return
+    for attempt in range(_BUSY_RETRIES):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            break
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < _BUSY_RETRIES - 1:
+                time.sleep(0.2 * (attempt + 1))
+                continue
+            raise
+    _thread_local.in_tx = True
+    try:
+        yield conn
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        _thread_local.in_tx = False
+
+
+# ---------------------------------------------------------------------------
+# 统一数据访问（方案 2.5：语义拆分）
+# ---------------------------------------------------------------------------
+def _finish(cur: sqlite3.Cursor) -> None:
+    """事务外自动提交；事务内由 transaction() 统一提交。"""
+    if not getattr(_thread_local, "in_tx", False):
+        get_connection().commit()
+
+
+def insert(sql: str, params: tuple = ()) -> int:
+    """仅用于 INSERT。返回 lastrowid。"""
+    cur = get_connection().execute(sql, params)
+    _finish(cur)
+    return int(cur.lastrowid)
+
+
+def execute(sql: str, params: tuple = ()) -> int:
+    """用于 UPDATE/DELETE/DDL。返回受影响行数（rowcount），不再返回残留 lastrowid。"""
+    cur = get_connection().execute(sql, params)
+    _finish(cur)
+    return int(cur.rowcount)
+
+
+def executemany(sql: str, rows: list[tuple]) -> int:
+    """批量执行。返回影响行数合计。"""
+    conn = get_connection()
+    cur = conn.executemany(sql, rows)
+    _finish(cur)
+    return int(cur.rowcount or 0)
+
+
+def _row_to_dict(row: sqlite3.Row) -> dict:
+    if row is None:
+        return {}
+    return {k: row[k] for k in row.keys()}
 
 
 def fetch_all(sql: str, params: tuple = ()) -> list[dict]:
-    rows = _get_conn().execute(sql, params).fetchall()
+    rows = get_connection().execute(sql, params).fetchall()
     return [_row_to_dict(r) for r in rows]
 
 
 def fetch_one(sql: str, params: tuple = ()) -> Optional[dict]:
-    row = _get_conn().execute(sql, params).fetchone()
+    row = get_connection().execute(sql, params).fetchone()
     return _row_to_dict(row) if row is not None else None
 
 
@@ -322,106 +319,18 @@ def query_one(sql: str, params: tuple = ()) -> Optional[dict]:
 
 
 def init_db() -> None:
-    _get_conn()
+    """建立/校验连接与 schema 版本。遗留库在此抛 MigrationRequiredError（拒绝启动）。"""
+    get_connection()
+
+
+def schema_version() -> int:
+    rows = fetch_all("SELECT MAX(version) AS v FROM schema_migrations")
+    return int(rows[0]["v"] or 0) if rows else 0
 
 
 # ---------------------------------------------------------------------------
-# 影子增量迁移：对齐旧库中缺失的新字段（幂等）
+# 材料路径安全（P0，保持不变）
 # ---------------------------------------------------------------------------
-def _migrate_conn(conn: sqlite3.Connection) -> list[str]:
-    """（不持锁调用方需自行加 _lock）对存量库补齐方案要求的缺失字段。"""
-    migrated: list[str] = []
-    info = {
-        r[0]: {c[1] for c in conn.execute(f"PRAGMA table_info('{r[0]}')").fetchall()}
-        for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-    }
-
-    def add_col(table: str, col: str, ddl: str):
-        if table in info and col not in info[table]:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
-            migrated.append(f"{table}.{col}")
-
-    # materials: 补充方案要求的元信息字段
-    add_col("materials", "display_name", "display_name TEXT")
-    add_col("materials", "name", "name TEXT")
-    add_col("materials", "kind", "kind TEXT")
-    add_col("materials", "mime", "mime TEXT")
-    add_col("materials", "sha256", "sha256 TEXT")
-    add_col("materials", "size_bytes", "size_bytes INTEGER DEFAULT 0")
-    add_col("materials", "parse_error", "parse_error TEXT")
-    add_col("materials", "status", "status TEXT DEFAULT 'uploaded'")
-    add_col("materials", "created_at", "created_at TEXT")
-    add_col("materials", "updated_at", "updated_at TEXT")
-
-    # notes：方案要求补齐课程归属与正文/model
-    add_col("notes", "chapter_id", "chapter_id INTEGER")
-    add_col("notes", "course_id", "course_id INTEGER")
-    add_col("notes", "body", "body TEXT")
-    add_col("notes", "model_used", "model_used TEXT")
-    add_col("notes", "created_at", "created_at TEXT")
-
-    # reviews 补齐结构化字段（旧库 reviews 仅 kind/outputs_json）
-    add_col("reviews", "course_id", "course_id INTEGER")
-    add_col("reviews", "exam_date", "exam_date TEXT")
-    add_col("reviews", "scope_json", "scope_json TEXT")
-    add_col("reviews", "outline", "outline TEXT")
-    add_col("reviews", "review_materials", "review_materials TEXT")
-    add_col("reviews", "self_test", "self_test TEXT")
-    add_col("reviews", "auditor_result", "auditor_result TEXT")
-    add_col("reviews", "score", "score REAL")
-    add_col("reviews", "created_at", "created_at TEXT")
-
-    # homeworks / questions / answer_items 补齐
-    add_col("homeworks", "course_id", "course_id INTEGER")
-    add_col("homeworks", "mode", "mode TEXT")
-    add_col("homeworks", "date", "date TEXT")
-    add_col("homeworks", "input_dir", "input_dir TEXT")
-    add_col("homeworks", "created_at", "created_at TEXT")
-    add_col("questions", "image_file", "image_file TEXT")
-    add_col("questions", "knowledge_points_json", "knowledge_points_json TEXT")
-    add_col("questions", "scope_json", "scope_json TEXT")
-    add_col("questions", "risk_json", "risk_json TEXT")
-    add_col("questions", "created_at", "created_at TEXT")
-    add_col("answer_items", "model_used", "model_used TEXT")
-    add_col("answer_items", "parallel_solution", "parallel_solution TEXT")
-    add_col("answer_items", "teaching", "teaching TEXT")
-    add_col("answer_items", "conflict", "conflict TEXT")
-    add_col("answer_items", "out_of_scope_risk", "out_of_scope_risk TEXT")
-    add_col("answer_items", "created_at", "created_at TEXT")
-    add_col("errors", "mastery", "mastery REAL DEFAULT 0.0")
-    add_col("source_chunks", "image_file", "image_file TEXT")
-    add_col("source_chunks", "ocr_confidence", "ocr_confidence REAL DEFAULT 1.0")
-    add_col("source_chunks", "topics_json", "topics_json TEXT")
-    add_col("source_chunks", "embedding", "embedding TEXT")
-    add_col("source_chunks", "created_at", "created_at TEXT")
-
-    # workflow_runs 补充 updated_at
-    add_col("workflow_runs", "updated_at", "updated_at TEXT")
-
-    # run_nodes 补充 attempt / output_json / latency 结构结果
-    add_col("run_nodes", "attempt", "attempt INTEGER DEFAULT 1")
-    add_col("run_nodes", "output_json", "output_json TEXT")
-    add_col("run_nodes", "latency_ms", "latency_ms INTEGER DEFAULT 0")
-
-    # review_attempts 新增（用于复习作答记录）
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS review_attempts ("
-        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        " review_id INTEGER REFERENCES reviews(id) ON DELETE CASCADE,"
-        " question_no TEXT, question_text TEXT, user_answer TEXT,"
-        " is_correct INTEGER, mastery_after REAL,"
-        " created_at TEXT DEFAULT (datetime('now','localtime')) )"
-    )
-    conn.commit()
-    return migrated
-
-
-def migrate_existing_db() -> dict:
-    # 由 _get_conn 首次连接时自动执行；此处仅保证执行过并返回幂等统计
-    conn = _get_conn()
-    return {"migrated_columns": "runs_at_connect", "db_path": str(DB_PATH)}
-
-
 def resolve_material_path(material_id: int) -> tuple[str, str, str]:
     """P0 安全边界：把 material_id 解析为受控 uploads 根目录下的真实路径。"""
     from .dag import BusinessError

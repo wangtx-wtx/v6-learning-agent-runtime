@@ -1,4 +1,4 @@
-"""
+﻿"""
 作业流 DAG（V5.4 重写，对应方案 7.2）。
 
 链路：
@@ -18,7 +18,7 @@ import re
 from typing import Optional
 
 from .dag import DAG, DAGContext, DAGNode, BusinessError
-from .database import execute, fetch_all, fetch_one
+from .database import execute, fetch_all, fetch_one, insert
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ async def _ocr_image(gateway, ctx, model: str, img) -> str:
         image_b64 = base64.b64encode(Path(img).read_bytes()).decode()
     elif isinstance(img, int):
         try:
-            from .database import resolve_material_path
+            from .database import resolve_material_path, insert
             p, _, _ = resolve_material_path(img)
             image_b64 = base64.b64encode(Path(p).read_bytes()).decode()
         except Exception:
@@ -104,19 +104,19 @@ async def persist_questions_node(ctx: DAGContext, model: str) -> dict:
     items = ctx.outputs.get("resolve_input", {}).get("questions", [])
     homework_id = ctx.input.get("homework_id")
     if not homework_id:
-        homework_id = execute(
+        homework_id = insert(
             "INSERT INTO homeworks (title, status, course_id, lesson_id, chapter_id, mode, date, created_at) "
             "VALUES (?, 'pending', ?, ?, ?, ?, datetime('now','localtime'), datetime('now','localtime'))",
             ("待解作业", ctx.input.get("course_id"), ctx.input.get("lesson_id"), ctx.input.get("chapter_id"), "solve"),
-            returning_lastrowid=True,
-        )
+
+)
     question_ids = []
     for i, q in enumerate(items, 1):
-        qid = execute(
+        qid = insert(
             "INSERT INTO questions (homework_id, question_no, text, created_at) VALUES (?,?,?, datetime('now','localtime'))",
             (homework_id, i, q),
-            returning_lastrowid=True,
-        )
+
+)
         question_ids.append({"question_id": qid, "question_no": i, "text": q})
     return {"homework_id": homework_id, "questions": question_ids, "count": len(question_ids)}
 
@@ -258,7 +258,7 @@ async def scope_checker_node(ctx: DAGContext, model: str) -> dict:
 
 async def persist_answers_node(ctx: DAGContext, model: str) -> dict:
     """把所有解答写入 answer_items，并标记冲突、累计 token。"""
-    from .database import fetch_all
+    from .database import fetch_all, insert
     solver_answers = ctx.outputs.get("solver", {}).get("answers", [])
     parallel = ctx.outputs.get("parallel_solver", {}).get("parallel_answers", [])
     decisions = ctx.outputs.get("adjudicator", {}).get("decisions", [])
@@ -271,7 +271,7 @@ async def persist_answers_node(ctx: DAGContext, model: str) -> dict:
     for a in solver_answers:
         qid = qid_by_no.get(a.get("question_no"))
         conf = dec_map.get(a.get("question_no"), {}).get("conflict", False)
-        execute(
+        insert(
             "INSERT INTO answer_items (question_id, final_answer, solution_plan, detailed_solution, "
             " confidence, model_used, parallel_solution, teaching, evidence_json, status, conflict, created_at) "
             "VALUES (?,?,?,?,?,?,?,?,'{}',?,?,datetime('now','localtime'))",

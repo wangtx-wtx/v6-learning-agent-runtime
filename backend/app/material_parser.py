@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from .database import execute, fetch_all, fetch_one
+from .database import execute, fetch_all, fetch_one, insert
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,7 @@ async def run_parse_material(material_id: int) -> dict:
     chunk_count = 0
     for locator, text in located:
         for seg in split_segments(text):
-            execute(
+            insert(
                 "INSERT INTO source_chunks (material_id, lesson_id, chapter_id, course_id, type, locator, text, "
                 " ocr_confidence, created_at) "
                 "VALUES (?,?,?,?,?,?,?, 1.0, datetime('now','localtime'))",
@@ -163,7 +163,7 @@ def _index_material(material_id: int) -> None:
     try:
         rows = fetch_all("SELECT id, text FROM source_chunks WHERE material_id=?", (material_id,))
         for r in rows:
-            execute(
+            insert(
                 "INSERT INTO chunks_fts (rowid, text) VALUES (?, ?) "
                 "ON CONFLICT(rowid) DO UPDATE SET text=excluded.text",
                 (r["id"], r.get("text") or ""),

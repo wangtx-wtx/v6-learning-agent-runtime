@@ -1,10 +1,10 @@
-"""Seed academic_calendar from legacy calendar.json/courses.json."""
+﻿"""Seed academic_calendar from legacy calendar.json/courses.json."""
 import json
 import datetime
 from pathlib import Path
 from typing import Optional
 
-from .database import query, execute
+from .database import query, execute, insert
 
 LEGACY_CALENDAR_PATH = Path(r"C:\Users\28595\Desktop\新建文件夹 (4)\自动化学习框架\data\courses\calendar.json")
 LEGACY_COURSES_PATH = Path(r"C:\Users\28595\Desktop\新建文件夹 (4)\自动化学习框架\data\courses\courses.json")
@@ -88,7 +88,7 @@ def seed_calendar(calendar_path: Optional[Path] = None, courses_path: Optional[P
         events.append(("special", s_.get("name", ""), s_.get("date", ""), s_.get("note", "")))
 
     for typ, title, dt, detail in events:
-        execute(
+        insert(
             "INSERT INTO academic_calendar (course_id, event_type, title, date, detail) VALUES (NULL,?,?,?,?)",
             (typ, title, dt or None, detail or None),
         )
@@ -107,11 +107,11 @@ def seed_calendar(calendar_path: Optional[Path] = None, courses_path: Optional[P
         rec = by_code.get(code) or by_name.get(name)
         if not rec:
             teacher = lc.get("schedule", [{}])[0].get("teacher") if lc.get("schedule") else None
-            sid = execute(
+            sid = insert(
                 "INSERT INTO courses (name, code, semester, teacher, schedule_json) VALUES (?,?,?,?,?)",
                 (lc.get("name"), code, cal.get("semester"), teacher, _safe_dump(lc.get("schedule", []))),
-                returning_lastrowid=True,
-            )
+
+)
             rec = {"id": sid, "teacher": teacher, "schedule_json": _safe_dump(lc.get("schedule", []))}
             stats["teachers_updated"] += 1
 
@@ -143,12 +143,12 @@ def seed_calendar(calendar_path: Optional[Path] = None, courses_path: Optional[P
                     if ch_rows:
                         chid = ch_rows[0]["id"]
                     else:
-                        chid = execute(
+                        chid = insert(
                             "INSERT INTO chapters (course_id, chapter_no, title, status) VALUES (?,?,?,?)",
                             (rec["id"], 1, "第1章（未定）", "not_started"),
-                            returning_lastrowid=True,
-                        )
-                    execute(
+
+)
+                    insert(
                         "INSERT INTO lessons (chapter_id, course_id, lesson_no, title, date, status) VALUES (?,?,?,?,?,?)",
                         (chid, rec["id"], "L01", "第1讲", lesson_date, "not_started"),
                     )
@@ -158,7 +158,7 @@ def seed_calendar(calendar_path: Optional[Path] = None, courses_path: Optional[P
         if rec.get("id"):
             idx = (rec["id"] - 1) % max(1, 10)
             d = datetime.date.fromisoformat(exam_start) + datetime.timedelta(days=idx)
-            execute(
+            insert(
                 "INSERT INTO academic_calendar (course_id, event_type, title, date, detail) VALUES (?,?,?,?,?)",
                 (rec["id"], "exam", f"期末考试：{lc.get('name','')}", d.isoformat(),
                  f"{code} 期末建议日期（请根据教务处通知手动核正）"),

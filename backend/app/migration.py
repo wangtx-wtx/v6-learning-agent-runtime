@@ -1,4 +1,4 @@
-"""
+﻿"""
 旧数据迁移：从 v2 项目迁移 courses.json, calendar.json, error-bank.json,
 knowledge-graph.json 到 v5 SQLite。
 
@@ -11,7 +11,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from .database import execute, query, query_one, init_db
+from .database import execute, query, query_one, init_db, insert
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ def migrate_from_path(base_path: str) -> dict:
                     course_name = item.get("name") or item.get("title") or ""
                     if not course_name:
                         continue
-                    execute(
+                    insert(
                         "INSERT INTO courses (name, code, semester, teacher, schedule_json) VALUES (?,?,?,?,?)",
                         (course_name, item.get("code", ""), item.get("semester", ""),
                          item.get("teacher", ""), json.dumps(item.get("schedule", {}), ensure_ascii=False)),
@@ -54,7 +54,7 @@ def migrate_from_path(base_path: str) -> dict:
             for ev in events:
                 if isinstance(ev, list):
                     continue
-                execute(
+                insert(
                     "INSERT INTO academic_calendar (course_id, event_type, title, date, detail) VALUES (?,?,?,?,?)",
                     (ev.get("course_id"), ev.get("type", ""), ev.get("title", ""),
                      ev.get("date", ""), json.dumps(ev, ensure_ascii=False)),
@@ -71,7 +71,7 @@ def migrate_from_path(base_path: str) -> dict:
             for item in items:
                 if isinstance(item, list):
                     continue
-                execute(
+                insert(
                     "INSERT INTO errors (course_id, chapter_id, lesson_id, question_text, image_file, "
                     "student_answer, correct_answer, user_explanation, status) VALUES (?,?,?,?,?,?,?,?, 'confirmed')",
                     (item.get("course_id"), item.get("chapter_id"), item.get("lesson_id"),
@@ -93,19 +93,19 @@ def migrate_from_path(base_path: str) -> dict:
             for node in nodes:
                 if isinstance(node, list):
                     continue
-                nid = execute(
+                nid = insert(
                     "INSERT INTO graph_nodes (course_id, title, node_type, meta_json) VALUES (?,?,?,?)",
                     (node.get("course_id"), node.get("title", ""), node.get("node_type", "topic"),
                      json.dumps(node, ensure_ascii=False)),
-                    returning_lastrowid=True,
-                )
+
+)
                 node_map[node.get("id")] = nid
                 stats["graph_nodes"] += 1
             for edge in edges:
                 src = node_map.get(edge.get("source"))
                 tgt = node_map.get(edge.get("target"))
                 if src and tgt:
-                    execute(
+                    insert(
                         "INSERT INTO graph_edges (source_id, target_id, relation) VALUES (?,?,?)",
                         (src, tgt, edge.get("relation", "")),
                     )
@@ -119,7 +119,7 @@ def migrate_from_path(base_path: str) -> dict:
         for md_file in sorted(archive_dir.rglob("*.md")):
             try:
                 content = md_file.read_text(encoding="utf-8", errors="ignore")
-                execute(
+                insert(
                     "INSERT INTO source_chunks (type, locator, text) VALUES ('archive_md', ?, ?)",
                     (str(md_file.relative_to(base)), content[:5000]),
                 )

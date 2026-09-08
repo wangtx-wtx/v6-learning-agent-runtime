@@ -13,7 +13,7 @@ import re
 import unicodedata
 from typing import Optional
 
-from .database import execute, query_one
+from .database import execute, query_one, insert
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +100,7 @@ def verify_evidence_list(
         })
         results.append(item)
         if persist:
-            execute(
+            insert(
                 "INSERT INTO evidence_links "
                 "(owner_type, owner_id, chunk_id, source_type, quote, locator, evidence_kind, "
                 " verify_status, verify_method, model, prompt_version) "

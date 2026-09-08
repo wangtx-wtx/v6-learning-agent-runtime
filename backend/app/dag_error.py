@@ -1,4 +1,4 @@
-"""
+﻿"""
 错题流 DAG（V5.4 重写，对应方案 7.3）。
 
 链路：
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from .dag import DAG, DAGContext, DAGNode, RetryableModelError, SchemaValidationError
-from .database import execute, fetch_one
+from .database import execute, fetch_one, insert
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ async def error_vision_reader(ctx: DAGContext, model: str) -> dict:
             image_b64 = base64.b64encode(Path(img).read_bytes()).decode()
         elif isinstance(img, int):
             try:
-                from .database import resolve_material_path
+                from .database import resolve_material_path, insert
                 p, _, _ = resolve_material_path(img)
                 image_b64 = base64.b64encode(Path(p).read_bytes()).decode()
             except Exception:
@@ -131,7 +131,7 @@ async def error_ingest(ctx: DAGContext, model: str) -> dict:
     ids = []
     for cand in candidates:
         nxt = _sm2_next(0.0, False)
-        eid = execute(
+        eid = insert(
             "INSERT INTO errors (course_id, chapter_id, lesson_id, question_text, student_answer, "
             " correct_answer, ai_error_json, final_error_json, status, next_review_at, review_stage, mastery) "
             "VALUES (?,?,?,?,?,?,?,?, 'provisional', ?, 0, 0.0)",
@@ -141,8 +141,8 @@ async def error_ingest(ctx: DAGContext, model: str) -> dict:
              json.dumps(cand.get("candidate_causes", []), ensure_ascii=False),
              json.dumps({**cand, "ai_analysis": ctx.outputs.get("analyst", {}).get("analysis", [])}, ensure_ascii=False),
              nxt),
-            returning_lastrowid=True,
-        )
+
+)
         ids.append(eid)
     return {"provisional_count": len(ids), "ids": ids}
 

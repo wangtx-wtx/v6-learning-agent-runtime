@@ -14,7 +14,7 @@ import logging
 import threading
 from typing import Optional
 
-from .database import execute, fetch_one
+from .database import execute, fetch_one, insert
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ _parse_worker_started = False
 # --------------------------------------------------------------------------- workflow
 def enqueue_workflow(run_id: int) -> None:
     """把工作流 run 加入后台队列（幂等：主键去重）。"""
-    execute(
+    insert(
         "INSERT OR IGNORE INTO run_tasks (run_id, status, created_at) "
         "VALUES (?, 'queued', datetime('now','localtime'))",
         (run_id,),
@@ -151,7 +151,7 @@ def build_flow(workflow: str):
 
 # --------------------------------------------------------------------------- 材料解析
 def enqueue_parse(material_id: int) -> None:
-    execute(
+    insert(
         "INSERT OR IGNORE INTO parse_tasks (material_id, status, created_at) "
         "VALUES (?, 'queued', datetime('now','localtime'))",
         (material_id,),

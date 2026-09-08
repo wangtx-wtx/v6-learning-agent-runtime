@@ -1,4 +1,4 @@
-"""
+﻿"""
 FastAPI 主应用 + API 路由。
 """
 import asyncio
@@ -20,7 +20,7 @@ from urllib.parse import quote
 
 from . import config
 from .config import OBSIDIAN_VAULT_ROOT, FRONTEND_PORT
-from .database import init_db, query, query_one, execute, fetch_one
+from .database import init_db, query, query_one, execute, fetch_one, insert
 from .gateway import gateway
 from .dag import DAGContext
 from .dag_lesson import build_lesson_dag
@@ -138,20 +138,10 @@ async def mobile_token_check(request: Request, call_next):
 @app.on_event("startup")
 async def startup():
     init_db()
-    # 存量库增量迁移：补齐方案要求而旧库缺失的字段（非破坏性）
-    try:
-        from .database import migrate_existing_db
-        _mr = migrate_existing_db()
-        if _mr.get("migrated_columns"):
-            logger.info("数据库增量迁移: %s", ", ".join(_mr["migrated_columns"]))
-    except Exception as e:
-        logger.warning(f"migrate_existing_db skipped: {e}")
-    # V5.2:运行 schema 演进(唯一索引等)
-    try:
-        from .migration import run_migrations
-        run_migrations()
-    except Exception as e:
-        logger.warning(f"run_migrations skipped: {e}")
+    # V5.5：schema 版本校验在 init_db()/get_connection() 内完成；
+    # 遗留库（无 schema_migrations）会抛 MigrationRequiredError 拒绝启动，
+    # 必须先运行 `python -m tools.migrate_database` 影子迁移（方案 2.2/2.3）。
+    # 运行时 ALTER 迁移体系已废弃，不再在启动阶段做结构变更。
     ensure_vault_structure()
     # 自动导入校历数据（幂等：已有数据则不重复导入）
     try:
@@ -283,12 +273,12 @@ async def health():
 
 @app.post("/api/courses")
 async def create_course(course: CourseCreate):
-    rid = execute(
+    rid = insert(
         "INSERT INTO courses (name, code, semester, teacher, schedule_json) VALUES (?,?,?,?,?)",
         (course.name, course.code, course.semester, course.teacher,
          json.dumps(course.schedule or {}, ensure_ascii=False)),
-        returning_lastrowid=True,
-    )
+
+)
     return {"id": rid, "status": "created"}
 
 
@@ -299,11 +289,11 @@ async def list_courses():
 
 @app.post("/api/chapters")
 async def create_chapter(ch: ChapterCreate):
-    rid = execute(
+    rid = insert(
         "INSERT INTO chapters (course_id, chapter_no, title, syllabus_ref, status) VALUES (?,?,?,?,'not_started')",
         (ch.course_id, ch.chapter_no, ch.title, ch.syllabus_ref),
-        returning_lastrowid=True,
-    )
+
+)
     return {"id": rid, "status": "created"}
 
 
@@ -316,11 +306,11 @@ async def list_chapters(course_id: Optional[int] = None):
 
 @app.post("/api/lessons")
 async def create_lesson(ls: LessonCreate):
-    rid = execute(
+    rid = insert(
         "INSERT INTO lessons (chapter_id, course_id, lesson_no, title, date) VALUES (?,?,?,?,?)",
         (ls.chapter_id, ls.course_id, ls.lesson_no, ls.title, ls.date),
-        returning_lastrowid=True,
-    )
+
+)
     return {"id": rid, "status": "created"}
 
 
@@ -515,14 +505,14 @@ async def upload_material(file: UploadFile = File(...), lesson_id: Optional[int]
         final_path = str(target)  # 审计:移动成功后若后续 INSERT 失败,也要清理这个落盘文件
 
         kind = _kind_of(suf)
-        rid = execute(
+        rid = insert(
             "INSERT INTO materials (lesson_id, chapter_id, course_id, file_path, name, display_name, "
             " file_hash, sha256, type, kind, mime, size_bytes, parser_status, status, updated_at) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'uploaded', 'uploaded', datetime('now','localtime'))",
             (lesson_id, chapter_id, course_id, str(target), raw_name, raw_name,
              sha256[:16], sha256, kind, kind, (file.content_type or ""), total),
-            returning_lastrowid=True,
-        )
+
+)
         # 入库即进解析队列（后台线程读取→切分→建索引）
         from .workers import enqueue_parse
         enqueue_parse(rid)
@@ -790,11 +780,11 @@ async def list_homeworks(chapter_id: Optional[int] = None, lesson_id: Optional[i
 
 @app.post("/api/homeworks")
 async def create_homework():
-    rid = execute(
+    rid = insert(
         "INSERT INTO homeworks (title, status) VALUES (?, ?)",
         ("新作业", "pending"),
-        returning_lastrowid=True,
-    )
+
+)
     return {"id": rid, "status": "pending"}
 
 
@@ -928,11 +918,11 @@ async def list_calendar(course_id: Optional[int] = None, event_type: Optional[st
 
 @app.post("/api/calendar")
 async def create_calendar_event(ev: AcademicCalendarCreate):
-    rid = execute(
+    rid = insert(
         "INSERT INTO academic_calendar (course_id, event_type, title, date, detail) VALUES (?,?,?,?,?)",
         (ev.course_id, ev.event_type, ev.title, ev.date, ev.detail),
-        returning_lastrowid=True,
-    )
+
+)
     return {"id": rid, "status": "created"}
 
 
@@ -1006,11 +996,11 @@ async def import_syllabus(req: SyllabusImportReq):
         course = query_one("SELECT * FROM courses WHERE name=?", (req.course_name,))
     if not course:
         # 自动创建课程
-        course_id = execute(
+        course_id = insert(
             "INSERT INTO courses (name, code, semester) VALUES (?,?,?)",
             (req.course_name or req.course_code or "未命名课程", req.course_code, None),
-            returning_lastrowid=True,
-        )
+
+)
         course = {"id": course_id}
     stats = {"chapters": 0, "lessons": 0}
     chapters_payload = [
@@ -1032,11 +1022,11 @@ async def import_syllabus(req: SyllabusImportReq):
                 ch_id = placeholder["id"]
                 execute("UPDATE chapters SET chapter_no=?, title=? WHERE id=?", (ch_no, ch_title, ch_id))
             else:
-                ch_id = execute(
+                ch_id = insert(
                     "INSERT INTO chapters (course_id, chapter_no, title, status) VALUES (?,?,?,'not_started')",
                     (course["id"], ch_no, ch_title),
-                    returning_lastrowid=True,
-                )
+
+)
             stats["chapters"] += 1
         for ls in ch.get("lessons") or []:
             if isinstance(ls, str):
@@ -1046,7 +1036,7 @@ async def import_syllabus(req: SyllabusImportReq):
                 lesson_no = ls.get("lesson_no")
                 lesson_title = ls.get("title") or ls.get("lesson_no") or "未命名课时"
             date = ls.get("date") if isinstance(ls, dict) else None
-            execute(
+            insert(
                 "INSERT INTO lessons (chapter_id, course_id, lesson_no, title, date, status) VALUES (?,?,?,?,?,'not_started')",
                 (ch_id, course["id"], lesson_no, lesson_title, date),
             )

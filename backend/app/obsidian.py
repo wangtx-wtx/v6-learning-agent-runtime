@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import OBSIDIAN_VAULT_ROOT
-from .database import execute, query
+from .database import execute, query, insert
 
 VAULT_STRUCTURE = [
     "00 Inbox",
@@ -99,7 +99,7 @@ def write_note_vault(course: str, chapter: str, lesson_label: str, title: str,
     rel = path.relative_to(root)
     # 记录 sync job
     h = _hash(markdown)
-    execute(
+    insert(
         "INSERT INTO sync_jobs (target, asset_id, asset_path, content_hash, status, retries, synced_at) "
         "VALUES ('obsidian', 0, ?, ?, 'synced', 0, datetime('now','localtime'))",
         (str(rel), h),

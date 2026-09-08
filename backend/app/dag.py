@@ -1,4 +1,4 @@
-"""
+﻿"""
 DAG 执行引擎（V5.4 重写）。
 
 对照审查报告整改：
@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Optional
 
-from .database import execute, fetch_one
+from .database import execute, fetch_one, insert
 
 logger = logging.getLogger(__name__)
 
@@ -238,12 +238,12 @@ class DAGContext:
         self.model_routes: dict[str, str] = {}
 
     def create_run(self, workflow: str, mode: str, course_id=None, lesson_id=None, chapter_id=None) -> int:
-        self.run_id = execute(
+        self.run_id = insert(
             "INSERT INTO workflow_runs (workflow, mode, course_id, lesson_id, chapter_id, status, input_json, created_at, updated_at) "
             "VALUES (?,?,?,?,?, 'queued', ?, datetime('now','localtime'), datetime('now','localtime'))",
             (workflow, mode, course_id, lesson_id, chapter_id, json.dumps(self.input, ensure_ascii=False, default=str)),
-            returning_lastrowid=True,
-        )
+
+)
         return self.run_id
 
     def set_output(self, name: str, value: dict):
@@ -281,14 +281,14 @@ class DAGContext:
         )
 
     def start_node(self, node: DAGNode, model_id: str, started_iso: str, attempt: int = 1) -> int:
-        return execute(
+        return insert(
             "INSERT INTO run_nodes (run_id, node_name, status, agent_role, model, attempt, input_ref, "
             " started_at, tokens_in, tokens_out, latency_ms, error) "
             "VALUES (?,?,?,?,?,?,?,?,0,0,0,'')",
             (self.run_id, node.name, "running", node.agent_role, model_id or LOCAL_MODEL_ID,
              attempt, str(uuid.uuid4()), started_iso),
-            returning_lastrowid=True,
-        )
+
+)
 
     def finish_node(self, node_id: int, status: str, result: dict,
                     started: float = None, attempt: int = 1, error: str = "",

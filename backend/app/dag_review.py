@@ -1,4 +1,4 @@
-"""
+﻿"""
 复习流 DAG（V5.4 重写，对应方案 7.4）。
 
 链路：
@@ -14,7 +14,7 @@ import json
 import logging
 
 from .dag import DAG, DAGContext, DAGNode, BusinessError
-from .database import execute, fetch_all, fetch_one
+from .database import execute, fetch_all, fetch_one, insert
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +97,7 @@ async def _persist_node(ctx: DAGContext, model: str) -> dict:
     self_test = ctx.outputs.get("self_test", {}).get("self_test", [])
     insuff = ctx.outputs.get("writer", {}).get("insufficient_data", False)
     auditor = json.dumps({"auditor": "skip"} if insuff else {"auditor": "ok"}, ensure_ascii=False)
-    rid = execute(
+    rid = insert(
         "INSERT INTO reviews (course_id, chapter_id, kind, exam_date, scope_json, outline, review_materials, "
         " self_test, status, outputs_json, auditor_result, score, created_at) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?, datetime('now','localtime'))",
@@ -109,8 +109,8 @@ async def _persist_node(ctx: DAGContext, model: str) -> dict:
          "insufficient_data" if insuff else "generated",
          json.dumps({"insufficient_data": insuff}, ensure_ascii=False),
          auditor, 0.0 if insuff else 1.0),
-        returning_lastrowid=True,
-    )
+
+)
     return {"review_id": rid, "status": "insufficient_data" if insuff else "generated"}
 
 

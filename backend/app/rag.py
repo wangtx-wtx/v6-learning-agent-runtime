@@ -7,6 +7,7 @@ V5.2:中文分词改用 jieba(细粒度模式),Jaccard 之外附加关键词命�
 import json
 import logging
 import re
+import sqlite3
 from typing import Optional
 
 import numpy as np
@@ -40,6 +41,52 @@ def init_fts() -> None:
         _FTS_INIT_DONE = True
     except Exception as e:
         logger.warning(f"FTS5 初始化失败(可能当前 sqlite 无 fts5): {e}")
+
+
+def rebuild_fts_all(conn: Optional[sqlite3.Connection] = None) -> int:
+    """
+    全量重建 FTS 索引（迁移/恢复后调用）。返回索引块数。
+    rowid = source_chunks.id，保证删除/重解析时能精确同步。
+    """
+    own = conn is None
+    if own:
+        from .database import get_connection
+        conn = get_connection()
+    init_fts()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM chunks_fts")
+        cur.execute("INSERT INTO chunks_fts(rowid, text) SELECT id, text FROM source_chunks")
+        conn.commit()
+        return int(cur.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0])
+    except Exception as e:
+        logger.warning(f"FTS 重建失败: {e}")
+        return -1
+    finally:
+        if own:
+            conn.close()
+
+
+def fts_index_chunks(conn: sqlite3.Connection, rows: list[tuple[int, str]]) -> None:
+    """把新块写入 FTS（rowid=chunk_id, text）。须在 source_chunks 写入的同一事务中调用。"""
+    init_fts()
+    if not rows:
+        return
+    try:
+        conn.executemany("INSERT INTO chunks_fts(rowid, text) VALUES (?,?)", rows)
+    except Exception as e:
+        logger.warning(f"FTS 索引写入失败: {e}")
+
+
+def fts_delete_chunk_ids(conn: sqlite3.Connection, chunk_ids: list[int]) -> None:
+    """删除指定块的 FTS 行（材料重解析/删除时调用，方案 10.1）。"""
+    init_fts()
+    if not chunk_ids:
+        return
+    try:
+        conn.executemany("DELETE FROM chunks_fts WHERE rowid=?", [(i,) for i in chunk_ids])
+    except Exception as e:
+        logger.warning(f"FTS 删除失败: {e}")
 
 
 async def embed_text(text: str) -> list[float]:

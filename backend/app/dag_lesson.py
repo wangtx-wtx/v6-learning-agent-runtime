@@ -1,4 +1,4 @@
-"""
+﻿"""
 听课流 DAG（V5.4 重写，对应方案 7.1）。
 
 链路：
@@ -18,14 +18,14 @@ import json
 import logging
 
 from .dag import DAG, DAGContext, DAGNode
-from .database import execute, fetch_all, fetch_one
+from .database import execute, fetch_all, fetch_one, insert
 from .material_parser import run_parse_material, split_segments
 
 logger = logging.getLogger(__name__)
 
 
 async def resolve_materials_node(ctx: DAGContext, model: str) -> dict:
-    from .database import resolve_materials
+    from .database import resolve_materials, insert
     from .dag import BusinessError
 
     course_id = ctx.input.get("course_id")
@@ -56,13 +56,13 @@ async def parse_materials_node(ctx: DAGContext, model: str) -> dict:
     transcript = (ctx.input.get("transcript") or "").strip()
     if transcript:
         for i, seg in enumerate(split_segments(transcript, 600), 1):
-            cid = execute(
+            cid = insert(
                 "INSERT INTO source_chunks (lesson_id, chapter_id, course_id, type, locator, text, created_at) "
                 "VALUES (?,?,?, 'transcript', ?, ?, datetime('now','localtime'))",
                 (ctx.input.get("lesson_id"), ctx.input.get("chapter_id"), ctx.input.get("course_id"),
                  f"seg:{i}", seg),
-                returning_lastrowid=True,
-            )
+
+)
             chunks.append({"material_id": None, "chunk_id": cid, "locator": f"seg:{i}"})
             total += 1
     return {"chunks": chunks, "count": len(chunks), "materials": [m.get("id") for m in materials]}
@@ -171,7 +171,7 @@ async def persist_note_node(ctx: DAGContext, model: str) -> dict:
     from .obsidian import write_note_vault
     note = ctx.outputs.get("note_writer", {}).get("note", {}) or {}
     ev_ok = ctx.outputs.get("evidence", {}).get("all_verified", False)
-    note_id = execute(
+    note_id = insert(
         "INSERT INTO notes (lesson_id, chapter_id, course_id, title, body, status, version, evidence_json, model_used, created_at) "
         "VALUES (?,?,?,?,?,?, 1, ?, ?, datetime('now','localtime'))",
         (ctx.input.get("lesson_id"), ctx.input.get("chapter_id"), ctx.input.get("course_id"),
@@ -179,8 +179,8 @@ async def persist_note_node(ctx: DAGContext, model: str) -> dict:
          "confirmed" if ev_ok else "draft",
          json.dumps(note.get("evidence", []), ensure_ascii=False),
          ctx.outputs.get("note_writer", {}).get("model_used", "")),
-        returning_lastrowid=True,
-    )
+
+)
     if ctx.input.get("lesson_id"):
         execute("UPDATE lessons SET status='note_ready' WHERE id=?", (ctx.input["lesson_id"],))
     if ctx.input.get("chapter_id"):
@@ -204,7 +204,7 @@ async def obsidian_sync_node(ctx: DAGContext, model: str) -> dict:
         execute("UPDATE notes SET markdown_path=?, status='synced' WHERE id=?", (rel, note_id))
         return {"synced": True, "path": rel}
     except Exception as e:
-        execute(
+        insert(
             "INSERT INTO sync_jobs (target, asset_id, status, retries, last_error, synced_at) "
             "VALUES ('obsidian', ?, 'pending', 0, ?, NULL)",
             (note_id, str(e)[:300]),
