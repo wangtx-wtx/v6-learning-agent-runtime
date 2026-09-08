@@ -11,7 +11,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from .database import execute, query, init_db
+from .database import execute, query, query_one, init_db
 
 logger = logging.getLogger(__name__)
 
@@ -165,10 +165,10 @@ def run_migrations() -> dict:
     )
     if dups:
         for row in dups:
-            keep_id = query(
+            keep_id = query_one(
                 "SELECT MIN(id) AS id FROM courses "
                 "WHERE name=? AND COALESCE(semester,'')=?",
-                (row["name"], row["sem"]), one=True
+                (row["name"], row["sem"]),
             )
             keep_id = keep_id["id"] if keep_id else None
             if keep_id:

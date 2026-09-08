@@ -182,7 +182,7 @@ class DAGContext:
 
     def finish_run(self, status: str = "completed", output: Optional[dict] = None, error: Optional[str] = None):
         # V5.2:状态机白名单——禁止从终态回到非终态
-        cur = query("SELECT status FROM workflow_runs WHERE id=?", (self.run_id,), one=True)
+        cur = query_one("SELECT status FROM workflow_runs WHERE id=?", (self.run_id,))
         if cur and not _can_transition(cur.get("status", ""), status):
             logger.warning(f"非法状态转换 {cur.get('status')} -> {status} 被拒绝")
             return

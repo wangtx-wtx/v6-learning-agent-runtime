@@ -95,6 +95,15 @@ GATEWAY_TIMEOUT = float(os.environ.get("V5_GATEWAY_TIMEOUT", "60"))
 # Obsidian 同步目标（默认自动创建在 v5/data/obsidian_vault）
 OBSIDIAN_VAULT_ROOT = Path(os.environ.get("V5_OBSIDIAN_VAULT", DATA_DIR / "obsidian_vault"))
 
+# 受控数据根目录 —— 所有材料/上传文件都限定在此目录下（P0 路径安全）
+DATA_ROOT = Path(os.environ.get("V5_DATA_ROOT", str(DATA_DIR))).resolve()
+DATA_ROOT.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR = Path(os.environ.get("V5_UPLOAD_DIR", str(DATA_DIR / "uploads"))).resolve()
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_DIR = Path(os.environ.get("V5_BACKUP_DIR", str(DATA_DIR / "backups"))).resolve()
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+QUARANTINE_DIR = Path(os.environ.get("V5_QUARANTINE_DIR", str(DATA_DIR / "quarantine"))).resolve()
+
 # 移动端 / Funnel 模式鉴权 Token（设置后启用；空则不校验）
 _env = _load_env_file()
 MOBILE_TOKEN = (

@@ -20,7 +20,7 @@ from urllib.parse import quote
 
 from . import config
 from .config import OBSIDIAN_VAULT_ROOT, FRONTEND_PORT
-from .database import init_db, query, execute
+from .database import init_db, query, query_one, execute, fetch_one
 from .gateway import gateway
 from .dag import DAGContext
 from .dag_lesson import build_lesson_dag
@@ -83,8 +83,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
-    allow_headers=["Content-Type", "x-app-token"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+    allow_headers=["Content-Type", "x-app-token", "Accept"],
 )
 
 
@@ -133,6 +133,14 @@ async def mobile_token_check(request: Request, call_next):
 @app.on_event("startup")
 async def startup():
     init_db()
+    # 存量库增量迁移：补齐方案要求而旧库缺失的字段（非破坏性）
+    try:
+        from .database import migrate_existing_db
+        _mr = migrate_existing_db()
+        if _mr.get("migrated_columns"):
+            logger.info("数据库增量迁移: %s", ", ".join(_mr["migrated_columns"]))
+    except Exception as e:
+        logger.warning(f"migrate_existing_db skipped: {e}")
     # V5.2:运行 schema 演进(唯一索引等)
     try:
         from .migration import run_migrations
@@ -356,7 +364,7 @@ async def run_lesson(req: LessonRunRequest):
 
 @app.get("/api/workflows/lesson/{run_id}")
 async def get_lesson_run(run_id: int):
-    run = query("SELECT * FROM workflow_runs WHERE id=? AND workflow='lesson'", (run_id,), one=True)
+    run = query_one("SELECT * FROM workflow_runs WHERE id=? AND workflow='lesson'", (run_id,))
     if not run:
         raise HTTPException(404, "run 不存在")
     nodes = query("SELECT * FROM run_nodes WHERE run_id=? ORDER BY id", (run_id,))
@@ -373,7 +381,7 @@ async def run_homework(req: HomeworkRunRequest):
 
 @app.get("/api/workflows/homework/{run_id}")
 async def get_homework_run(run_id: int):
-    run = query("SELECT * FROM workflow_runs WHERE id=? AND workflow='homework'", (run_id,), one=True)
+    run = query_one("SELECT * FROM workflow_runs WHERE id=? AND workflow='homework'", (run_id,))
     if not run:
         raise HTTPException(404, "run 不存在")
     nodes = query("SELECT * FROM run_nodes WHERE run_id=? ORDER BY id", (run_id,))
@@ -433,68 +441,202 @@ async def list_reviews():
 async def upload_material(file: UploadFile = File(...), lesson_id: Optional[int] = Form(None),
                           chapter_id: Optional[int] = Form(None), course_id: Optional[int] = Form(None)):
     """
-    安全上传:
+    安全上传（V5.4 整改）:
     1. 扩展名白名单 (ALLOWED_EXTS)
-    2. UUID 安全文件名(避免路径穿越 + 原始名泄露)
+    2. 流式写入临时文件（避免 50MB 级多份内存副本）→ 校验后原子移动到 UPLOAD_DIR
     3. 单文件 ≤ MAX_FILE_SIZE(默认 50MB)
-    4. Magic bytes 校验(文本类除外)
-    5. 响应不返回绝对路径,只返回 id + kind
+    4. Magic bytes 校验（文本类除外）+ SHA-256 / size
+    5. 相同 SHA-256 去重：返回已有材料或建立引用
+    6. 基于配置的 UPLOAD_DIR 绝对路径，不回传绝对路径
+    7. 初始状态 uploaded（进入材料状态机）
     """
     from pathlib import Path
     import uuid as _uuid
+    from tempfile import NamedTemporaryFile
+    from .config import UPLOAD_DIR
 
-    raw_name = _safe_filename(file.filename or "")
+    raw_name = _safe_filename(file.filename or "") or "unnamed"
     suf = Path(raw_name).suffix.lower()
     if suf not in ALLOWED_EXTS:
         raise HTTPException(status_code=400, detail=f"不支持的文件类型:{suf or '(无)'}")
 
-    # 分块读取 + 限大小
-    chunks: list[bytes] = []
-    total = 0
-    while True:
-        chunk = await file.read(1 * 1024 * 1024)  # 1 MB
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=413,
-                detail=f"文件超过 {MAX_FILE_SIZE // (1024*1024)} MB 限制",
+    # 流式写临时文件 + 实时 SHA-256 / 大小统计
+    tmp_path = None
+    try:
+        tmp = NamedTemporaryFile(prefix="up_", suffix=suf, delete=False, dir=str(UPLOAD_DIR))
+        tmp_path = tmp.name
+        total = 0
+        import hashlib as _hl
+        dig = _hl.sha256()
+        try:
+            while True:
+                chunk = await file.read(1 * 1024 * 1024)  # 1 MB
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_FILE_SIZE:
+                    raise HTTPException(status_code=413, detail=f"文件超过 {MAX_FILE_SIZE // (1024*1024)} MB 限制")
+                tmp.write(chunk)
+                dig.update(chunk)
+        finally:
+            tmp.close()
+        sha256 = dig.hexdigest()
+        if total == 0:
+            raise HTTPException(status_code=400, detail="空文件")
+
+        # Magic bytes 校验
+        head = b""
+        with open(tmp_path, "rb") as fh:
+            head = fh.read(8)
+        if not _check_magic(head, suf):
+            raise HTTPException(status_code=400, detail=f"文件内容与扩展名 {suf} 不匹配")
+
+        # SHA-256 去重：相同内容返回已有材料（只做逻辑引用，不重复落盘）
+        existing = query_one("SELECT id FROM materials WHERE sha256=?", (sha256,))
+        if existing:
+            os.remove(tmp_path)
+            tmp_path = None
+            # 建立逻辑引用（更新归属绑定）
+            execute(
+                "UPDATE materials SET lesson_id=COALESCE(?,lesson_id), chapter_id=COALESCE(?,chapter_id), "
+                "course_id=COALESCE(?,course_id), updated_at=datetime('now','localtime') WHERE id=?",
+                (lesson_id, chapter_id, course_id, existing["id"]),
             )
-        chunks.append(chunk)
-    content = b"".join(chunks)
+            return {"id": existing["id"], "status": "uploaded", "kind": _kind_of(suf),
+                    "name": raw_name, "deduped": True}
 
-    # Magic bytes 校验
-    if not _check_magic(content[:8], suf):
-        raise HTTPException(
-            status_code=400,
-            detail=f"文件内容与扩展名 {suf} 不匹配",
+        # 原子移动到最终文件名
+        safe_name = f"{_uuid.uuid4().hex}{suf}"
+        target = UPLOAD_DIR / safe_name
+        os.replace(tmp_path, str(target))
+        tmp_path = None
+
+        kind = _kind_of(suf)
+        rid = execute(
+            "INSERT INTO materials (lesson_id, chapter_id, course_id, file_path, name, display_name, "
+            " file_hash, sha256, type, kind, mime, size_bytes, parser_status, status, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'uploaded', 'uploaded', datetime('now','localtime'))",
+            (lesson_id, chapter_id, course_id, str(target), raw_name, raw_name,
+             sha256[:16], sha256, kind, kind, (file.content_type or ""), total),
+            returning_lastrowid=True,
         )
+        return {"id": rid, "status": "uploaded", "kind": kind, "name": raw_name}
+    except HTTPException:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+    except Exception:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
-    # 安全文件名 = UUID + 扩展名
-    safe_name = f"{_uuid.uuid4().hex}{suf}"
-    data_dir = Path("data/uploads")
-    data_dir.mkdir(parents=True, exist_ok=True)
-    target = data_dir / safe_name
-    target.write_bytes(content)
 
-    # 类型识别
-    kind = ""
+def _kind_of(suf: str) -> str:
+    suf = suf.lower()
     if suf in (".pptx", ".ppt"):
-        kind = "ppt"
-    elif suf == ".pdf":
-        kind = "pdf"
-    elif suf in (".jpg", ".jpeg", ".png", ".webp"):
-        kind = "image"
+        return "ppt"
+    if suf == ".pdf":
+        return "pdf"
+    if suf in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+        return "image"
+    if suf in (".doc", ".docx"):
+        return "doc"
+    if suf in (".mp3", ".m4a", ".wav"):
+        return "audio"
+    return "text"
 
-    rid = execute(
-        "INSERT INTO materials (lesson_id, chapter_id, course_id, file_path, file_hash, type, parser_status) "
-        "VALUES (?,?,?,?,?,?,'pending')",
-        (lesson_id, chapter_id, course_id, str(target), _sha256_hex(content)[:16], kind),
-        returning_lastrowid=True,
+
+# ---------- 材料库 CRUD ----------
+
+
+# ---------- 材料库 CRUD ----------
+
+@app.get("/api/materials")
+async def list_materials(status: Optional[str] = None, course_id: Optional[int] = None,
+                         chapter_id: Optional[int] = None, lesson_id: Optional[int] = None):
+    sql = "SELECT * FROM materials WHERE 1=1"
+    params = []
+    if status:
+        sql += " AND status=?"
+        params.append(status)
+    if course_id is not None:
+        sql += " AND course_id=?"
+        params.append(course_id)
+    if chapter_id is not None:
+        sql += " AND chapter_id=?"
+        params.append(chapter_id)
+    if lesson_id is not None:
+        sql += " AND lesson_id=?"
+        params.append(lesson_id)
+    sql += " ORDER BY id DESC"
+    # 不回传绝对路径
+    rows = query(sql, tuple(params))
+    for r in rows:
+        r.pop("file_path", None)
+    return rows
+
+
+@app.get("/api/materials/{material_id}")
+async def get_material(material_id: int):
+    row = query_one("SELECT * FROM materials WHERE id=?", (material_id,))
+    if not row:
+        raise HTTPException(404, "材料不存在")
+    row.pop("file_path", None)
+    return row
+
+
+class MaterialPatch(BaseModel):
+    course_id: Optional[int] = None
+    chapter_id: Optional[int] = None
+    lesson_id: Optional[int] = None
+    name: Optional[str] = None
+    status: Optional[str] = None
+
+
+@app.patch("/api/materials/{material_id}")
+async def patch_material(material_id: int, body: MaterialPatch):
+    sets = ["updated_at=datetime('now','localtime')"]
+    params = []
+    for field in ("course_id", "chapter_id", "lesson_id", "name", "status"):
+        val = getattr(body, field)
+        if val is not None:
+            sets.append(f"{field}=?")
+            params.append(val)
+    if len(sets) == 1:
+        raise HTTPException(400, "没有可更新的字段")
+    params.append(material_id)
+    execute(f"UPDATE materials SET {', '.join(sets)} WHERE id=?", tuple(params))
+    return {"id": material_id, "status": "patched"}
+
+
+@app.delete("/api/materials/{material_id}")
+async def delete_material(material_id: int):
+    row = query_one("SELECT id FROM materials WHERE id=?", (material_id,))
+    if not row:
+        raise HTTPException(404, "材料不存在")
+    execute("DELETE FROM materials WHERE id=?", (material_id,))
+    # 物理文件清理交给后台 GC；此处仅删除记录
+    return {"id": material_id, "status": "deleted"}
+
+
+@app.post("/api/materials/{material_id}/retry")
+async def retry_material(material_id: int):
+    from .workers import enqueue_parse
+    row = query_one("SELECT id FROM materials WHERE id=?", (material_id,))
+    if not row:
+        raise HTTPException(404, "材料不存在")
+    execute(
+        "UPDATE materials SET parser_status='queued', status='queued', parse_error=NULL, updated_at=datetime('now','localtime') WHERE id=?",
+        (material_id,),
     )
-    # 不返回绝对路径,只返回 id + kind + 原始名(供前端展示)
-    return {"id": rid, "status": "uploaded", "kind": kind, "name": raw_name}
+    enqueue_parse(material_id)
+    return {"id": material_id, "status": "queued"}
+
+
+@app.get("/api/materials/{material_id}/chunks")
+async def material_chunks(material_id: int):
+    rows = query("SELECT id, type, locator, text, ocr_confidence FROM source_chunks WHERE material_id=? ORDER BY id", (material_id,))
+    return rows
 
 
 # ---------- 同步 ----------
@@ -518,7 +660,7 @@ async def list_runs(limit: int = 50):
 
 @app.get("/api/runs/{run_id}")
 async def get_run(run_id: int):
-    run = query("SELECT * FROM workflow_runs WHERE id=?", (run_id,), one=True)
+    run = query_one("SELECT * FROM workflow_runs WHERE id=?", (run_id,))
     if not run:
         raise HTTPException(404, "run 不存在")
     nodes = query("SELECT * FROM run_nodes WHERE run_id=? ORDER BY id", (run_id,))
@@ -640,7 +782,7 @@ CHAPTER_STATES = ["not_started", "in_progress", "material_ready", "homework_read
 
 @app.get("/api/chapters/{chapter_id}/state")
 async def get_chapter_state(chapter_id: int):
-    ch = query("SELECT * FROM chapters WHERE id=?", (chapter_id,), one=True)
+    ch = query_one("SELECT * FROM chapters WHERE id=?", (chapter_id,))
     if not ch:
         raise HTTPException(404, "章节不存在")
     # 计算可推进的状态列表
@@ -654,7 +796,7 @@ async def get_chapter_state(chapter_id: int):
 
 @app.post("/api/chapters/{chapter_id}/advance")
 async def advance_chapter(chapter_id: int):
-    ch = query("SELECT * FROM chapters WHERE id=?", (chapter_id,), one=True)
+    ch = query_one("SELECT * FROM chapters WHERE id=?", (chapter_id,))
     if not ch:
         raise HTTPException(404, "章节不存在")
     current = ch.get("status", "not_started")
@@ -784,11 +926,11 @@ async def import_syllabus(req: SyllabusImportReq):
     # locate course
     course = None
     if req.course_id:
-        course = query("SELECT * FROM courses WHERE id=?", (req.course_id,), one=True)
+        course = query_one("SELECT * FROM courses WHERE id=?", (req.course_id,))
     if not course and req.course_code:
-        course = query("SELECT * FROM courses WHERE code=?", (req.course_code,), one=True)
+        course = query_one("SELECT * FROM courses WHERE code=?", (req.course_code,))
     if not course and req.course_name:
-        course = query("SELECT * FROM courses WHERE name=?", (req.course_name,), one=True)
+        course = query_one("SELECT * FROM courses WHERE name=?", (req.course_name,))
     if not course:
         # 自动创建课程
         course_id = execute(
@@ -805,14 +947,13 @@ async def import_syllabus(req: SyllabusImportReq):
     for ch in chapters_payload:
         ch_no = ch.get("chapter_no")
         ch_title = ch.get("title") or f"第{ch_no}章"
-        existing = query("SELECT id FROM chapters WHERE course_id=? AND title=?", (course["id"], ch_title), one=True)
+        existing = query_one("SELECT id FROM chapters WHERE course_id=? AND title=?", (course["id"], ch_title))
         if existing:
             ch_id = existing["id"]
         else:
-            placeholder = query(
+            placeholder = query_one(
                 "SELECT id FROM chapters WHERE course_id=? AND title LIKE '第1章（未定）' ORDER BY id LIMIT 1",
                 (course["id"],),
-                one=True,
             )
             if placeholder and ch_no in (1, None):
                 ch_id = placeholder["id"]
