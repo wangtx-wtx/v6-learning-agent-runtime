@@ -24,6 +24,24 @@ except ImportError:
     logger.warning("jieba 未安装,中文分词降级为字符切分。pip install jieba 启用。")
 
 
+_FTS_INIT_DONE = False
+
+
+def init_fts() -> None:
+    """创建 FTS5 块索引表（幂等）。"""
+    global _FTS_INIT_DONE
+    if _FTS_INIT_DONE:
+        return
+    from .database import execute
+    try:
+        execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(text, content='')"
+        )
+        _FTS_INIT_DONE = True
+    except Exception as e:
+        logger.warning(f"FTS5 初始化失败(可能当前 sqlite 无 fts5): {e}")
+
+
 async def embed_text(text: str) -> list[float]:
     """调用 embedding 模型获取向量"""
     try:

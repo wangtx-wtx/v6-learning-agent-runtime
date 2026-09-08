@@ -198,6 +198,22 @@ CREATE TABLE IF NOT EXISTS evidence_links (
     model TEXT, prompt_version TEXT,
     created_at TEXT DEFAULT (datetime('now','localtime'))
 );
+CREATE TABLE IF NOT EXISTS run_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER UNIQUE REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    status TEXT DEFAULT 'queued',
+    error TEXT,
+    created_at TEXT DEFAULT (datetime('now','localtime')),
+    finished_at TEXT
+);
+CREATE TABLE IF NOT EXISTS parse_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    material_id INTEGER UNIQUE REFERENCES materials(id) ON DELETE CASCADE,
+    status TEXT DEFAULT 'queued',
+    error TEXT,
+    created_at TEXT DEFAULT (datetime('now','localtime')),
+    finished_at TEXT
+);
 """
 
 # 索引单独维护：必须在表/列补齐之后创建（避免旧库缺列时 CREATE INDEX 失败）。
@@ -364,6 +380,7 @@ def _migrate_conn(conn: sqlite3.Connection) -> list[str]:
     add_col("source_chunks", "ocr_confidence", "ocr_confidence REAL DEFAULT 1.0")
     add_col("source_chunks", "topics_json", "topics_json TEXT")
     add_col("source_chunks", "embedding", "embedding TEXT")
+    add_col("source_chunks", "created_at", "created_at TEXT")
 
     # workflow_runs 补充 updated_at
     add_col("workflow_runs", "updated_at", "updated_at TEXT")

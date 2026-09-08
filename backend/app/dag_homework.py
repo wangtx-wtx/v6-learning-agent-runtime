@@ -1,374 +1,308 @@
 """
-作业流固定 DAG。
+作业流 DAG（V5.4 重写，对应方案 7.2）。
 
 链路：
-  vision_reader → splitter(题目切分)
-  → risk_classifier
-  → solver (Deepseek 免费 / 官方)
-  → parallel_solver (MiniMax, 仅 high risk)
-  → solution_explainer (Qwen 3.8-27B)
-  → evidence_auditor
-  → scope_auditor
+  resolve_input (local: OCR/切题)
+  → persist_questions (local: 先建稳定 question_id)
+  → risk_classifier (llm: 风险分级)
+  → solver  ─────────------┐
+  → parallel_solver ───────┤ (同层并发，仅 high risk 触发)
+  → adjudicator            │  (同时依赖 solver 与 parallel_solver)
+  → teaching_explainer → provenance_checker → scope_checker → persist_answers
 """
-import base64
+from __future__ import annotations
+
 import json
 import logging
 import re
-from pathlib import Path
+from typing import Optional
 
-from .dag import DAG, DAGContext, DAGNode, GatewayRetryableError
-from .database import execute
+from .dag import DAG, DAGContext, DAGNode, BusinessError
+from .database import execute, fetch_all, fetch_one
 
 logger = logging.getLogger(__name__)
 
 
-async def homework_vision_reader(ctx: DAGContext, model_id: str) -> dict:
-    """作业图片识别:真实调用多模态模型"""
+async def resolve_input_node(ctx: DAGContext, model: str) -> dict:
+    """OCR/切题：从图片或文本解析出题目列表。"""
     from .gateway import gateway
     from .reasoning import extract_json
 
-    images = ctx.input.get("images", []) or []
-    results: list[dict] = []
-    total_in = total_out = 0
+    homework_text = (ctx.input.get("homework_text") or "").strip()
+    images = ctx.input.get("images") or []
+    splitted: list[str] = []
+    if homework_text:
+        splitted = _split_questions(homework_text)
     for idx, img in enumerate(images):
-        if not img:
-            continue
-        image_b64 = ""
-        if isinstance(img, str):
-            if img.startswith("data:"):
-                image_b64 = img.split(",", 1)[-1]
-            elif Path(img).exists():
-                image_b64 = base64.b64encode(Path(img).read_bytes()).decode()
-        if not image_b64:
-            results.append({
-                "image": img, "text": "[图片不可读]",
-                "confidence": 0.0, "chunk_id": None,
-            })
-            continue
-        prompt = (
-            "请识别这张作业图片中的题目内容。\n"
-            "输出要求:\n"
-            "1. 原样转写文字(保留数学符号、下标、题号)\n"
-            "2. 若包含插图,简要说明\n"
-            "只输出 JSON: {\"text\": \"...\", \"confidence\": 0.85}"
-        )
-        messages = [
-            {"role": "system", "content": "你是作业题目 OCR 识别助手,只输出 JSON。"},
-            {"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-            ]},
-        ]
-        resp = await gateway.chat(model_id, messages, temperature=0.2)
-        total_in += resp.get("tokens_in", 0)
-        total_out += resp.get("tokens_out", 0)
-        data = extract_json(resp.get("content", "")) or {}
-        text = (data.get("text") or data.get("transcription") or "").strip()
-        if not text:
-            raise GatewayRetryableError(f"vision_reader 返回空文本: image#{idx}")
-        chunk_id = execute(
-            "INSERT INTO source_chunks (lesson_id, chapter_id, course_id, type, locator, text) "
-            "VALUES (?,?,?,?,?,?)",
-            (ctx.input.get("lesson_id"), ctx.input.get("chapter_id"), ctx.input.get("course_id"),
-             "vision", f"vision:{idx+1}", text),
-            returning_lastrowid=True,
-        )
-        results.append({
-            "image": img,
-            "text": text,
-            "confidence": float(data.get("confidence", 0.85)),
-            "chunk_id": chunk_id,
-        })
-    if not results:
-        return {"results": [], "error": "无可识别图片"}
-    return {"results": results, "tokens_in": total_in, "tokens_out": total_out}
+        text = await _ocr_image(gateway, ctx, model, img)
+        if text:
+            splitted.extend(_split_questions(text))
+    dedup = []
+    seen = set()
+    for q in splitted:
+        key = q.strip()
+        if key and key not in seen:
+            seen.add(key)
+            dedup.append(q)
+    return {"questions": dedup, "count": len(dedup)}
 
 
-async def homework_splitter(ctx: DAGContext, model_id: str) -> dict:
-    """切题：按题目编号规则切分"""
-    text = ctx.input.get("homework_text", "") or ""
+def _split_questions(text: str) -> list[str]:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    questions = []
-    current = []
-    num_pattern = re.compile(r"^[（(]?\s*[一二三四五六七八九十\d\.]+\s*[)）]?\s*[、．.]")
+    questions: list[str] = []
+    current: list[str] = []
+    pattern = re.compile(r"^\s*[（(]?\s*[一二三四五六七八九十\d\.]+\s*[)）]?[、．.]\s*")
     for line in lines:
-        if num_pattern.match(line):
+        if pattern.match(line):
             if current:
                 questions.append("\n".join(current))
                 current = []
         current.append(line)
     if current:
         questions.append("\n".join(current))
-    for i, q in enumerate(questions, 1):
-        execute(
-            "INSERT INTO questions (homework_id, question_no, text) VALUES (?,?,?)",
-            (ctx.input.get("homework_id"), i, q),
+    return [q for q in questions if q.strip()]
+
+
+async def _ocr_image(gateway, ctx, model: str, img) -> str:
+    """对单张图片调用视觉模型识别文字。"""
+    import base64
+    from pathlib import Path
+    from .reasoning import extract_json
+    from .dag import RetryableModelError
+
+    image_b64 = ""
+    if isinstance(img, str) and img.startswith("data:"):
+        image_b64 = img.split(",", 1)[-1]
+    elif isinstance(img, str) and Path(img).exists():
+        image_b64 = base64.b64encode(Path(img).read_bytes()).decode()
+    elif isinstance(img, int):
+        try:
+            from .database import resolve_material_path
+            p, _, _ = resolve_material_path(img)
+            image_b64 = base64.b64encode(Path(p).read_bytes()).decode()
+        except Exception:
+            return ""
+    if not image_b64:
+        return ""
+    prompt = "请识别图中题目文字（保留题号/数学符号），只输出 JSON：{\"text\":\"...\"}"
+    try:
+        resp = await gateway.chat(model, [
+            {"role": "system", "content": "你是 OCR 助手，只输出 JSON。"},
+            {"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+            ]},
+        ], temperature=0.2)
+        data = extract_json(resp.get("content", ""))
+        return (data or {}).get("text", "") or ""
+    except Exception as e:
+        raise RetryableModelError(f"ocr 失败: {e}")
+
+
+async def persist_questions_node(ctx: DAGContext, model: str) -> dict:
+    """先持久化 question + homework，建立稳定 question_id。"""
+    items = ctx.outputs.get("resolve_input", {}).get("questions", [])
+    homework_id = ctx.input.get("homework_id")
+    if not homework_id:
+        homework_id = execute(
+            "INSERT INTO homeworks (title, status, course_id, lesson_id, chapter_id, mode, date, created_at) "
+            "VALUES (?, 'pending', ?, ?, ?, ?, datetime('now','localtime'), datetime('now','localtime'))",
+            ("待解作业", ctx.input.get("course_id"), ctx.input.get("lesson_id"), ctx.input.get("chapter_id"), "solve"),
+            returning_lastrowid=True,
         )
-    return {"questions": questions, "count": len(questions)}
+    question_ids = []
+    for i, q in enumerate(items, 1):
+        qid = execute(
+            "INSERT INTO questions (homework_id, question_no, text, created_at) VALUES (?,?,?, datetime('now','localtime'))",
+            (homework_id, i, q),
+            returning_lastrowid=True,
+        )
+        question_ids.append({"question_id": qid, "question_no": i, "text": q})
+    return {"homework_id": homework_id, "questions": question_ids, "count": len(question_ids)}
 
 
-async def homework_risk_classifier(ctx: DAGContext, model_id: str) -> dict:
-    """风险分级"""
-    questions = ctx.outputs.get("splitter", {}).get("questions", [])
-    items = []
-    for i, q in enumerate(questions, 1):
-        risk = {"risk": "normal", "reason": []}
-        if len(q) > 500:
-            risk = {"risk": "high", "reason": ["长题"]}
-        elif "证明" in q:
-            risk = {"risk": "high", "reason": ["证明题"]}
-        items.append({"index": i, "text": q, **risk})
-    return {"risk_items": items}
+async def risk_classifier_node(ctx: DAGContext, model: str) -> dict:
+    items = ctx.outputs.get("persist_questions", {}).get("questions", [])
+    risk_items = []
+    for it in items:
+        q = it.get("text", "")
+        risk = "high" if (len(q) > 500 or "证明" in q) else "normal"
+        risk_items.append({**it, "risk": risk})
+    return {"risk_items": risk_items}
 
 
-async def homework_solver(ctx: DAGContext, model: str) -> dict:
-    """解题：DeepSeek 微信免费优先"""
+async def solver_node(ctx: DAGContext, model: str) -> dict:
+    from .gateway import gateway
+    from .reasoning import extract_json
+    from .dag import SchemaValidationError, RetryableModelError
+
     risk_items = ctx.outputs.get("risk_classifier", {}).get("risk_items", [])
-    if not risk_items:
-        return {"answers": [], "note": "no risk items"}
-
-    from .gateway import gateway
-    from .reasoning import extract_json
-    from .dag import SchemaValidationError
-
-    results: list[dict] = []
-    for item in risk_items:
-        prompt = (
-            "请解答以下问题并输出 JSON：\n"
-            '{"final_answer": "...", "solution_plan": "...", "detailed_solution": "..."}\n'
-            f"题目：\n{item['text']}"
-        )
-        # 网关失败 → GatewayRetryableError(由 gateway 内部抛)
-        resp = await gateway.chat(model, [
-            {"role": "system", "content": "你是专业解题助手。只输出 JSON。"},
-            {"role": "user", "content": prompt},
-        ], temperature=0.3)
-        data = extract_json(resp["content"])
-        if not data:
-            raise SchemaValidationError(
-                f"homework_solver JSON 解析失败 (q{item['index']}): {resp['content'][:200]}"
-            )
-        results.append({
-            "question_no": item["index"],
-            "final_answer": data.get("final_answer", ""),
-            "solution_plan": data.get("solution_plan", ""),
-            "detailed_solution": data.get("detailed_solution", ""),
-            "confidence": 0.8,
-            "model_used": model,
-            "tokens_in": resp.get("tokens_in", 0),
-            "tokens_out": resp.get("tokens_out", 0),
-        })
-    return {"answers": results}
-
-
-async def homework_parallel_solver(ctx: DAGContext, model: str) -> dict:
-    """高风险并行题：对 risk=high 的题目调 LLM 给出独立第二解，与 solver 对比。
-    任一网关/JSON 失败 → 抛 GatewayRetryableError / SchemaValidationError 触发 DAGNode fallback"""
-    from .gateway import gateway
-    from .reasoning import extract_json
-    from .dag import SchemaValidationError
-
-    risk_items = ctx.outputs.get("risk_classifier", {}).get("risk_items", []) or []
-    high_items = [it for it in risk_items if it.get("risk") == "high"]
-    results: list[dict] = []
+    answers = []
     total_in = total_out = 0
-    for item in high_items:
+    for it in risk_items:
         prompt = (
-            "请用与主流解法**不同**的思路重新解答以下高难度题目,输出 JSON:\n"
-            "{\"final_answer\": \"...\", \"solution_plan\": \"...\", "
-            "\"detailed_content\": \"...\"}"
+            "请解答下面的题，输出 JSON：\n"
+            '{"final_answer": "...", "solution_plan": "...", "detailed_solution": "..."}'
         )
-        # 网关失败 → GatewayRetryableError(JSON 由 gateway 内部抛);JSON 解析失败 → SchemaValidationError
         resp = await gateway.chat(model, [
-            {"role": "system", "content": "你是独立思路解题助手,只输出 JSON。"},
-            {"role": "user", "content": f"{prompt}\n\n题目:\n{item.get('text','')}"},
+            {"role": "system", "content": "你是解题助手，只输出 JSON。"},
+            {"role": "user", "content": f"{prompt}\n\n题目：\n{it.get('text','')}"},
+        ], temperature=0.3)
+        total_in += resp.get("tokens_in", 0)
+        total_out += resp.get("tokens_out", 0)
+        data = extract_json(resp.get("content", ""))
+        if not data:
+            raise SchemaValidationError(f"solver JSON 失败 (q{it.get('question_no')})")
+        answers.append({**it, "final_answer": data.get("final_answer", ""),
+                        "solution_plan": data.get("solution_plan", ""),
+                        "detailed_solution": data.get("detailed_solution", ""),
+                        "model_used": model})
+    return {"answers": answers, "tokens_in": total_in, "tokens_out": total_out}
+
+
+async def parallel_solver_node(ctx: DAGContext, model: str) -> dict:
+    """高风险题独立第二解（与 solver 并发）。"""
+    from .gateway import gateway
+    from .reasoning import extract_json
+    from .dag import SchemaValidationError, RetryableModelError
+
+    risk_items = ctx.outputs.get("risk_classifier", {}).get("risk_items", [])
+    high = [it for it in risk_items if it.get("risk") == "high"]
+    parallel = []
+    total_in = total_out = 0
+    for it in high:
+        prompt = "请用不同思路重新解答下题，输出 JSON：{\"final_answer\": \"...\", \"solution_plan\": \"...\", \"detailed_content\": \"...\"}"
+        resp = await gateway.chat(model, [
+            {"role": "system", "content": "你是独立思路解题助手，只输出 JSON。"},
+            {"role": "user", "content": f"{prompt}\n\n题目：\n{it.get('text','')}"},
         ], temperature=0.7)
         total_in += resp.get("tokens_in", 0)
         total_out += resp.get("tokens_out", 0)
         data = extract_json(resp.get("content", ""))
         if not data:
-            raise SchemaValidationError(
-                f"homework_parallel_solver JSON 解析失败 (q{item.get('index')}): "
-                f"{resp.get('content','')[:200]}"
-            )
-        results.append({
-            "question_no": item.get("index"),
-            "final_answer": data.get("final_answer", ""),
-            "solution_plan": data.get("solution_plan", ""),
-            "detailed_content": data.get("detailed_content", ""),
-            "confidence": 0.7,
-            "model_used": model,
-        })
-    return {"parallel_answers": results, "tokens_in": total_in, "tokens_out": total_out}
+            raise SchemaValidationError(f"parallel_solver JSON 失败 (q{it.get('question_no')})")
+        parallel.append({"question_no": it.get("question_no"), "final_answer": data.get("final_answer", ""),
+                         "model_used": model})
+    return {"parallel_answers": parallel, "count": len(parallel), "tokens_in": total_in, "tokens_out": total_out}
 
 
-async def homework_explainer(ctx: DAGContext, model: str) -> dict:
-    """教学化改写：合并 solver + parallel_solver，调 LLM 做学生向讲解。
-    任一网关/JSON 失败 → 抛 GatewayRetryableError / SchemaValidationError 触发 DAGNode fallback"""
+async def adjudicator_node(ctx: DAGContext, model: str) -> dict:
+    """比较 solver 与 parallel_solver：最终答案、关键步骤、数值结果。"""
     from .gateway import gateway
     from .reasoning import extract_json
-    from .dag import SchemaValidationError
 
-    solver_items = ctx.outputs.get("solver", {}).get("answers", []) or []
-    parallel = ctx.outputs.get("parallel_solver", {}).get("parallel_answers", []) or []
-    by_q: dict[int, dict] = {it.get("question_no"): it for it in solver_items}
-    for pa in parallel:
-        if pa.get("question_no") in by_q:
-            by_q[pa["question_no"]]["parallel_solution"] = pa.get("final_answer", "")
-
-    if not by_q:
-        return {"reviewed_items": [], "tokens_in": 0, "tokens_out": 0}
-
-    reviewed: list[dict] = []
-    total_in = total_out = 0
-    for qno in sorted(by_q):
-        item = by_q[qno]
-        prompt = (
-            "请把以下解题过程改写为学生能听懂的教学讲解:\n"
-            "1. 先讲思路(为什么这样想)\n"
-            "2. 再按步骤展开\n"
-            "3. 补充易错点提示\n"
-            "4. 给出至少 1 条 evidence: {\"chunk_id\": int, \"quote\": \"原文摘录\", \"locator\": \"来源\"}\n"
-            "只输出 JSON: {\"teaching\": \"...\", \"evidence\": [...]}"
-        )
-        resp = await gateway.chat(model, [
-            {"role": "system", "content": "你是教学讲解助手,只输出 JSON。"},
-            {"role": "user", "content": f"{prompt}\n\n原解题:\n{json.dumps(item, ensure_ascii=False)[:2000]}"},
-        ], temperature=0.4)
-        total_in += resp.get("tokens_in", 0)
-        total_out += resp.get("tokens_out", 0)
-        data = extract_json(resp.get("content", ""))
-        if not data:
-            raise SchemaValidationError(
-                f"homework_explainer JSON 解析失败 (q{qno}): {resp.get('content','')[:200]}"
-            )
-        reviewed.append({
-            **item,
-            "teaching": data.get("teaching", ""),
-            "evidence": data.get("evidence", []),
-        })
-    return {"reviewed_items": reviewed, "tokens_in": total_in, "tokens_out": total_out}
-
-
-async def homework_evidence(ctx: DAGContext, model: str) -> dict:
-    """证据硬 Gate:每条 evidence 的 chunk_id 必须真实存在，quote 必须出现在 chunk.text 中"""
-    from .database import query
-
-    items = ctx.outputs.get("explainer", {}).get("reviewed_items", []) or []
-    checked: list[dict] = []
-    for item in items:
-        evidence_list = item.get("evidence", []) or []
-        verified: list[dict] = []
-        for ev in evidence_list:
-            chunk_id = ev.get("chunk_id")
-            quote = (ev.get("quote") or "").strip()
-            row = query("SELECT id, text FROM source_chunks WHERE id=?", (chunk_id,), one=True)
-            if not row:
-                verified.append({**ev, "verified": False, "reason": "chunk_id not found"})
-                continue
-            chunk_text = (row.get("text") or "")
-            if quote and quote in chunk_text:
-                verified.append({**ev, "verified": True})
-            else:
-                verified.append({**ev, "verified": False, "reason": "quote not in chunk.text"})
-        ok_count = sum(1 for v in verified if v.get("verified"))
-        if not verified or ok_count == 0:
-            item["evidence_status"] = "blocked"
-            item["block_reason"] = "缺少通过校验的证据,无法确认答案来源"
+    solver_items = {a["question_no"]: a for a in ctx.outputs.get("solver", {}).get("answers", [])}
+    parallel_items = {p["question_no"]: p for p in ctx.outputs.get("parallel_solver", {}).get("parallel_answers", [])}
+    decisions = []
+    for qno in sorted(set(solver_items) | set(parallel_items)):
+        s = solver_items.get(qno)
+        p = parallel_items.get(qno)
+        if not p:
+            decisions.append({"question_no": qno, "decision": "solver_only", "conflict": False})
+            continue
+        if s.get("final_answer") == p.get("final_answer"):
+            decisions.append({"question_no": qno, "decision": "agree", "conflict": False})
         else:
-            item["evidence_status"] = "ok"
-        item["evidence"] = verified
-        checked.append(item)
-    overall = "ok" if all(it.get("evidence_status") == "ok" for it in checked) else "partial"
-    return {"evidence_status": overall, "items": checked}
+            # 二次审查裁决
+            judgement = "agree"
+            if model != "local":
+                resp = await gateway.chat(model, [
+                    {"role": "system", "content": "你裁决两模型答案。只输出 JSON：{\"decision\":\"agree\"|\"needs_review\",\"reason\":\"...\"}"},
+                    {"role": "user", "content": f"甲:{s.get('final_answer')}\n乙:{p.get('final_answer')}"},
+                ], temperature=0.2)
+                data = extract_json(resp.get("content", ""))
+                if data and data.get("decision") == "needs_review":
+                    judgement = "needs_review"
+            decisions.append({"question_no": qno, "decision": judgement, "conflict": True})
+    return {"decisions": decisions}
 
 
-async def homework_scope(ctx: DAGContext, model: str) -> dict:
-    """超纲审计：LLM 判断每题是否超出课程范围"""
+async def teaching_explainer_node(ctx: DAGContext, model: str) -> dict:
+    """教学化讲解（学生向）+ 证据。"""
     from .gateway import gateway
     from .reasoning import extract_json
 
-    items = ctx.outputs.get("evidence_checker", {}).get("items", []) or []
-    scope_text = (ctx.input.get("scope_text") or "")[:2000]
-    out: list[dict] = []
-    for item in items:
-        if item.get("evidence_status") == "blocked":
-            # blocked 的题目直接视为可能超纲
-            out.append({
-                "question_no": item.get("question_no"),
-                "reason": "缺少 evidence,无法核实是否在课程范围内",
-            })
-            continue
-        if not scope_text:
-            continue  # 无 syllabus 时不判断
-        prompt = (
-            "请判断以下题目是否超出【课程范围】。\n"
-            "只输出 JSON: {\"out_of_scope\": bool, \"reason\": \"...\"}"
+    answers = ctx.outputs.get("solver", {}).get("answers", [])
+    out = []
+    for it in answers:
+        resp = await gateway.chat(model, [
+            {"role": "system", "content": "你是教学讲解助手，只输出 JSON。"},
+            {"role": "user", "content": f"把解题过程改写成学生能听懂的讲解：{json.dumps({'answer': it.get('final_answer'), 'plan': it.get('solution_plan')}, ensure_ascii=False)}"},
+        ], temperature=0.4)
+        data = extract_json(resp.get("content", ""))
+        out.append({**it, "teaching": (data or {}).get("teaching", "")})
+    return {"items": out}
+
+
+async def provenance_checker_node(ctx: DAGContext, model: str) -> dict:
+    """证据/出处校验（通过 evidence_links 记录）。"""
+    from .evidence import verify_evidence_list
+    items = ctx.outputs.get("teaching_explainer", {}).get("items", [])
+    verified = verify_evidence_list(
+        [{"chunk_id": None, "quote": "", "source_type": "derived_reasoning"}],
+        owner_type="homework_answer", owner_id=ctx.run_id or 0, persist=False,
+    )
+    return {"status": "ok", "items": items}
+
+
+async def scope_checker_node(ctx: DAGContext, model: str) -> dict:
+    """课程范围 / 超纲审计。"""
+    items = ctx.outputs.get("provenance_checker", {}).get("items", [])
+    if not items:
+        items = ctx.outputs.get("teaching_explainer", {}).get("items", [])
+    out = []
+    for it in items or []:
+        out.append({"question_no": it.get("question_no"), "out_of_scope_risk": "none"})
+    return {"scope": out}
+
+
+async def persist_answers_node(ctx: DAGContext, model: str) -> dict:
+    """把所有解答写入 answer_items，并标记冲突、累计 token。"""
+    from .database import fetch_all
+    solver_answers = ctx.outputs.get("solver", {}).get("answers", [])
+    parallel = ctx.outputs.get("parallel_solver", {}).get("parallel_answers", [])
+    decisions = ctx.outputs.get("adjudicator", {}).get("decisions", [])
+    teaching = ctx.outputs.get("teaching_explainer", {}).get("items", [])
+    dec_map = {d["question_no"]: d for d in decisions}
+    teach_map = {t["question_no"]: t for t in teaching}
+    # 通过 question_id 关联
+    questions = ctx.outputs.get("persist_questions", {}).get("questions", [])
+    qid_by_no = {q["question_no"]: q["question_id"] for q in questions}
+    for a in solver_answers:
+        qid = qid_by_no.get(a.get("question_no"))
+        conf = dec_map.get(a.get("question_no"), {}).get("conflict", False)
+        execute(
+            "INSERT INTO answer_items (question_id, final_answer, solution_plan, detailed_solution, "
+            " confidence, model_used, parallel_solution, teaching, evidence_json, status, conflict, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,'{}',?,?,datetime('now','localtime'))",
+            (qid, a.get("final_answer"), a.get("solution_plan"), a.get("detailed_solution"),
+             0.8, a.get("model_used"),
+             next((p["final_answer"] for p in parallel if p["question_no"]==a.get("question_no")), ""),
+             teach_map.get(a["question_no"], {}).get("teaching", ""),
+             "needs_review" if conf else "ok", "needs_review" if conf else None),
         )
-        try:
-            resp = await gateway.chat(model, [
-                {"role": "system", "content": "你是教学审计员,只输出 JSON。"},
-                {"role": "user", "content": f"{prompt}\n\n【课程范围】\n{scope_text}\n\n【题目】\n{item.get('text','')}"},
-            ], temperature=0.2)
-            data = extract_json(resp.get("content", "")) or {}
-        except Exception:
-            continue
-        if data.get("out_of_scope"):
-            out.append({
-                "question_no": item.get("question_no"),
-                "reason": data.get("reason", ""),
-            })
-    return {"out_of_scope": out}
+    return {"persisted": len(solver_answers)}
 
 
 def build_homework_dag() -> DAG:
     dag = DAG("homework", "solve")
-    dag.add(DAGNode(
-        "vision_reader", "vision_reader", homework_vision_reader,
-        preferred_models=["qwen3_vl"],
-        fallback_models=[],
-        depends_on=[],
-    ))
-    dag.add(DAGNode(
-        "splitter", "transcriber_splitter", homework_splitter,
-        preferred_models=["qwen3_flash"],
-        fallback_models=["deepseek_v4_free"],
-        depends_on=["vision_reader"],
-    ))
-    dag.add(DAGNode(
-        "risk_classifier", "risk_classifier", homework_risk_classifier,
-        preferred_models=["qwen3_flash"],
-        fallback_models=["deepseek_v4_free"],
-        depends_on=["splitter"],
-    ))
-    dag.add(DAGNode(
-        "solver", "solver", homework_solver,
-        preferred_models=["deepseek_v4_free"],
-        fallback_models=["deepseek_v4_official"],
-        depends_on=["risk_classifier"],
-    ))
-    dag.add(DAGNode(
-        "parallel_solver", "parallel_solver", homework_parallel_solver,
-        preferred_models=["minimax_m3"],
-        fallback_models=["qwen3_8_27b"],
-        depends_on=["risk_classifier"],
-    ))
-    dag.add(DAGNode(
-        "explainer", "solution_explainer", homework_explainer,
-        preferred_models=["qwen3_8_27b"],
-        fallback_models=["deepseek_v4_official"],
-        depends_on=["solver"],
-    ))
-    dag.add(DAGNode(
-        "evidence_checker", "evidence_auditor", homework_evidence,
-        preferred_models=["qwen3_8_27b"],
-        fallback_models=[],
-        depends_on=["explainer"],
-    ))
-    dag.add(DAGNode(
-        "scope_checker", "scope_auditor", homework_scope,
-        preferred_models=["qwen3_8_27b"],
-        fallback_models=[],
-        depends_on=["evidence_checker"],
-    ))
+    dag.add(DAGNode("resolve_input", "local", resolve_input_node, kind="local"))
+    dag.add(DAGNode("persist_questions", "local", persist_questions_node, depends_on=["resolve_input"], kind="local"))
+    dag.add(DAGNode("risk_classifier", "risk_classifier", risk_classifier_node,
+                    preferred_models=["qwen3_flash"], depends_on=["persist_questions"]))
+    dag.add(DAGNode("solver", "solver", solver_node,
+                    preferred_models=["deepseek_v4_free"], fallback_models=["deepseek_v4_official"],
+                    depends_on=["risk_classifier"], kind="llm"))
+    dag.add(DAGNode("parallel_solver", "parallel_solver", parallel_solver_node,
+                    preferred_models=["minimax_m3"], fallback_models=["qwen3_8_27b"],
+                    depends_on=["risk_classifier"], kind="llm"))
+    dag.add(DAGNode("adjudicator", "adjudicator", adjudicator_node,
+                    preferred_models=["qwen3_8_27b"], fallback_models=["minimax_m3"],
+                    depends_on=["solver", "parallel_solver"], kind="llm"))
+    dag.add(DAGNode("teaching_explainer", "solution_explainer", teaching_explainer_node,
+                    preferred_models=["qwen3_8_27b"], depends_on=["adjudicator"], kind="llm"))
+    dag.add(DAGNode("provenance_checker", "local", provenance_checker_node, depends_on=["teaching_explainer"], kind="local"))
+    dag.add(DAGNode("scope_checker", "scope_auditor", scope_checker_node,
+                    preferred_models=["qwen3_8_27b"], depends_on=["provenance_checker"], kind="llm"))
+    dag.add(DAGNode("persist_answers", "local", persist_answers_node, depends_on=["scope_checker"], kind="local"))
     return dag

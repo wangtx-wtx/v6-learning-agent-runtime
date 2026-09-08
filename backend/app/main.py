@@ -245,25 +245,19 @@ def _extract_quota_pct(usage: dict) -> float:
         return 0.0
 
 
-async def run_dag_workflow(workflow_name: str, dag_builder, ctx: DAGContext, mode: str):
-    ctx.create_run(
-        workflow_name,
-        mode,
-        course_id=ctx.input.get("course_id"),
-        lesson_id=ctx.input.get("lesson_id"),
-        chapter_id=ctx.input.get("chapter_id"),
-    )
-    usage = await load_usage_from_gateway(gateway)
-    quota_pct = _extract_quota_pct(usage)
-    routes = make_route_for_workflow(workflow_name, quota_pct)
-    ctx.update_model_routes(routes)
-    try:
-        outputs = await dag_builder().run(ctx)
-        ctx.finish_run("completed", output=outputs)
-        return {"run_id": ctx.run_id, "outputs": outputs}
-    except Exception as e:
-        ctx.finish_run("failed", output=ctx.outputs, error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+async def enqueue_workflow(workflow_name: str, mode: str, input_data: dict, response_body: Optional[dict] = None) -> dict:
+    """创建 run(queued) 并交给后台 Worker 执行，接口立即返回 202。"""
+    from .dag import DAGContext
+    from .workers import enqueue_workflow as q_workflow
+    ctx = DAGContext(input_data)
+    course_id = ctx.input.get("course_id")
+    lesson_id = ctx.input.get("lesson_id")
+    chapter_id = ctx.input.get("chapter_id")
+    run_id = ctx.create_run(workflow_name, mode, course_id=course_id, lesson_id=lesson_id, chapter_id=chapter_id)
+    q_workflow(run_id)
+    body = dict(response_body or {})
+    body.update({"run_id": run_id, "status": "queued"})
+    return body
 
 
 def _sha256_hex(data: bytes) -> str:
@@ -356,10 +350,10 @@ async def get_routes(workflow: str):
 
 # ---------- 听课流 ----------
 
-@app.post("/api/workflows/lesson")
+@app.post("/api/workflows/lesson", status_code=202)
 async def run_lesson(req: LessonRunRequest):
-    ctx = DAGContext(req.model_dump())
-    return await run_dag_workflow("lesson", build_lesson_dag, ctx, "attend")
+    payload = req.model_dump(exclude_none=True)
+    return await enqueue_workflow("lesson", "attend", payload)
 
 
 @app.get("/api/workflows/lesson/{run_id}")
@@ -373,10 +367,10 @@ async def get_lesson_run(run_id: int):
 
 # ---------- 作业流 ----------
 
-@app.post("/api/workflows/homework")
+@app.post("/api/workflows/homework", status_code=202)
 async def run_homework(req: HomeworkRunRequest):
-    ctx = DAGContext(req.model_dump())
-    return await run_dag_workflow("homework", build_homework_dag, ctx, "solve")
+    payload = req.model_dump(exclude_none=True)
+    return await enqueue_workflow("homework", "solve", payload)
 
 
 @app.get("/api/workflows/homework/{run_id}")
@@ -390,10 +384,10 @@ async def get_homework_run(run_id: int):
 
 # ---------- 错题流 ----------
 
-@app.post("/api/workflows/error")
+@app.post("/api/workflows/error", status_code=202)
 async def run_error(req: ErrorRunRequest):
-    ctx = DAGContext(req.model_dump())
-    return await run_dag_workflow("error", build_error_dag, ctx, "collect")
+    payload = req.model_dump(exclude_none=True)
+    return await enqueue_workflow("error", "collect", payload)
 
 
 @app.get("/api/errors")
@@ -424,10 +418,10 @@ async def reject_error(error_id: int):
 
 # ---------- 复习流 ----------
 
-@app.post("/api/workflows/review")
+@app.post("/api/workflows/review", status_code=202)
 async def run_review(req: ReviewRunRequest):
-    ctx = DAGContext(req.model_dump())
-    return await run_dag_workflow("review", build_review_dag, ctx, "review")
+    payload = req.model_dump(exclude_none=True)
+    return await enqueue_workflow("review", "review", payload)
 
 
 @app.get("/api/reviews")
@@ -665,6 +659,58 @@ async def get_run(run_id: int):
         raise HTTPException(404, "run 不存在")
     nodes = query("SELECT * FROM run_nodes WHERE run_id=? ORDER BY id", (run_id,))
     return {"run": run, "nodes": nodes}
+
+
+@app.get("/api/runs/{run_id}/events")
+async def run_events(request: Request, run_id: int):
+    """SSE 实时进度：仅当 SSE 断线时前端降级轮询。"""
+    from fastapi.responses import StreamingResponse
+
+    async def gen():
+        last = None
+        try:
+            while True:
+                run = query_one("SELECT status, error FROM workflow_runs WHERE id=?", (run_id,))
+                nodes = query("SELECT node_name, status, model FROM run_nodes WHERE run_id=? ORDER BY id", (run_id,))
+                status = run.get("status") if run else "missing"
+                payload = {
+                    "run_id": run_id,
+                    "status": status,
+                    "error": run.get("error", "") if run else None,
+                    "nodes": [{"node_name": n["node_name"], "status": n["status"], "model": n["model"]} for n in nodes],
+                }
+                if payload != last:
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    last = payload
+                if status in ("completed", "failed", "cancelled", "missing"):
+                    yield "event: done\n\n"
+                    break
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            pass
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.post("/api/runs/{run_id}/rerun/{node_name}")
+async def rerun_node(run_id: int, node_name: str):
+    """从失败节点重跑：立即在前台执行（同步），更新该节点 output。"""
+    from .dag import DAGContext
+    from .workers import build_flow
+    run = query_one("SELECT * FROM workflow_runs WHERE id=?", (run_id,))
+    if not run:
+        raise HTTPException(404, "run 不存在")
+    dag = build_flow(run.get("workflow") or "")
+    if node_name not in dag.nodes:
+        raise HTTPException(404, f"节点 {node_name} 不存在")
+    ctx = DAGContext()
+    ctx.run_id = run_id
+    try:
+        ctx.input = json.loads(run.get("input_json") or "{}") if isinstance(run.get("input_json"), str) else (run.get("input_json") or {})
+    except Exception:
+        ctx.input = {}
+    result = await dag.rerun_node(ctx, node_name)
+    return {"run_id": run_id, "node": node_name, "result": result}
 
 
 @app.post("/api/migrate")
