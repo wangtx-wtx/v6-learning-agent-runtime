@@ -4,7 +4,7 @@
 
 | 层 | 位置 | 说明 |
 | --- | --- | --- |
-| 单元/集成测试 | `backend/tests/` | unittest，81 用例，全部离线（不依赖本地网关），~21s |
+| 单元/集成测试 | `backend/tests/` | unittest，86 用例，全部离线（不依赖本地网关），~22s |
 | 真实冒烟 | `backend/smoke_phase*.py` | 端到端真实运行（依赖后端 8801 + 真实模型网关 8080），人工/发布前执行 |
 | 契约测试 | `backend/tests/test_phase_h.py` | Fake Gateway 按真实 chat 响应结构（content/tokens_in/tokens_out/model）离线验证 DAG 节点 |
 | CI | `.github/workflows/ci.yml` | 后端 compileall + unittest；前端 vue-tsc + build |
@@ -32,9 +32,9 @@ python smoke_phasef.py    # 混合检索/审计
 - Windows 控制台统一 `sys.stdout.reconfigure(encoding="utf-8", errors="replace")`；
 - 涉及外网关的行为（embedding/chat）在单测中一律 mock/降级路径验证，真实调用只在冒烟脚本中发生。
 
-## 用例分布（81）
+## 用例分布（86）
 
-- `test_core.py` 14 · `test_database.py` · `test_workers.py` 13 · `test_blob_gc.py` 10 · `test_review_flow.py` 13
+- `test_core.py` 14 · `unit/test_database.py` 11 · `test_workers.py` 13 · `test_blob_gc.py` 10 · `test_review_flow.py` 13
 - `test_phase_e.py` 10（Obsidian 路径/证据空规则/错题事件/作业状态机/先做后看）
 - `test_phase_f.py` 10（prompt 加载/夹具覆盖/schema 绑定/混合检索/审计）
 - `test_phase_h.py` 5（快照恢复闭环/Fake Gateway 契约）

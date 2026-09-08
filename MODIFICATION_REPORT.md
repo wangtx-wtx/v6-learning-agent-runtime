@@ -7,7 +7,7 @@
 
 - 产品版本：**5.5.0**（`/api/health` 实测返回）
 - DB Schema：**v7**（migrations 0001–0007，生产库已应用，`schema_migrations=[1..7]`）
-- 测试：**81/81 通过**（`python -m unittest discover -s tests -t .`，约 21s）
+- 测试：**86/86 通过**（`python -m unittest discover -s tests -t .`，约 22s）
 - 提交历史（本阶段 A–H）：
 
 ```
@@ -40,7 +40,7 @@
 ## 二、已实现（代码已落地，且经测试或真实运行验证）
 
 ### A. 数据库 / 连接策略
-- **连接策略（方案 2.4）**：读=线程本地连接；写（`execute/insert/executemany`）=专用短连接；`transaction()` 独立连接 + `BEGIN IMMEDIATE` + 3 次忙等重试。依据：FastAPI 协程共享事件循环线程，共享连接导致交错 BEGIN 冲突（此前 `database is locked` 实测复现，现 61→81 用例无锁冲突）。
+- **连接策略（方案 2.4）**：读=线程本地连接；写（`execute/insert/executemany`）=专用短连接；`transaction()` 独立连接 + `BEGIN IMMEDIATE` + 3 次忙等重试。依据：FastAPI 协程共享事件循环线程，共享连接导致交错 BEGIN 冲突（此前 `database is locked` 实测复现，现 61→86 用例无锁冲突）。
 - **WAL 设置**仅在模式非 wal 时执行（避免写竞争下 `journal_mode` 需要排他锁报错）。
 - **Schema v7**：`0007_blob_dedup_model.sql` 撤销 0006 的 `materials.file_hash` 唯一索引（与 blob 去重模型冲突）；生产库已迁移，`schema_migrations` checksum 锁定。
 
@@ -88,9 +88,9 @@
 
 ---
 
-## 三、已测试（自动化用例覆盖，81/81 通过）
+## 三、已测试（自动化用例覆盖，86/86 通过）
 
-- **数据库**：版本 7、migrations [1..7]、多线程读写互斥/事务连接策略、自增语义。
+- **数据库**：版本 7、migrations [1..7]、FK 完整性、多线程读写互斥/事务连接策略、自增语义。
 - **Worker**：认领原子性、租约与心跳、恢复语义（interrupted→queued、超限→failed）、并发槽位、取消置位与检查点、TestClient 下 Event 重建。
 - **Blob/GC**：去重引用、复活、重写、物理删除、补偿队列、审计口径、类型矩阵与别名。
 - **复习**：normalize/判分/SM-2 边界（clamp、连续错重置）、before 链、complete 幂等（409）、答案隐藏。
@@ -140,4 +140,4 @@
 - Windows 11 / Python 3.12.10 / Node v24.19.0（npm 11.17.0）
 - 后端 `127.0.0.1:8801`（uvicorn app.main:app），模型网关 `127.0.0.1:8080`（真实可用，usage/chat 200）
 - 生产库 `backend/data/v5.db`：schema v7、材料 1–8 blob 引用 live、`without_blob=0`
-- 全量命令：`python -m unittest discover -s tests -t .` → `Ran 81 tests ... OK`；`npx vue-tsc -b` → 0 错；`npm run build` → 成功
+- 全量命令：`python -m unittest discover -s tests -t .` → `Ran 86 tests ... OK`；`npx vue-tsc -b` → 0 错；`npm run build` → 成功
