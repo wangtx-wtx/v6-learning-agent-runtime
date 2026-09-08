@@ -360,6 +360,17 @@ def _migrate_conn(conn: sqlite3.Connection) -> list[str]:
     add_col("notes", "model_used", "model_used TEXT")
     add_col("notes", "created_at", "created_at TEXT")
 
+    # reviews 补齐结构化字段（旧库 reviews 仅 kind/outputs_json）
+    add_col("reviews", "course_id", "course_id INTEGER")
+    add_col("reviews", "exam_date", "exam_date TEXT")
+    add_col("reviews", "scope_json", "scope_json TEXT")
+    add_col("reviews", "outline", "outline TEXT")
+    add_col("reviews", "review_materials", "review_materials TEXT")
+    add_col("reviews", "self_test", "self_test TEXT")
+    add_col("reviews", "auditor_result", "auditor_result TEXT")
+    add_col("reviews", "score", "score REAL")
+    add_col("reviews", "created_at", "created_at TEXT")
+
     # homeworks / questions / answer_items 补齐
     add_col("homeworks", "course_id", "course_id INTEGER")
     add_col("homeworks", "mode", "mode TEXT")
@@ -370,11 +381,13 @@ def _migrate_conn(conn: sqlite3.Connection) -> list[str]:
     add_col("questions", "knowledge_points_json", "knowledge_points_json TEXT")
     add_col("questions", "scope_json", "scope_json TEXT")
     add_col("questions", "risk_json", "risk_json TEXT")
+    add_col("questions", "created_at", "created_at TEXT")
     add_col("answer_items", "model_used", "model_used TEXT")
     add_col("answer_items", "parallel_solution", "parallel_solution TEXT")
     add_col("answer_items", "teaching", "teaching TEXT")
     add_col("answer_items", "conflict", "conflict TEXT")
     add_col("answer_items", "out_of_scope_risk", "out_of_scope_risk TEXT")
+    add_col("answer_items", "created_at", "created_at TEXT")
     add_col("errors", "mastery", "mastery REAL DEFAULT 0.0")
     add_col("source_chunks", "image_file", "image_file TEXT")
     add_col("source_chunks", "ocr_confidence", "ocr_confidence REAL DEFAULT 1.0")

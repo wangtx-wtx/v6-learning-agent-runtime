@@ -122,13 +122,17 @@ async def execute_run(run_id: int) -> None:
 
 
 def _quota_pct(usage) -> float:
+    # usage 不可用时不默认解释为 0% 用量（否则可能误用免费路由而超支）；
+    # 返回 100 → 走 conservative 路由（官方 DeepSeek / 安全默认）。
+    if not usage or not isinstance(usage, dict) or not usage.get("available", True):
+        return 100.0
     try:
         data = usage.get("data") if isinstance(usage.get("data"), dict) else usage
         used = data.get("used_5h", 0) or 0
         limit = data.get("limit_5h", 1200) or 1200
         return min(100.0, float(used) / max(float(limit), 1.0) * 100)
     except Exception:
-        return 0.0
+        return 100.0
 
 
 def build_flow(workflow: str):

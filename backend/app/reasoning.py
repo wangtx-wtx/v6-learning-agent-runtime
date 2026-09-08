@@ -77,3 +77,33 @@ def extract_structured(text: str) -> dict:
         "cleaned_text": clean_minimax_thinking(text),
         "quotes": quotes,
     }
+
+
+def repair_json_blob(text: str) -> Optional[Any]:
+    """对 LLM 常见低错误做修复：去除代码围栏、修尾逗号、补完整截断括号。"""
+    s = (text or "").strip()
+    s = re.sub(r"^```(?:json)?\s*", "", s)
+    s = re.sub(r"\s*```$", "", s)
+    s = (s or "").strip()
+    if not s:
+        return None
+    # 先原样试
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    # 去除尾逗号（对象/数组末尾 , 后跟 } 或 ]）
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    # 尝试补全（括号/引号计数）- 简单策略：逐层截断到最近平衡点
+    for idx in range(len(s), 0, -1):
+        cand = s[:idx]
+        if cand.count("{") == cand.count("}") and cand.count("[") == cand.count("]"):
+            try:
+                return json.loads(cand)
+            except Exception:
+                continue
+    return None

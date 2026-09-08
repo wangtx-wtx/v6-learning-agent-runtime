@@ -89,7 +89,7 @@ async def _self_test(ctx: DAGContext, model: str) -> dict:
         return {"self_test": []}
 
 
-def _persist_node(ctx: DAGContext, model: str) -> dict:
+async def _persist_node(ctx: DAGContext, model: str) -> dict:
     resources = ctx.outputs.get("aggregator", {}).get("resources", {})
     package = ctx.outputs.get("writer", {}).get("review_package", {})
     self_test = ctx.outputs.get("self_test", {}).get("self_test", [])
@@ -112,7 +112,7 @@ def _persist_node(ctx: DAGContext, model: str) -> dict:
     return {"review_id": rid, "status": "insufficient_data" if insuff else "generated"}
 
 
-def _grade_node(ctx: DAGContext, model: str) -> dict:
+async def _grade_node(ctx: DAGContext, model: str) -> dict:
     """占位：用户提交作答后写入 review_attempts（接口另行实现）。"""
     review_id = ctx.outputs.get("persist_review", {}).get("review_id")
     return {"review_id": review_id, "pending_attempts": True}
