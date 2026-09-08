@@ -50,6 +50,15 @@ async def lifespan(app):
     recovery = recover_all()
     logger.info("任务恢复: %s", recovery)
 
+    # 清理上次进程崩溃遗留的上传临时文件（方案 4.4）
+    try:
+        from .services.blob_gc import cleanup_tmp_files
+        n = cleanup_tmp_files(max_age_hours=24.0)
+        if n:
+            logger.info("已清理 %d 个超龄上传临时文件", n)
+    except Exception as e:
+        logger.warning(f"tmp cleanup skipped: {e}")
+
     worker_manager.start()
     selfcheck = _health_selfcheck()
     logger.info("v5.5 后端启动完成，自检: %s", selfcheck)

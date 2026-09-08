@@ -475,41 +475,30 @@ async def upload_material(file: UploadFile = File(...), lesson_id: Optional[int]
         if not _check_magic(head, suf):
             raise HTTPException(status_code=400, detail=f"文件内容与扩展名 {suf} 不匹配")
 
-        # SHA-256 去重：相同内容返回已有材料（只做逻辑引用，不重复落盘）
-        existing = query_one("SELECT id FROM materials WHERE sha256=?", (sha256,))
-        if existing:
-            os.remove(tmp_path)
-            tmp_path = None
-            # 建立逻辑引用（更新归属绑定）
-            execute(
-                "UPDATE materials SET lesson_id=COALESCE(?,lesson_id), chapter_id=COALESCE(?,chapter_id), "
-                "course_id=COALESCE(?,course_id), updated_at=datetime('now','localtime') WHERE id=?",
-                (lesson_id, chapter_id, course_id, existing["id"]),
-            )
-            return {"id": existing["id"], "status": "uploaded", "kind": _kind_of(suf),
-                    "name": raw_name, "deduped": True}
-
-        # 原子移动到最终文件名
-        safe_name = f"{_uuid.uuid4().hex}{suf}"
-        target = UPLOAD_DIR / safe_name
-        os.replace(tmp_path, str(target))
-        tmp_path = None
-        final_path = str(target)  # 审计:移动成功后若后续 INSERT 失败,也要清理这个落盘文件
-
         kind = _kind_of(suf)
+
+        # Blob 去重（方案 4.1）：统一入口处理 live 复用 / 死 blob 复活 / 新落位；
+        # 去重命中 = 新建 material 引用同一 blob，绝不修改旧材料归属。
+        from .services.blob import acquire_blob
+        from .services.file_types import initial_state
+        got = acquire_blob(sha256, tmp_path, suf, file.content_type, total, UPLOAD_DIR)
+        tmp_path = None
+        blob_id = got["blob_id"]
+        final_path = got["storage_path"]
+
         rid = insert(
             "INSERT INTO materials (lesson_id, chapter_id, course_id, file_path, name, display_name, "
-            " file_hash, sha256, type, kind, mime, size_bytes, parser_status, status, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'uploaded', 'uploaded', datetime('now','localtime'))",
-            (lesson_id, chapter_id, course_id, str(target), raw_name, raw_name,
-             sha256[:16], sha256, kind, kind, (file.content_type or ""), total),
+            " file_hash, sha256, type, kind, mime, size_bytes, blob_id, parser_status, status, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now','localtime'))",
+            (lesson_id, chapter_id, course_id, final_path, raw_name, raw_name,
+             sha256[:16], sha256, kind, kind, (file.content_type or ""), total,
+             blob_id, *initial_state(kind)),
+        )
 
-)
-        # 入库即进解析队列（后台线程读取→切分→建索引）
-        from .workers import enqueue_parse
-        enqueue_parse(rid)
+        _enqueue_parse_if_needed(rid, kind)
         final_path = None  # 成功:不再需要清理
-        return {"id": rid, "status": "uploaded", "kind": kind, "name": raw_name}
+        return {"id": rid, "status": "uploaded", "kind": kind, "name": raw_name,
+                "deduped": bool(got["reused"])}
     except HTTPException:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -537,6 +526,15 @@ def _kind_of(suf: str) -> str:
     if suf in (".mp3", ".m4a", ".wav"):
         return "audio"
     return "text"
+
+
+def _enqueue_parse_if_needed(material_id: int, kind: str) -> None:
+    """只有可解析类型进解析队列；image/audio 进入 needs_ocr/transcribing 等待真实识别管线。"""
+    from .services.file_types import is_parseable
+    if not is_parseable(kind):
+        return
+    from .workers import enqueue_parse
+    enqueue_parse(material_id)
 
 
 # ---------- 材料库 CRUD ----------
@@ -620,25 +618,46 @@ async def delete_material(material_id: int):
         "WHERE material_id=? AND status='queued'",
         (material_id,),
     )
-    # 先删依赖其 RAG 块（source_chunks.material_id 无 CASCADE,须先手动清理）,再删材料记录
-    execute("DELETE FROM source_chunks WHERE material_id=?", (material_id,))
-    execute("DELETE FROM materials WHERE id=?", (material_id,))
-    # 物理文件清理交给后台 GC（方案 5.x）；此处仅删除记录与检索块
-    return {"id": material_id, "status": "deleted"}
+    # 按依赖顺序清理（evidence→FTS→chunks→parse_tasks→materials→blob 引用减一）
+    from .services.blob_gc import delete_material_record, gc_blob_now
+    summary = delete_material_record(material_id)
+    # 归零的 blob 立即尝试物理删除（失败自动落 GC 任务队列）
+    if summary.get("pending_delete"):
+        summary["gc"] = gc_blob_now(summary["blob_id"])
+    return {"id": material_id, "status": "deleted", **summary}
 
 
 @app.post("/api/materials/{material_id}/retry")
 async def retry_material(material_id: int):
-    from .workers import enqueue_parse
-    row = query_one("SELECT id FROM materials WHERE id=?", (material_id,))
+    from .services.file_types import is_parseable
+    row = query_one("SELECT id, kind FROM materials WHERE id=?", (material_id,))
     if not row:
         raise HTTPException(404, "材料不存在")
+    if not is_parseable(row["kind"] or "text"):
+        raise HTTPException(400, f"类型 {row['kind']} 不支持自动解析（等待识别管线）")
     execute(
         "UPDATE materials SET parser_status='queued', status='queued', parse_error=NULL, updated_at=datetime('now','localtime') WHERE id=?",
         (material_id,),
     )
+    from .workers import enqueue_parse
     enqueue_parse(material_id)
     return {"id": material_id, "status": "queued"}
+
+
+# ---------- 存储审计与 GC（方案 4.3） ----------
+
+@app.get("/api/admin/storage/audit")
+async def admin_storage_audit():
+    from .services.blob_gc import storage_audit
+    return storage_audit()
+
+
+@app.post("/api/admin/storage/gc")
+async def admin_storage_gc():
+    from .services.blob_gc import run_pending_gc, cleanup_tmp_files
+    report = run_pending_gc()
+    report["tmp_files_removed"] = cleanup_tmp_files(max_age_hours=0)  # GC 手动触发时清理全部残留
+    return report
 
 
 @app.get("/api/materials/{material_id}/chunks")

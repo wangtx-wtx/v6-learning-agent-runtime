@@ -81,12 +81,7 @@ def _parse_docx(path: str) -> list[tuple]:
         return [("docx", f"[docx 解析失败: {e}]")]
 
 
-def _parse_image(path: str) -> list[tuple]:
-    return [("image", f"[图片材料待视觉识别: {Path(path).name}]")]
-
-
-def _parse_audio(path: str) -> list[tuple]:
-    return [("audio", f"[音频材料待转写: {Path(path).name}]")]
+# 图片/音频不在此解析：按类型矩阵进入 needs_ocr / transcribing（见 run_parse_material）
 
 
 # ------------------------------- 取消支持 -------------------------------------
@@ -126,6 +121,23 @@ async def run_parse_material(material_id: int) -> dict:
 
     kind = (row.get("kind") or row.get("type") or "").lower()
     suf = Path(path).suffix.lower()
+
+    # 类型支持矩阵（方案 4.4）：图片/音频不产生占位 chunk、不伪装 ready
+    if kind == "image" or suf in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+        execute(
+            "UPDATE materials SET parser_status='needs_ocr', status='needs_ocr', parse_error=NULL, "
+            "updated_at=datetime('now','localtime') WHERE id=?",
+            (material_id,),
+        )
+        return {"material_id": material_id, "state": "needs_ocr", "chunk_count": 0}
+    if kind == "audio" or suf in (".mp3", ".m4a", ".wav"):
+        execute(
+            "UPDATE materials SET parser_status='transcribing', status='transcribing', parse_error=NULL, "
+            "updated_at=datetime('now','localtime') WHERE id=?",
+            (material_id,),
+        )
+        return {"material_id": material_id, "state": "transcribing", "chunk_count": 0}
+
     execute("DELETE FROM source_chunks WHERE material_id=?", (material_id,))
 
     located: list[tuple] = []
@@ -135,10 +147,6 @@ async def run_parse_material(material_id: int) -> dict:
         located = _parse_pptx(path)
     elif kind in ("doc",) or suf in (".docx", ".doc"):
         located = _parse_docx(path)
-    elif kind in ("image",) or suf in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
-        located = _parse_image(path)
-    elif kind in ("audio",) or suf in (".mp3", ".m4a", ".wav"):
-        located = _parse_audio(path)
     else:
         located = _parse_text(path)
 
