@@ -1,0 +1,43 @@
+# v5.1 model routing config
+models:
+  deepseek_v4_free:
+    gateway_model: "Deepseek-v4-flash"
+    provider: wechat
+  deepseek_v4_official:
+    gateway_model: "deepseekv4-flash"
+    provider: deepseek
+  qwen3_8_27b:
+    gateway_model: "ecnu-plus"
+    provider: qwen
+  qwen3_flash:
+    gateway_model: "qwen3.8-flash"
+    provider: qwen
+  qwen3_vl:
+    gateway_model: "qwen3-vl-flash"
+    provider: qwen
+  minimax_m3:
+    gateway_model: "minimax-m3"
+    provider: minimax
+  glm_flash:
+    gateway_model: "glm-5.3-flash"
+    provider: zhipu
+  embedding:
+    gateway_model: "ecnu-embedding-small"
+    provider: local
+  rerank:
+    gateway_model: "ecnu-rerank"
+    provider: local
+
+quota_policy:
+  deepseek_v4_free:
+    limits:
+      "5h": 1200
+      "7d": 9000
+      "30d": 18000
+    thresholds:
+      normal: 70
+      conservative: 90
+
+gateway:
+  base_url: "http://127.0.0.1:8080"
+  read_only: true

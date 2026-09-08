@@ -1,0 +1,87 @@
+@import "tailwindcss";
+
+@layer base {
+  html, body, #app {
+    min-height: 100%;
+  }
+
+  body {
+    @apply bg-slate-950 text-slate-100 antialiased;
+    font-family: Inter, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background-image:
+      radial-gradient(circle at 15% 15%, rgba(37,99,235,.18), transparent 28rem),
+      radial-gradient(circle at 85% 10%, rgba(16,185,129,.13), transparent 26rem),
+      linear-gradient(180deg, #020617 0%, #020617 100%);
+    background-attachment: fixed;
+  }
+
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 999px; }
+  ::-webkit-scrollbar-thumb:hover { background: #334155; }
+}
+
+@layer components {
+  .page-shell { @apply space-y-6; }
+  .page-header { @apply flex flex-wrap items-end justify-between gap-4; }
+  .page-title { @apply text-2xl font-bold tracking-tight text-white; }
+  .page-subtitle { @apply mt-1 max-w-3xl text-sm leading-6 text-slate-400; }
+
+  .card {
+    @apply rounded-2xl border border-slate-800/80 bg-slate-900/65 p-5 shadow-[0_10px_30px_rgba(2,6,23,.35)] backdrop-blur;
+  }
+  .card-soft {
+    @apply rounded-2xl border border-slate-800/60 bg-slate-900/45 p-4 transition hover:border-slate-700 hover:bg-slate-900/70;
+  }
+  .card-title { @apply text-sm font-semibold text-slate-200; }
+  .card-muted { @apply text-xs leading-5 text-slate-500; }
+
+  .section {
+    @apply rounded-2xl border border-slate-800/70 bg-slate-900/55 p-5 shadow-lg backdrop-blur;
+  }
+  .section-head { @apply mb-4 flex items-center justify-between gap-3; }
+
+  .btn {
+    @apply inline-flex cursor-pointer items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-45;
+  }
+  .btn-primary {
+    @apply bg-blue-600 text-white shadow-[0_8px_22px_rgba(37,99,235,.24)] hover:bg-blue-500;
+  }
+  .btn-secondary {
+    @apply border border-slate-700 bg-slate-900/80 text-slate-200 hover:border-slate-600 hover:bg-slate-800;
+  }
+  .btn-ghost {
+    @apply text-slate-400 hover:bg-slate-800/70 hover:text-slate-100;
+  }
+
+  .input, textarea.input, select.input {
+    @apply w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 placeholder-slate-500 transition focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/25;
+  }
+  .label { @apply mb-1 block text-xs font-medium text-slate-400; }
+
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full border border-slate-700 bg-slate-900/80 px-2.5 py-1 text-xs font-medium text-slate-300;
+  }
+  .chip-green { @apply border-emerald-800/70 bg-emerald-500/10 text-emerald-300; }
+  .chip-red { @apply border-rose-800/70 bg-rose-500/10 text-rose-300; }
+  .chip-amber { @apply border-amber-800/70 bg-amber-500/10 text-amber-300; }
+
+  .stat-card {
+    @apply relative overflow-hidden rounded-2xl border border-slate-800/80 bg-slate-900/65 p-4 shadow-lg backdrop-blur transition hover:border-slate-700;
+  }
+  .stat-label { @apply text-xs font-medium text-slate-400; }
+  .stat-value { @apply mt-2 text-2xl font-bold tracking-tight text-white; }
+  .stat-icon { @apply absolute right-4 top-4 text-xl opacity-70; }
+
+  .data-table { @apply w-full min-w-[600px] border-collapse text-left text-sm; }
+  .data-table th { @apply whitespace-nowrap border-b border-slate-800 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500; }
+  .data-table td { @apply border-b border-slate-800/50 px-3 py-3 align-middle text-slate-200; }
+
+  .code-panel { @apply max-h-[26rem] overflow-auto rounded-xl border border-slate-800 bg-slate-950/80 p-4 font-mono text-xs leading-5 text-slate-300 whitespace-pre-wrap; }
+
+  .empty {
+    @apply flex min-h-44 flex-col items-center justify-center gap-2 rounded-2xl border border-dashed border-slate-800 bg-slate-950/45 p-6 text-center;
+  }
+  .empty-icon { @apply text-2xl text-slate-600; }
+  .empty-text { @apply text-sm text-slate-500; }
+}

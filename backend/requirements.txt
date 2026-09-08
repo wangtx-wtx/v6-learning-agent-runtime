@@ -1,0 +1,9 @@
+fastapi>=0.104
+uvicorn[standard]>=0.24
+httpx>=0.24
+pydantic>=2.0
+python-multipart>=0.0.6
+python-pptx>=0.6.21
+pypdf>=3.17
+numpy>=1.26
+jieba>=0.42  # V5.2:中文 RAG 分词
