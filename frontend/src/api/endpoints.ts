@@ -124,7 +124,17 @@ export interface Material {
   file_path?: string | null
   file_hash?: string | null
   type?: string | null
+  kind?: string | null
+  name?: string | null
+  display_name?: string | null
+  mime?: string | null
+  sha256?: string | null
+  size_bytes?: number
   parser_status?: string | null
+  status?: string | null
+  parse_error?: string | null
+  created_at?: string | null
+  updated_at?: string | null
 }
 
 export interface GraphNode {
@@ -207,11 +217,17 @@ export const SyllabusApi = {
 }
 
 export const MaterialsApi = {
-  upload: (form: FormData, headers?: Record<string, string>) => api.postForm<{ id: number; status: string; kind: string; path: string }>(
+  upload: (form: FormData, headers?: Record<string, string>) => api.postForm<{ id: number; status: string; kind: string; name?: string; deduped?: boolean }>(
     '/materials/upload',
     form,
     headers,
   ),
+  list: (params?: { status?: string; course_id?: number }) => api.get<Material[]>('/materials', params),
+  get: (id: number) => api.get<Material>(`/materials/${id}`),
+  patch: (id: number, body: Record<string, unknown>) => api.patch<{ id: number; status: string }>(`/materials/${id}`, body),
+  remove: (id: number) => api.del<{ id: number; status: string }>(`/materials/${id}`),
+  retry: (id: number) => api.post<{ id: number; status: string }>(`/materials/${id}/retry`),
+  chunks: (id: number) => api.get<any[]>(`/materials/${id}/chunks`),
 }
 
 export const ErrorsApi = {

@@ -84,6 +84,16 @@ async function put<T>(path: string, body?: unknown, headers?: Headers): Promise<
   return handle<T>(res)
 }
 
+async function patch<T>(path: string, body?: unknown, headers?: Headers): Promise<T> {
+  const baseHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'PATCH',
+    headers: { ...baseHeaders, ...mergeHeaders(headers) },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  return handle<T>(res)
+}
+
 async function del<T>(path: string, headers?: Headers): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     method: 'DELETE',
@@ -105,6 +115,7 @@ export const api = {
   get,
   post,
   put,
+  patch,
   del,
   postForm,
 }

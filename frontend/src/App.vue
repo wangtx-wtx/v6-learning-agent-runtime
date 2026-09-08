@@ -53,32 +53,41 @@ interface NavItem { key: PageKey; label: string; icon: string }
 interface NavGroup { title: string; items: NavItem[] }
 const groups: NavGroup[] = [
   {
-    title: '工作台',
+    title: '今日',
     items: [
-      { key: 'dashboard', label: '总览', icon: '🎯' },
-      { key: 'courses', label: '课程与考试', icon: '📚' },
-      { key: 'chapters', label: '章节进度', icon: '🗂️' },
+      { key: 'dashboard', label: '今日总览', icon: '🗓️' },
+      { key: 'errors', label: '待确认错题', icon: '❌' },
     ],
   },
   {
-    title: '学习流水线',
+    title: '课程',
     items: [
-      { key: 'upload', label: '材料上传', icon: '📤' },
+      { key: 'courses', label: '课程与考试', icon: '📚' },
+      { key: 'chapters', label: '章节进度', icon: '🗂️' },
       { key: 'lesson-flow', label: '听课流', icon: '📝' },
-      { key: 'homework-flow', label: '作业流', icon: '✏️' },
-      { key: 'errors', label: '错题确认', icon: '❌' },
+    ],
+  },
+  {
+    title: '收件箱',
+    items: [
+      { key: 'upload', label: '材料收件箱', icon: '📥' },
+      { key: 'homework-flow', label: '作业处理', icon: '✏️' },
+    ],
+  },
+  {
+    title: '复习',
+    items: [
       { key: 'review', label: '复习中心', icon: '🔁' },
     ],
   },
   {
-    title: '知识与系统',
+    title: '系统',
     items: [
-      { key: 'graph', label: '知识图谱', icon: '🕸️' },
       { key: 'models', label: '模型与额度', icon: '🤖' },
       { key: 'sync', label: 'Obsidian 同步', icon: '🔄' },
       { key: 'runs', label: '运行日志', icon: '📜' },
-      { key: 'm-token', label: '远程上传凭证', icon: '🔐' },
-      { key: 'm-upload', label: '移动投喂', icon: '📱' },
+      { key: 'm-token', label: '远程访问凭证', icon: '🔐' },
+      { key: 'm-upload', label: '移动采集', icon: '📱' },
     ],
   },
 ]

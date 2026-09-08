@@ -192,6 +192,7 @@ class LessonRunRequest(BaseModel):
     date: Optional[str] = None
     transcript: Optional[str] = None
     materials: Optional[list] = None
+    material_ids: Optional[list] = None  # P0: 移动端用它把真实上传文件带入工作流
     images: Optional[list] = None
     material_summary: Optional[str] = None
 
@@ -203,6 +204,7 @@ class HomeworkRunRequest(BaseModel):
     homework_id: Optional[int] = None
     homework_text: Optional[str] = None
     images: Optional[list] = None
+    material_ids: Optional[list] = None  # P0: 移动端上传图片后回传的已入库材料 id
 
 
 class ErrorRunRequest(BaseModel):
@@ -514,6 +516,9 @@ async def upload_material(file: UploadFile = File(...), lesson_id: Optional[int]
              sha256[:16], sha256, kind, kind, (file.content_type or ""), total),
             returning_lastrowid=True,
         )
+        # 入库即进解析队列（后台线程读取→切分→建索引）
+        from .workers import enqueue_parse
+        enqueue_parse(rid)
         return {"id": rid, "status": "uploaded", "kind": kind, "name": raw_name}
     except HTTPException:
         if tmp_path and os.path.exists(tmp_path):
@@ -859,12 +864,20 @@ async def advance_chapter(chapter_id: int):
         execute("UPDATE chapters SET status=? WHERE id=?", (new_status, chapter_id))
     return {"id": chapter_id, "status": new_status}
 
+class SetStatusBody(BaseModel):
+    status: str
+
+
 @app.post("/api/chapters/{chapter_id}/set_status")
-async def set_chapter_status_api(chapter_id: int, status: str):
-    if status not in CHAPTER_STATES:
-        raise HTTPException(400, f"无效状态: {status}. 允许值: {CHAPTER_STATES}")
-    execute("UPDATE chapters SET status=? WHERE id=?", (status, chapter_id))
-    return {"id": chapter_id, "status": status}
+async def set_chapter_status_api(chapter_id: int, body: Optional[SetStatusBody] = None, status: Optional[str] = None):
+    # P0: 前端发送 JSON body，后端必须优先读 body；query 参数仅作向后兼容
+    value = (body.status if body is not None else None) or status
+    if not value:
+        raise HTTPException(400, "缺少 status")
+    if value not in CHAPTER_STATES:
+        raise HTTPException(400, f"无效状态: {value}. 允许值: {CHAPTER_STATES}")
+    execute("UPDATE chapters SET status=? WHERE id=?", (value, chapter_id))
+    return {"id": chapter_id, "status": value}
 
 
 # ---------- 数据备份 ----------

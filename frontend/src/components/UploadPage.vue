@@ -119,7 +119,6 @@ async function startUpload() {
       const result = await MaterialsApi.upload(form)
       r.id = result.id
       r.kind = result.kind
-      r.path = result.path
       r.state = 'success'
       r.progress = 100
       r.message = `已入库 #${result.id}（${result.kind || 'unknown'}）`
@@ -147,15 +146,61 @@ function fileIcon(name: string): string {
   return '📦'
 }
 
-onMounted(loadMeta)
+onMounted(async () => {
+  await loadMeta()
+  loadMaterials()
+})
+
+const materials = ref<Record<string, any>[]>([])
+const materialsLoading = ref(false)
+
+async function loadMaterials() {
+  materialsLoading.value = true
+  try {
+    materials.value = await MaterialsApi.list()
+  } catch (e: any) {
+    materials.value = []
+  } finally {
+    materialsLoading.value = false
+  }
+}
+
+function statusColor(s?: string): 'green' | 'red' | 'blue' | 'amber' | 'slate' {
+  const st = (s || '').toLowerCase()
+  if (['ready', 'synced'].includes(st)) return 'green'
+  if (['failed'].includes(st)) return 'red'
+  if (['indexed'].includes(st)) return 'blue'
+  if (['uploaded', 'queued', 'parsing', 'pending'].includes(st)) return 'amber'
+  return 'slate'
+}
+
+async function retryMaterial(id: number) {
+  try {
+    await MaterialsApi.retry(id)
+    toast.success('已重新入队解析')
+    loadMaterials()
+  } catch (e: any) {
+    toast.error(e?.message || '重试失败')
+  }
+}
+
+async function removeMaterial(id: number) {
+  try {
+    await MaterialsApi.remove(id)
+    toast.success(`已删除材料 #${id}`)
+    loadMaterials()
+  } catch (e: any) {
+    toast.error(e?.message || '删除失败')
+  }
+}
 </script>
 
 <template>
   <div class="page-shell">
     <PageHeader
-      emoji="📤"
-      title="材料上传"
-      subtitle="支持 PPT / PDF / Word / 图片 / Markdown 批量上传，可绑定到课程 / 章节 / 课时。"
+      emoji="📥"
+      title="材料收件箱"
+      subtitle="上传材料进入收件箱，自动解析并生成检索块；可绑定课程 / 章节 / 课时。"
     >
       <template #actions>
         <button class="btn btn-secondary" :disabled="!uploads.length" @click="resetAll">清空队列</button>
@@ -229,7 +274,6 @@ onMounted(loadMeta)
               <p class="truncate text-sm font-medium text-slate-100">{{ r.file.name }}</p>
               <p class="text-[11px] text-slate-500">
                 {{ (r.file.size / 1024).toFixed(1) }} KB
-                <span v-if="r.path"> · {{ r.path }}</span>
                 <span v-if="r.kind"> · 类型：{{ r.kind }}</span>
               </p>
               <div class="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
@@ -255,6 +299,54 @@ onMounted(loadMeta)
             </div>
           </li>
         </ul>
+      </States>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <h3 class="card-title">材料库</h3>
+          <p class="card-muted">已上传材料的解析状态与绑定关系。</p>
+        </div>
+        <button class="btn btn-secondary btn-sm" @click="loadMaterials">刷新</button>
+      </div>
+      <States :loading="materialsLoading" :empty="!materials.length" empty-icon="🗂️" empty-title="暂无材料"
+        empty-hint="上传文件后这里会显示解析状态。">
+        <div class="overflow-x-auto rounded-xl border border-slate-800">
+          <table class="w-full text-left text-sm">
+            <thead class="bg-slate-900/60 text-xs uppercase text-slate-400">
+              <tr>
+                <th class="px-4 py-2">名称</th>
+                <th class="px-4 py-2">类型</th>
+                <th class="px-4 py-2">状态</th>
+                <th class="px-4 py-2">大小</th>
+                <th class="px-4 py-2 text-right">操作</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-800">
+              <tr v-for="m in materials" :key="m.id">
+                <td class="px-4 py-2 text-slate-100">{{ m.name || m.display_name || `材料 #${m.id}` }}</td>
+                <td class="px-4 py-2 capitalize text-slate-400">{{ m.kind || m.type || 'text' }}</td>
+                <td class="px-4 py-2">
+                  <StatusBadge :status="m.status || m.parser_status || 'pending'" :variant="statusColor(m.status || m.parser_status)">
+                    {{ m.status || m.parser_status || 'pending' }}
+                  </StatusBadge>
+                  <span v-if="m.parse_error" class="block text-[11px] text-rose-300">{{ m.parse_error }}</span>
+                </td>
+                <td class="px-4 py-2 text-slate-400">
+                  {{ m.size_bytes ? (m.size_bytes / 1024).toFixed(1) + ' KB' : '—' }}
+                </td>
+                <td class="px-4 py-2 text-right">
+                  <div class="inline-flex gap-1">
+                    <button class="btn btn-ghost !px-2 !py-1 text-xs" @click="retryMaterial(m.id)"
+                      :disabled="m.status === 'parsing' || m.status === 'queued'">重试</button>
+                    <button class="btn btn-ghost !px-2 !py-1 text-xs text-rose-300" @click="removeMaterial(m.id)">删除</button>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </States>
     </section>
   </div>
