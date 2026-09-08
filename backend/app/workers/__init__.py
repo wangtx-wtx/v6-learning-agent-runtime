@@ -21,12 +21,13 @@ from .recovery import recover_all, recover_interrupted_tasks  # noqa: F401
 
 def build_flow(workflow: str):
     from ..dag_lesson import build_lesson_dag
-    from ..dag_homework import build_homework_dag
+    from ..dag_homework import build_homework_dag, build_homework_ocr_dag
     from ..dag_error import build_error_dag
     from ..dag_review import build_review_dag
     mapping = {
         "lesson": build_lesson_dag,
         "homework": build_homework_dag,
+        "homework_ocr": build_homework_ocr_dag,
         "error": build_error_dag,
         "review": build_review_dag,
     }

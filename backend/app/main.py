@@ -358,8 +358,89 @@ async def get_lesson_run(run_id: int):
 
 @app.post("/api/workflows/homework", status_code=202)
 async def run_homework(req: HomeworkRunRequest):
+    """作业流（方案 7.2 状态机）：
+    - 仅图片输入且未确认 → 走 OCR 管线（homework_ocr），停在 awaiting_confirmation；
+    - 已确认 homework_id 或有文本 → 直接求解。"""
     payload = req.model_dump(exclude_none=True)
+    homework_id = payload.get("homework_id")
+    if homework_id:
+        hw = query_one("SELECT status FROM homeworks WHERE id=?", (homework_id,))
+        if not hw:
+            raise HTTPException(404, "homework 不存在")
+        if hw["status"] == "awaiting_confirmation":
+            raise HTTPException(409, "作业等待 OCR 确认，请先调用 confirm 接口")
+    if (payload.get("images") and not payload.get("homework_text")
+            and not homework_id):
+        return await enqueue_workflow("homework_ocr", "solve", payload)
     return await enqueue_workflow("homework", "solve", payload)
+
+
+class HomeworkConfirmRequest(BaseModel):
+    questions: list[dict] = []   # [{question_id, text}] — 可修正 OCR 文本
+
+
+@app.post("/api/homeworks/{homework_id}/confirm")
+async def confirm_homework_ocr(homework_id: int, body: HomeworkConfirmRequest):
+    """确认 OCR 题目（awaiting_confirmation→confirmed），确认后自动排队求解。"""
+    hw = query_one("SELECT status FROM homeworks WHERE id=?", (homework_id,))
+    if not hw:
+        raise HTTPException(404, "homework 不存在")
+    if hw["status"] != "awaiting_confirmation":
+        raise HTTPException(409, f"作业状态为 {hw['status']}，不能确认 OCR")
+    for q in body.questions:
+        execute("UPDATE questions SET text=? WHERE id=? AND homework_id=?",
+                (q.get("text", ""), q.get("question_id"), homework_id))
+    execute("UPDATE homeworks SET status='confirmed' WHERE id=?", (homework_id,))
+    payload = {"homework_id": homework_id}
+    run = await enqueue_workflow("homework", "solve", payload)
+    return {"homework_id": homework_id, "status": "confirmed",
+            "run_id": run.get("run_id")}
+
+
+@app.post("/api/homeworks/{homework_id}/answer")
+async def submit_homework_answer(homework_id: int, body: dict):
+    """先做后看（方案 7.4）：学生提交自己的答案后才允许看解答。"""
+    qid = body.get("question_id")
+    student_answer = (body.get("student_answer") or "").strip()
+    if not qid or not student_answer:
+        raise HTTPException(400, "question_id 与 student_answer 必填")
+    q = query_one("SELECT id, homework_id FROM questions WHERE id=? AND homework_id=?",
+                  (qid, homework_id))
+    if not q:
+        raise HTTPException(404, "题目不存在")
+    n = execute(
+        "UPDATE questions SET student_answer=?, submitted_at=datetime('now','localtime'), "
+        " reveal_allowed=1 WHERE id=? AND (submitted_at IS NULL OR submitted_at='')",
+        (student_answer, qid),
+    )
+    if n == 0:
+        raise HTTPException(409, "该题已提交过答案，不能重复提交")
+    return {"question_id": qid, "submitted": True, "reveal_allowed": 1}
+
+
+@app.get("/api/homeworks/{homework_id}")
+async def homework_detail(homework_id: int):
+    """作业详情（先做后看）：未提交答案的题目不返回解答内容。"""
+    hw = query_one("SELECT * FROM homeworks WHERE id=?", (homework_id,))
+    if not hw:
+        raise HTTPException(404, "homework 不存在")
+    questions = query(
+        "SELECT id, question_no, text, student_answer, submitted_at, reveal_allowed "
+        "FROM questions WHERE homework_id=? ORDER BY question_no", (homework_id,))
+    # 只有已提交作答（reveal_allowed=1）的题目才返回解答
+    answers = {a["question_id"]: a for a in query(
+        "SELECT a.* FROM answer_items a JOIN questions q ON q.id=a.question_id "
+        "WHERE q.homework_id=? AND q.reveal_allowed=1", (homework_id,))}
+    items = []
+    for q in questions:
+        item = {k: q[k] for k in ("id", "question_no", "text", "student_answer",
+                                  "submitted_at", "reveal_allowed")}
+        a = answers.get(q["id"])
+        if a:
+            item["answer"] = {k: a[k] for k in ("final_answer", "solution_plan",
+                                                "detailed_solution", "teaching", "conflict")}
+        items.append(item)
+    return {"homework": hw, "questions": items}
 
 
 @app.get("/api/workflows/homework/{run_id}")
@@ -393,16 +474,45 @@ async def list_errors(status: Optional[str] = None, chapter_id: Optional[int] = 
     return query(sql, tuple(params))
 
 
+def _error_event(error_id: int, event_type: str, old: str, new: str, payload: dict | None = None):
+    insert(
+        "INSERT INTO error_events (error_id, event_type, old_status, new_status, payload_json) "
+        "VALUES (?,?,?,?,?)",
+        (error_id, event_type, old, new,
+         json.dumps(payload or {}, ensure_ascii=False)),
+    )
+
+
 @app.post("/api/errors/{error_id}/confirm")
 async def confirm_error(error_id: int):
-    execute("UPDATE errors SET status='confirmed' WHERE id=?", (error_id,))
-    return {"status": "confirmed"}
+    """确认错题（方案 8.3）：rowcount 判定 + 终态 409 + error_events 留痕。"""
+    row = query_one("SELECT status FROM errors WHERE id=?", (error_id,))
+    if not row:
+        raise HTTPException(404, "错题不存在")
+    old = row["status"]
+    if old in ("confirmed", "rejected"):
+        raise HTTPException(409, f"错题已为终态（{old}），不能再次确认")
+    n = execute("UPDATE errors SET status='confirmed' WHERE id=? AND status=?", (error_id, old))
+    if n == 0:
+        raise HTTPException(409, "状态已变化，请刷新后重试")
+    _error_event(error_id, "confirmed", old, "confirmed")
+    return {"id": error_id, "status": "confirmed"}
 
 
 @app.post("/api/errors/{error_id}/reject")
 async def reject_error(error_id: int):
-    execute("UPDATE errors SET status='rejected' WHERE id=?", (error_id,))
-    return {"status": "rejected"}
+    """驳回错题：同 confirm 语义（rowcount + 409 + 事件）。"""
+    row = query_one("SELECT status FROM errors WHERE id=?", (error_id,))
+    if not row:
+        raise HTTPException(404, "错题不存在")
+    old = row["status"]
+    if old in ("confirmed", "rejected"):
+        raise HTTPException(409, f"错题已为终态（{old}），不能驳回")
+    n = execute("UPDATE errors SET status='rejected' WHERE id=? AND status=?", (error_id, old))
+    if n == 0:
+        raise HTTPException(409, "状态已变化，请刷新后重试")
+    _error_event(error_id, "rejected", old, "rejected")
+    return {"id": error_id, "status": "rejected"}
 
 
 # ---------- 复习流 ----------
@@ -976,9 +1086,10 @@ async def run_result(run_id: int):
             "WHERE homework_id=? ORDER BY question_no",
             (hw_id,),
         )
+        # 先做后看（方案 7.4）：只返回已提交作答题目的解答
         result["solutions"] = query(
             "SELECT a.* FROM answer_items a JOIN questions q ON q.id=a.question_id "
-            "WHERE q.homework_id=? ORDER BY q.question_no",
+            "WHERE q.homework_id=? AND q.reveal_allowed=1 ORDER BY q.question_no",
             (hw_id,),
         )
         result["conflicts"] = [s for s in result["solutions"]

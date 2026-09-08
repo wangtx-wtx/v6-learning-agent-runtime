@@ -1,4 +1,4 @@
-﻿"""
+"""
 错题流 DAG（V5.4 重写，对应方案 7.3）。
 
 链路：
@@ -114,23 +114,40 @@ async def error_cross_check(ctx: DAGContext, model: str) -> dict:
             ], temperature=0.2)
             data = extract_json(resp.get("content", "")) or {}
         except Exception as e:
-            data = {"confirmed": po.get("possible_causes", []), "uncertainty": f"审查失败: {e}"}
+            data = {"confirmed_causes": po.get("possible_causes", []), "uncertain": f"审查失败: {e}"}
         candidates.append({
             "question_text": ana.get("question_text", ""),
             "student_answer": ana.get("student_answer", ""),
-            "candidate_causes": data.get("confirmed", po.get("possible_causes", [])),
+            "candidate_causes": data.get("confirmed_causes", data.get("confirmed", po.get("possible_causes", []))),
             "knowledge_points": po.get("knowledge_gaps", []),
+            "uncertain": data.get("uncertain", ""),
             "status": "provisional",
         })
     return {"candidates": candidates}
 
 
 async def error_ingest(ctx: DAGContext, model: str) -> dict:
-    """写 provisional 错题 + 安排首次复习（SM-2 简化变体 interval=1）。"""
+    """写 provisional 错题 + 安排首次复习（SM-2 简化变体 interval=1）。
+
+    ai_error_json 存结构化错因（方案 8.2）：{phenomenon, direct_cause, root_cause,
+    knowledge_gaps, possible_causes, confirmed_causes, uncertain}。
+    """
     candidates = ctx.outputs.get("cross_check", {}).get("candidates", [])
+    analyses = {a.get("question_text", ""): a.get("ai_error_analysis", {})
+                for a in ctx.outputs.get("analyst", {}).get("analysis", [])}
     ids = []
     for cand in candidates:
         nxt = _sm2_next(0.0, False)
+        analysis = analyses.get(cand.get("question_text", ""), {})
+        structured = {
+            "phenomenon": analysis.get("phenomenon", ""),
+            "direct_cause": analysis.get("direct_cause", ""),
+            "root_cause": analysis.get("root_cause", ""),
+            "knowledge_gaps": analysis.get("knowledge_gaps", []),
+            "possible_causes": analysis.get("possible_causes", []),
+            "confirmed_causes": cand.get("candidate_causes", []),
+            "uncertain": cand.get("uncertain", ""),
+        }
         eid = insert(
             "INSERT INTO errors (course_id, chapter_id, lesson_id, question_text, student_answer, "
             " correct_answer, ai_error_json, final_error_json, status, next_review_at, review_stage, mastery) "
@@ -138,8 +155,8 @@ async def error_ingest(ctx: DAGContext, model: str) -> dict:
             (ctx.input.get("course_id"), ctx.input.get("chapter_id"), ctx.input.get("lesson_id"),
              cand.get("question_text", ""), cand.get("student_answer", ""),
              ctx.input.get("correct_answer", ""),
-             json.dumps(cand.get("candidate_causes", []), ensure_ascii=False),
-             json.dumps({**cand, "ai_analysis": ctx.outputs.get("analyst", {}).get("analysis", [])}, ensure_ascii=False),
+             json.dumps(structured, ensure_ascii=False),
+             json.dumps({**structured, "ai_analysis": analyses.get(cand.get("question_text", ""), [])}, ensure_ascii=False),
              nxt),
 
 )
@@ -158,7 +175,7 @@ def _sm2_review(mastery: float, passed: bool) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
-def _review_scheduler_node(ctx: DAGContext, model: str) -> dict:
+async def _review_scheduler_node(ctx: DAGContext, model: str) -> dict:
     """确认 provisional 错题应进入正式错题库时，安排 SM-2 首次复习时间。"""
     ids = ctx.outputs.get("ingest", {}).get("ids", [])
     for eid in ids:
