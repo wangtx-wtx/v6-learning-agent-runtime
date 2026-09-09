@@ -1,6 +1,6 @@
 # v5 产品文档
 
-> 产品版本 **5.5.0** · DB Schema **v7**（migrations 0001–0007）· API 前缀 `/api` v1 · FastAPI + Vue3 · 本地模型网关 `127.0.0.1:8080`
+> 产品版本 **5.5.1** · DB Schema **v8**（migrations 0001–0008）· API 前缀 `/api` v1 · FastAPI + Vue3 · 本地模型网关 `127.0.0.1:8080`
 
 ## 文档索引
 
@@ -31,10 +31,10 @@ npm run dev      # 或 npm run build
 v5/
 ├── backend/
 │   ├── app/            # FastAPI 应用（main.py 路由、dag_* 业务流、workers 后台执行）
-│   ├── migrations/     # SQLite 迁移（0001-0007，带 checksum，禁止改已应用文件）
+│   ├── migrations/     # SQLite 迁移（0001-0008，带 checksum，禁止改已应用文件）
 │   ├── prompts/        # 外置提示词（<workflow>/<name>.<version>.md，带 sha256）
 │   ├── tools/          # 运维脚本（migrate_database、restore_snapshot）
-│   ├── tests/          # unittest 套件（86 个用例）
+│   ├── tests/          # unittest 套件（108 个用例）
 │   └── data/           # 运行数据（v5.db、blobs/、obsidian_vault/、backups/）
 ├── frontend/           # Vue3 + Vite + Tailwind（vue-router 分包、SSE 实时流）
 └── docs/               # 本文档

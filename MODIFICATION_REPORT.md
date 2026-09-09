@@ -5,9 +5,9 @@
 > 本报告严格区分「已实现 / 已测试 / Mock 验证 / 真实模型验证 / 待办 / 已知限制」，
 > **不把"函数存在"描述为"功能已完成"**。
 
-- 产品版本：**5.5.0**（`/api/health` 实测返回）
-- DB Schema：**v7**（migrations 0001–0007，生产库已应用，`schema_migrations=[1..7]`）
-- 测试：**86/86 通过**（`python -m unittest discover -s tests -t .`，约 22s）
+- 产品版本：**5.5.1**（`/api/health` 实测返回；frontend/package.json、`package-lock.json` 同步为 5.5.1）
+- DB Schema：**v8**（migrations 0001–0008，生产库已应用，`schema_migrations=[1..8]`，`PRAGMA user_version=8`）
+- 测试：**106/106 通过**（`python -m unittest discover -s tests -t .`，约 23s）
 - 提交历史（本阶段 A–H）：
 
 ```
@@ -42,7 +42,7 @@
 ### A. 数据库 / 连接策略
 - **连接策略（方案 2.4）**：读=线程本地连接；写（`execute/insert/executemany`）=专用短连接；`transaction()` 独立连接 + `BEGIN IMMEDIATE` + 3 次忙等重试。依据：FastAPI 协程共享事件循环线程，共享连接导致交错 BEGIN 冲突（此前 `database is locked` 实测复现，现 61→86 用例无锁冲突）。
 - **WAL 设置**仅在模式非 wal 时执行（避免写竞争下 `journal_mode` 需要排他锁报错）。
-- **Schema v7**：`0007_blob_dedup_model.sql` 撤销 0006 的 `materials.file_hash` 唯一索引（与 blob 去重模型冲突）；生产库已迁移，`schema_migrations` checksum 锁定。
+- **Schema v7 + v8（V5.5.1 收尾）**：`0007_blob_dedup_model.sql` 撤销 0006 的 `materials.file_hash` 唯一索引（与 blob 去重模型冲突）；V5.5.1 收尾新增 `0008_v551_user_version_utc.sql` 引入通用 `system_metadata` 表；`PRAGMA user_version` 与 `schema_migrations MAX(version)` 由 `database.sync_user_version(conn)` 在 `ensure_schema` 内统一同步。
 
 ### B. Worker / 生命周期
 - FastAPI `lifespan`（无 on_event）：init → 备份（测试覆写时跳过）→ `recover_all()` → 临时文件清理（24h，5 分钟活动上传保护）→ WorkerManager 启动 → 健康自检；停机反序。
@@ -84,7 +84,7 @@
 ### H. 运维 / 工程化
 - **快照恢复**：`python -m tools.restore_snapshot --latest|--file [--dry-run]`；integrity_check + schema_migrations 校验、恢复前 pre_restore 备份、原子替换 + WAL 清理；对真实生产备份 dry-run 通过（33 表、migrations [1..7]、integrity ok）。
 - **CI**：`.github/workflows/ci.yml`——后端（compileall + unittest，Python 3.12/windows-latest）+ 前端（vue-tsc + build，node 22）。
-- **文档**：`docs/README.md`（索引+结构）、`PRODUCT.md`、`ARCHITECTURE.md`、`OPERATIONS.md`、`TESTING.md`、`VERSIONS.md`；版本口径统一为 产品 5.5.0 / Schema 7 / API v1 / prompts v1。
+- **文档**：`docs/README.md`（索引+结构）、`PRODUCT.md`、`ARCHITECTURE.md`、`OPERATIONS.md`、`TESTING.md`、`VERSIONS.md`；版本口径统一为 产品 5.5.1 / Schema 8 / API v1 / prompts v1。
 
 ---
 

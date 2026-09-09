@@ -27,7 +27,7 @@
 
 ## 数据模型
 
-- 迁移：`backend/migrations/0001-0007`，`schema_migrations` 记录版本+sha256（篡改锁定：已应用文件不可改，只能新增）。当前 **schema_version=7**（0007：materials.file_hash 去唯一化，配合 blob 去重）。
+- 迁移：`backend/migrations/0001-0008`，`schema_migrations` 记录版本+sha256（篡改锁定：已应用文件不可改，只能新增）。当前 **schema_version=8**（0007：materials.file_hash 去唯一化，配合 blob 去重；0008：新增通用 system_metadata 表 + 同步 PRAGMA user_version）。
 - 关键表：`workflow_runs`（状态机含 interrupted/取消请求）、`run_nodes`（attempt/租约）、`file_blobs`（ref_count/gc_state）、`questions`（student_answer/submitted_at/reveal_allowed）、`answer_items`（conflict）、`errors` + `error_events`、`retrieval_runs`、`model_calls`、`notes`（markdown_path/status）。
 - 旧库升级：`python -m tools.migrate_database`（影子迁移：新文件构建→完整性校验→备份原库→原子替换）。
 

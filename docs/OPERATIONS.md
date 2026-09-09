@@ -9,7 +9,7 @@ cd ..\frontend
 npm run dev                                     # 前端开发（或用 dist/ 静态产物）
 ```
 
-- 后端健康检查：`GET http://127.0.0.1:8801/api/health` → `{"status":"ok","version":"5.5.0"}`
+- 后端健康检查：`GET http://127.0.0.1:8801/api/health` → `{"status":"ok","version":"5.5.1"}`
 - 启动时自动：备份 → 中断恢复 → 清理 24h 前临时文件 → 启动 Worker → 健康自检。
 
 ## 数据库迁移
@@ -29,9 +29,14 @@ python -m tools.migrate_database      # 影子迁移：构建新库→校验→�
 # 手动：POST /api/backups
 
 # 恢复（先校验、pre_restore 备份、原子替换）
-python -m tools.restore_snapshot --latest --dry-run   # 只校验
-python -m tools.restore_snapshot --latest             # 实际恢复（停机状态下执行）
+python -m tools.restore_snapshot --latest --dry-run              # 只校验，绝不修改目标库
+python -m tools.restore_snapshot --latest                        # 实际恢复（停机状态下执行）
 python -m tools.restore_snapshot --file backups\v5_20250101_120000.db
+
+# 旧版本 v7 备份升级到 v8（dry-run 也安全，不写永久副本）
+python -m tools.restore_snapshot --file v7_snap.db --upgrade-to 8 --dry-run
+python -m tools.restore_snapshot --file v7_snap.db --upgrade-to 8           # 永久恢复
+python -m tools.restore_snapshot --file v7_snap.db --upgrade-to 8 --overwrite  # 覆盖已有副本
 ```
 
 ## 存储管理
@@ -52,6 +57,6 @@ python -m tools.restore_snapshot --file backups\v5_20250101_120000.db
 
 ## 版本口径（统一）
 
-- 产品版本：**5.5.0**（`/api/health` 返回值）
-- DB Schema：**v7**（migrations 0001–0007）
+- 产品版本：**5.5.1**（`/api/health` 返回值）
+- DB Schema：**v8**（migrations 0001–0008）
 - API：`/api` 前缀 v1 路由风格
