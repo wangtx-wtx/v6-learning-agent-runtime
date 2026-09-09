@@ -22,15 +22,9 @@ import numpy as np
 
 from .database import query, execute
 from .gateway import gateway
+from . import tokenizer as _tokenizer  # V5.6.3: 统一分词组件
 
 logger = logging.getLogger(__name__)
-
-try:
-    import jieba  # type: ignore
-    _HAS_JIEBA = True
-except ImportError:
-    _HAS_JIEBA = False
-    logger.warning("jieba 未安装,中文分词降级为字符切分。pip install jieba 启用。")
 
 
 # ===========================================================================
@@ -312,20 +306,8 @@ def jaccard(query_tokens: set[str], doc_tokens: set[str]) -> float:
 
 
 def _tokenize(text: str) -> set[str]:
-    """中英文混合分词:中文走 jieba.cut_for_search,英文/数字走空白切分"""
-    tokens: set[str] = set()
-    s = str(text)
-    if _HAS_JIEBA and re.search(r"[一-鿿]", s):
-        for word in jieba.cut_for_search(s):
-            clean = re.sub(r"[^\w一-鿿]", "", word).strip()
-            if len(clean) >= 1:
-                tokens.add(clean.lower())
-    else:
-        for word in s.split():
-            clean = re.sub(r"[^\w一-鿿]", "", word).strip()
-            if clean:
-                tokens.add(clean.lower())
-    return tokens
+    """中英文混合分词（V5.6.3：统一走 tokenizer.tokenize）。"""
+    return set(_tokenizer.tokenize(text))
 
 
 def _bonus_phrase_score(query_text: str, doc_text: str) -> float:
@@ -333,15 +315,8 @@ def _bonus_phrase_score(query_text: str, doc_text: str) -> float:
     qt = query_text.strip()
     if not qt:
         return 0.0
-    phrases: list[str] = []
-    if _HAS_JIEBA and re.search(r"[一-鿿]", qt):
-        for w in jieba.cut_for_search(qt):
-            if len(w) >= 2:
-                phrases.append(w)
-    else:
-        for w in qt.split():
-            if len(w) >= 3:
-                phrases.append(w)
+    # V5.6.3：用统一 tokenizer 生成短语候选；只保留长度≥2 的短语
+    phrases = [w for w in _tokenizer.tokenize(qt) if len(w) >= 2]
     if not phrases:
         return 0.0
     hits = sum(1 for p in phrases if p in doc_text)
@@ -376,21 +351,8 @@ def _bm25_scores(query_text: str, docs: list[str], k1: float = 1.5, b: float = 0
 
 
 def _tokenize_list(text: str) -> list[str]:
-    """分词为列表（BM25 需要词频，不能用集合）。"""
-    import re as _re
-    tokens: list[str] = []
-    s = str(text)
-    if _HAS_JIEBA and _re.search(r"[一-鿿]", s):
-        for word in jieba.cut_for_search(s):
-            clean = _re.sub(r"[^\w一-鿿]", "", word).strip()
-            if clean:
-                tokens.append(clean.lower())
-    else:
-        for word in s.split():
-            clean = _re.sub(r"[^\w一-鿿]", "", word).strip()
-            if clean:
-                tokens.append(clean.lower())
-    return tokens
+    """分词为列表（BM25 需要词频，不能用集合）。V5.6.3：统一走 tokenizer。"""
+    return _tokenizer.tokenize(text)
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -424,7 +386,12 @@ async def retrieve_chunks(
         sql += " AND lesson_id=?"
         params.append(lesson_id)
     chunks = query(sql, tuple(params))
-    filters_json = json.dumps({"chapter_id": chapter_id, "lesson_id": lesson_id}, ensure_ascii=False)
+    # V5.6.3: 审计字段加入实际使用的 tokenizer 模式（复用 filters_json，无新 migration）
+    filters_json = json.dumps({
+        "chapter_id": chapter_id,
+        "lesson_id": lesson_id,
+        "_tokenizer": _tokenizer.get_tokenizer_status()["mode"],
+    }, ensure_ascii=False)
 
     def _persist(selected: list[dict], final_mode: str) -> None:
         try:

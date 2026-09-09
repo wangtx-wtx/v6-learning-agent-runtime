@@ -318,12 +318,24 @@ async def health():
     except Exception:
         fts_flag = "unavailable"
 
+    # V5.6.3: tokenizer 简化状态（degraded 含 unavailable/failed；不泄露异常）
+    try:
+        from . import tokenizer as _tok
+        _tok_status = _tok.get_tokenizer_status()["status"]
+        tokenizer_flag = "ready" if _tok_status == "ready" else "degraded"
+        if _tok_status == "failed":
+            degraded_reasons.append("tokenizer_failed")   # 初始化异常 → 503
+        # unavailable（jieba 缺失）是预期降级：显示 degraded，但不 503
+    except Exception:
+        tokenizer_flag = "degraded"
+
     info = {
         "status": "degraded" if degraded_reasons else "ok",
         "version": PRODUCT_VERSION,
         "api_version": "v1",
         "now_utc": now_utc_iso(),
         "fts": fts_flag,
+        "tokenizer": tokenizer_flag,
     }
     if degraded_reasons:
         info["degraded_reasons"] = degraded_reasons
@@ -385,11 +397,18 @@ async def admin_diagnostics(request: Request):
         info["fts"] = get_fts_status()
     except Exception:
         info["fts"] = {"status": "unavailable", "error": "read_failed"}
+    # V5.6.3: 完整 tokenizer 诊断（本机 diagnostics）
+    try:
+        from . import tokenizer as _tok
+        info["tokenizer"] = _tok.get_tokenizer_status()
+    except Exception:
+        info["tokenizer"] = {"status": "unavailable", "error": "read_failed"}
     degraded = (
         not info["schema"].get("consistent", True)
         or not info["worker"].get("supervisor_alive", True)
         or bool(info["database"].get("error"))
         or info.get("fts", {}).get("status") == "failed"
+        or info.get("tokenizer", {}).get("status") == "failed"
     )
     if degraded:
         info["status"] = "degraded"

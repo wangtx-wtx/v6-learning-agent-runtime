@@ -90,11 +90,21 @@ async def lifespan(app):
                 logger.exception("获取单实例锁失败，拒绝启动: %s", e)
                 raise RuntimeError(f"获取单实例锁失败: {e}") from e
 
-        # 2) 数据库初始化 + FTS 受控初始化（迁移完成 → 探测 → 原子建表 → 校验）
+        # 2) 数据库初始化
         init_db()
         ensure_vault_structure()
 
-        # 2.1) V5.6.2: FTS 启动阶段单点初始化（业务路径不再懒建 DDL）。
+        # 2.1) V5.6.3: tokenizer 初始化（迁移后、FTS 前）。
+        #      jieba 失败也以降级 char_fallback 启动；状态记录给 health（degraded）。
+        try:
+            from . import tokenizer as _tok
+            _tok_status = _tok.initialize_tokenizer()
+            logger.info("tokenizer 启动状态: %s (%s)",
+                        _tok_status, _tok.get_tokenizer_status()["mode"])
+        except Exception as e:
+            logger.warning("tokenizer 启动初始化异常: %s", e)
+
+        # 2.2) V5.6.2: FTS 启动阶段单点初始化（业务路径不再懒建 DDL）。
         #      ready/unavailable 都接受；failed 视为启动自检失败。
         try:
             from .rag import init_fts
