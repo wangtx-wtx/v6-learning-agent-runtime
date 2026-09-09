@@ -308,11 +308,22 @@ async def health():
             degraded_reasons.append("worker_supervisor_dead")
     except Exception:
         degraded_reasons.append("worker_check_failed")
+    # V5.6.2: FTS 简化状态（ready/unavailable/failed/uninitialized），不泄露底层异常
+    try:
+        from .rag import get_fts_status
+        info_fts = get_fts_status()
+        fts_flag = info_fts.get("status", "uninitialized")
+        if fts_flag == "failed":
+            degraded_reasons.append("fts_failed")
+    except Exception:
+        fts_flag = "unavailable"
+
     info = {
         "status": "degraded" if degraded_reasons else "ok",
         "version": PRODUCT_VERSION,
         "api_version": "v1",
         "now_utc": now_utc_iso(),
+        "fts": fts_flag,
     }
     if degraded_reasons:
         info["degraded_reasons"] = degraded_reasons
@@ -368,10 +379,17 @@ async def admin_diagnostics(request: Request):
         )
     except Exception:
         info["worker"]["error"] = "read_failed"
+    # V5.6.2: 完整 FTS 诊断（本机 diagnostics；不隐含底层异常文本，只给错误码）
+    try:
+        from .rag import get_fts_status
+        info["fts"] = get_fts_status()
+    except Exception:
+        info["fts"] = {"status": "unavailable", "error": "read_failed"}
     degraded = (
         not info["schema"].get("consistent", True)
         or not info["worker"].get("supervisor_alive", True)
         or bool(info["database"].get("error"))
+        or info.get("fts", {}).get("status") == "failed"
     )
     if degraded:
         info["status"] = "degraded"

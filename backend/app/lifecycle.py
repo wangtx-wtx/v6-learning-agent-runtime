@@ -90,9 +90,22 @@ async def lifespan(app):
                 logger.exception("获取单实例锁失败，拒绝启动: %s", e)
                 raise RuntimeError(f"获取单实例锁失败: {e}") from e
 
-        # 2) 数据库初始化
+        # 2) 数据库初始化 + FTS 受控初始化（迁移完成 → 探测 → 原子建表 → 校验）
         init_db()
         ensure_vault_structure()
+
+        # 2.1) V5.6.2: FTS 启动阶段单点初始化（业务路径不再懒建 DDL）。
+        #      ready/unavailable 都接受；failed 视为启动自检失败。
+        try:
+            from .rag import init_fts
+            _fts_status = init_fts()
+            if _fts_status not in ("ready", "unavailable"):
+                raise RuntimeError(f"FTS 初始化失败: {_fts_status}")
+            logger.info("FTS 启动状态: %s", _fts_status)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.warning(f"FTS 启动初始化异常: {e}")
 
         # 3) 可选副作用
         try:
