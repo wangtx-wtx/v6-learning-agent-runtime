@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from . import config as _config
 from .config import DB_PATH, DATA_DIR
 
 # 复制顺序：无关紧要（复制时关闭外键，最后统一 foreign_key_check），
@@ -230,6 +231,13 @@ def shadow_migrate(db_path: str | Path | None = None, dry_run: bool = False) -> 
     """
     执行影子迁移。返回 JSON 兼容报告；失败时抛出异常且绝不替换原库。
     """
+    # V5.6.1: 测试环境禁止影子迁移目标指向正式库
+    if _config.ENV == "test":
+        target_tmp = Path(db_path) if db_path else Path(DB_PATH)
+        if target_tmp.resolve() == _config.PROD_DB_PATH:
+            raise RuntimeError(
+                f"测试环境拒绝影子迁移正式库 {_config.PROD_DB_PATH}"
+            )
     target = Path(db_path) if db_path else Path(DB_PATH)
     data_dir = target.parent
     ts = time.strftime("%Y%m%d_%H%M%S")

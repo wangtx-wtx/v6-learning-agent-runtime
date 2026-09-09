@@ -24,9 +24,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from .config import DB_PATH, DATA_DIR
+from . import config as _config  # V5.6.1: 延迟引用，路径统一来自运行时 config
 
 logger = logging.getLogger(__name__)
+
+
+def _assert_not_production() -> None:
+    """V5.6.1 最终防线：测试环境禁止触碰正式 v5.db（任何读写）。"""
+    _config.assert_not_production(test_only=True)
 
 # ---------------------------------------------------------------------------
 # 版本化迁移（方案 2.2）
@@ -220,7 +225,7 @@ _override_lock = threading.Lock()
 
 def _active_db_path() -> Path:
     with _override_lock:
-        return Path(_db_path_override) if _db_path_override else Path(DB_PATH)
+        return Path(_db_path_override) if _db_path_override else Path(_config.DB_PATH)
 
 
 def configure_db(path: str | Path) -> None:
@@ -249,6 +254,8 @@ def reset_connections() -> None:
 
 
 def create_connection(path: str | Path | None = None) -> sqlite3.Connection:
+    # V5.6.1: 任何连接（读/写/迁移）在测试环境指向正式库时立即拒绝
+    _assert_not_production()
     p = Path(path) if path else _active_db_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p), timeout=15.0)  # check_same_thread 默认 True：禁止跨线程共享
@@ -405,7 +412,7 @@ def resolve_material_path(material_id: int) -> tuple[str, str, str]:
         resolved = Path(file_path).resolve()
     except Exception as e:
         raise BusinessError(f"material_id={material_id} 路径解析失败: {e}")
-    upload_root = (Path(DATA_DIR) / "uploads").resolve()
+    upload_root = _config.UPLOAD_DIR.resolve()
     try:
         resolved.relative_to(upload_root)
     except ValueError:

@@ -23,10 +23,10 @@ jobs:
           pip install -r requirements.txt
       - name: Compile all modules
         run: python -m compileall app tools -q
-      - name: Run unit tests
+      - name: Run unit tests (isolated data root; fail-closed)
         env:
           PYTHONIOENCODING: utf-8
-        run: python -m unittest discover -s tests -t . -v
+        run: python tools/run_tests_isolated.py
 
   frontend:
     name: Frontend type-check & build

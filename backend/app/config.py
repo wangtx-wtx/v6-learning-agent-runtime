@@ -1,5 +1,13 @@
 """
 v5 后端主配置
+
+V5.6.1 测试环境硬隔离：
+- 运行环境 ``V5_ENV``: production | development | test（默认 development）。
+- 测试模式（``V5_ENV=test``）必须提供独立临时根目录 ``V5_TEST_DATA_ROOT``，
+  所有路径（db/uploads/backups/quarantine/obsidian_vault/.instance.lock）均
+  由该根目录派生。**fail-closed**：缺根/根在正式 data 下/指向正式 v5.db → 直接
+  RuntimeError，绝不回退到正式路径。
+- 数据库、备份、上传、隔离区、锁文件、Obsidian 路径统一来自 ``DATA_DIR`` 单一根。
 """
 from pathlib import Path
 import io
@@ -11,14 +19,88 @@ logger = logging.getLogger(__name__)
 # V5.2:项目根与配置目录,取代硬编码 D:\ 路径
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
-DB_PATH = DATA_DIR / "v5.db"
+# 正式数据根（恒定，用于 test 模式的 fail-closed 校验）
+PROD_DATA_DIR = (BASE_DIR / "data").resolve()
+PROD_DB_PATH = PROD_DATA_DIR / "v5.db"
 KEYS_DIR = Path(os.environ.get(
     "V5_KEYS_DIR",
     PROJECT_ROOT / "data" / "keys",
 ))
 KEYS_FILE = KEYS_DIR / "keys.dat"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# 运行环境解析（V5.6.1）
+# ---------------------------------------------------------------------------
+ENV = os.environ.get("V5_ENV", "development").strip().lower()
+if ENV not in ("production", "development", "test"):
+    raise RuntimeError(f"无效 V5_ENV='{ENV}'，允许: production|development|test")
+
+
+def _test_data_root() -> Path:
+    """解析并校验测试数据根（V5_ENV=test 时调用）。"""
+    raw = os.environ.get("V5_TEST_DATA_ROOT", "").strip()
+    if not raw:
+        raise RuntimeError(
+            "V5_ENV=test 必须设置 V5_TEST_DATA_ROOT=<绝对临时目录>"
+        )
+    root = Path(raw).resolve()
+    # 禁止指向正式数据目录或其子目录
+    try:
+        root.relative_to(PROD_DATA_DIR)
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError(
+            f"V5_TEST_DATA_ROOT={root} 位于正式数据目录 {PROD_DATA_DIR} 下，已拒绝"
+        )
+    # 禁止直接指向正式 v5.db
+    if root == PROD_DB_PATH:
+        raise RuntimeError(f"V5_TEST_DATA_ROOT 不能指向正式数据库 {PROD_DB_PATH}")
+    return root
+
+
+if ENV == "test":
+    DATA_DIR = _test_data_root()
+    # 测试模式：忽略单独路径 env，全部派生自 DATA_DIR（统一单一根）
+    DB_PATH = DATA_DIR / "v5.db"
+    UPLOAD_DIR = DATA_DIR / "uploads"
+    BACKUP_DIR = DATA_DIR / "backups"
+    QUARANTINE_DIR = DATA_DIR / "quarantine"
+    OBSIDIAN_VAULT_ROOT = DATA_DIR / "obsidian_vault"
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+else:
+    # development / production：兼容旧 V5_DATA_ROOT（默认正式 backend/data）
+    DATA_DIR = Path(os.environ.get("V5_DATA_ROOT", str(PROD_DATA_DIR))).resolve()
+    DB_PATH = DATA_DIR / "v5.db"
+    UPLOAD_DIR = Path(os.environ.get("V5_UPLOAD_DIR", str(DATA_DIR / "uploads"))).resolve()
+    BACKUP_DIR = Path(os.environ.get("V5_BACKUP_DIR", str(DATA_DIR / "backups"))).resolve()
+    QUARANTINE_DIR = Path(os.environ.get("V5_QUARANTINE_DIR", str(DATA_DIR / "quarantine"))).resolve()
+    OBSIDIAN_VAULT_ROOT = Path(os.environ.get("V5_OBSIDIAN_VAULT", str(DATA_DIR / "obsidian_vault"))).resolve()
+    for _d in (DATA_DIR, UPLOAD_DIR, BACKUP_DIR, QUARANTINE_DIR, OBSIDIAN_VAULT_ROOT):
+        _d.mkdir(parents=True, exist_ok=True)
+
+
+def assert_not_production(path: str | Path | None = None,
+                          test_only: bool = True) -> None:
+    """V5.6.1 最终防线：测试进程中指向正式 v5.db 立即抛错。
+
+    ``path`` 显式给定时检查该路径（backup/restore 传入目标库）；
+    否则检查当前活动数据库（database 写入口）。开发/生产模式不拦截。
+    """
+    if test_only and ENV != "test":
+        return
+    target = path if path is not None else _active_db_guard()
+    if Path(target).resolve() == PROD_DB_PATH:
+        raise RuntimeError(
+            f"拒绝操作正式数据库 {PROD_DB_PATH}（当前 V5_ENV={ENV}）。"
+            "测试进程必须使用独立临时目录。"
+        )
+
+
+def _active_db_guard() -> Path:
+    """延迟获取 database 活动库路径（避免 config import 期循环引用）。"""
+    from .database import _active_db_path
+    return _active_db_path()
 
 GATEWAY_BASE_URL = os.environ.get("V5_GATEWAY_URL", "http://127.0.0.1:8080")
 # Unified API Gateway 鉴权 Key（自动读取 .env 或环境变量）
@@ -92,17 +174,8 @@ def _auto_detect_gateway_key() -> str:
 GATEWAY_API_KEY = _auto_detect_gateway_key()
 GATEWAY_TIMEOUT = float(os.environ.get("V5_GATEWAY_TIMEOUT", "60"))
 
-# Obsidian 同步目标（默认自动创建在 v5/data/obsidian_vault）
-OBSIDIAN_VAULT_ROOT = Path(os.environ.get("V5_OBSIDIAN_VAULT", DATA_DIR / "obsidian_vault"))
-
-# 受控数据根目录 —— 所有材料/上传文件都限定在此目录下（P0 路径安全）
-DATA_ROOT = Path(os.environ.get("V5_DATA_ROOT", str(DATA_DIR))).resolve()
-DATA_ROOT.mkdir(parents=True, exist_ok=True)
-UPLOAD_DIR = Path(os.environ.get("V5_UPLOAD_DIR", str(DATA_DIR / "uploads"))).resolve()
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-BACKUP_DIR = Path(os.environ.get("V5_BACKUP_DIR", str(DATA_DIR / "backups"))).resolve()
-BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-QUARANTINE_DIR = Path(os.environ.get("V5_QUARANTINE_DIR", str(DATA_DIR / "quarantine"))).resolve()
+# V5.6.1: 路径统一由上方 ENV 分支派生；DATA_ROOT 作为受控根别名保留（== DATA_DIR）
+DATA_ROOT = DATA_DIR
 
 # 移动端 / Funnel 模式鉴权 Token（设置后启用；空则不校验）
 _env = _load_env_file()

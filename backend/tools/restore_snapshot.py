@@ -29,9 +29,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.config import DB_PATH  # noqa: E402
+from app import config as _config  # noqa: E402
+from app.config import DB_PATH  # noqa: E402  # 默认目标（随运行时 config 决定）
 
 BACKUP_DIR = Path(DB_PATH).parent / "backups"
+
+
+def _assert_not_production(db_path: Path) -> None:
+    """V5.6.1: 测试环境禁止把正式 v5.db 作为恢复目标。"""
+    if _config.ENV == "test":
+        if Path(db_path).resolve() == _config.PROD_DB_PATH:
+            raise ValueError(
+                f"测试环境拒绝恢复正式数据库 {_config.PROD_DB_PATH}"
+            )
 
 
 def _read_user_version(conn: sqlite3.Connection) -> int:
@@ -162,6 +172,7 @@ def restore_snapshot(snapshot: Path, db_path: Path = DB_PATH,
     只返回 ``validate_snapshot`` 的报告。
     """
     snapshot = Path(snapshot)
+    _assert_not_production(db_path)
     db_path = Path(db_path)
     info = validate_snapshot(snapshot)
 
@@ -223,6 +234,7 @@ def restore_with_upgrade(snapshot: Path, db_path: Path = DB_PATH,
     - restore 阶段不创建 pre_restore 备份、不执行 os.replace。
     """
     snapshot = Path(snapshot)
+    _assert_not_production(db_path)
     try:
         validate_snapshot(snapshot)
         return restore_snapshot(snapshot, db_path=db_path, dry_run=dry_run)

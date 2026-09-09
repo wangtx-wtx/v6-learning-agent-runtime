@@ -10,8 +10,10 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from .config import OBSIDIAN_VAULT_ROOT
+from . import config as _config
 from .database import query, fetch_one, insert
+
+OBSIDIAN_VAULT_ROOT = _config.OBSIDIAN_VAULT_ROOT  # V5.6.1: 统一运行时配置（兼容现有引用）
 
 VAULT_STRUCTURE = [
     "00 Inbox",

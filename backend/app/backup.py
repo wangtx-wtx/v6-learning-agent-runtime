@@ -10,23 +10,39 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .config import DB_PATH, DATA_DIR
+from . import config as _config
 
 logger = logging.getLogger(__name__)
 BACKUP_DIR_NAME = "backups"
 BACKUP_KEEP = 7
 
 
+def _assert_not_production(db_path: Optional[Path] = None) -> None:
+    """V5.6.1: 备份阶段禁止触碰正式库（测试环境）。"""
+    from .database import _active_db_path
+    target = Path(db_path) if db_path is not None else _active_db_path()
+    _config.assert_not_production(target, test_only=True)
+    if _config.ENV == "test":
+        # 备份目录指向正式 backups 也拒绝
+        bk = Path(_config.BACKUP_DIR).resolve()
+        prod_bk = (_config.PROD_DATA_DIR / "backups").resolve()
+        if bk == prod_bk:
+            raise RuntimeError(
+                f"拒绝将测试备份写入正式备份目录 {prod_bk}（V5_ENV=test）"
+            )
+
+
 def backup_database(db_path: Optional[Path] = None) -> Optional[Path]:
     """使用 SQLite backup API 备份数据库到 data/backups/ 目录。
     返回备份文件路径，失败返回 None。
     """
-    db_path = Path(db_path or DB_PATH)
+    db_path = Path(db_path or _config.DB_PATH)
+    _assert_not_production(db_path)
     if not db_path.exists():
         logger.info(f"数据库不存在，跳过备份: {db_path}")
         return None
 
-    backup_dir = Path(DATA_DIR) / BACKUP_DIR_NAME
+    backup_dir = Path(_config.BACKUP_DIR)
     backup_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -69,7 +85,7 @@ def backup_database(db_path: Optional[Path] = None) -> Optional[Path]:
 
 def list_backups() -> list[dict]:
     """列出所有备份文件"""
-    backup_dir = Path(DATA_DIR) / BACKUP_DIR_NAME
+    backup_dir = Path(_config.BACKUP_DIR)
     if not backup_dir.exists():
         return []
     result = []
