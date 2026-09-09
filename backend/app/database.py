@@ -144,6 +144,8 @@ def ensure_schema(conn: sqlite3.Connection) -> dict:
         for mig in files:
             _apply_migration(conn, mig)
         conn.commit()
+        # V5.5.1 收尾 B.3: 全新库也必须在传入的连接上同步 user_version
+        sync_user_version(conn)
         return {"mode": "fresh_init", "applied": [m["version"] for m in files]}
 
     if not applied:
@@ -159,8 +161,48 @@ def ensure_schema(conn: sqlite3.Connection) -> dict:
             _apply_migration(conn, mig)
         conn.commit()
         logger.info("前向迁移完成: %s", [m["version"] for m in pending])
+    # V5.5.1 收尾 B.3: sync_user_version 必须作用于 ensure_schema 传入的
+    # 目标连接；否则影子迁移会污染生产库 header。失败 throw，不允许仅 warning。
+    sync_user_version(conn)
     return {"mode": "ok", "applied_versions": sorted(applied.keys()),
             "newly_applied": [m["version"] for m in pending]}
+
+
+def sync_user_version(conn: sqlite3.Connection) -> None:
+    """V5.5.1 收尾 B.3: 把 PRAGMA user_version 与 schema_migrations MAX(version) 同步。
+
+    必须接受**目标连接**作为参数：
+    - 影子迁移只更新影子库的 user_version；
+    - 普通初始化只更新生产库；
+    - dry-run 不会调用本函数（永远不会修改源库）。
+
+    SQLite 的 PRAGMA 在事务里会被 DDL/DML 一起回滚，因此调用方必须
+    在 BEGIN/COMMIT 之外、且**先**做正常 DML 提交，再调用本函数。
+    """
+    row = conn.execute("SELECT MAX(version) AS v FROM schema_migrations").fetchone()
+    target = int(row["v"] or 0)
+    cur = conn.execute("PRAGMA user_version").fetchone()
+    current = int(cur[0] if cur else 0)
+    if current == target:
+        return
+    # PRAGMA user_version=N 是 SQLite header 设置；不可参数化。
+    conn.execute(f"PRAGMA user_version={target}")
+    conn.commit()
+    logger.info("PRAGMA user_version 同步: %s -> %s", current, target)
+
+
+def sync_user_version_for_path(path: str | Path) -> None:
+    """便利函数：独立短连接同步指定路径的 user_version（不依赖 override）。
+
+    用于 restore / 一次性同步。普通 init_db 流程应走
+    ensure_schema(conn) → sync_user_version(conn)。
+    """
+    conn = sqlite3.connect(str(path), timeout=15.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        sync_user_version(conn)
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

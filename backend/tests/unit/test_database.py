@@ -46,11 +46,20 @@ class TestFreshDatabase(DatabaseTestBase):
 
     def test_schema_version(self):
         db.init_db()
-        self.assertEqual(db.schema_version(), 7)
-        versions = [r["version"] for r in db.fetch_all(
-            "SELECT version FROM schema_migrations ORDER BY version"
-        )]
-        self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7])
+        # V5.5.1: 0008 迁移落地后最大版本为 8
+        self.assertEqual(db.schema_version(), 8)
+        versions = sorted(r["version"] for r in db.fetch_all(
+            "SELECT version FROM schema_migrations"))
+        self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8])
+        # V5.5.1: PRAGMA user_version 应同步到 8
+        uv = db.fetch_one("PRAGMA user_version")
+        # fetch_one 对 PRAGMA 返回的是元组/Row；归一为 int
+        if isinstance(uv, dict):
+            uv_int = int(uv.get("user_version", 0))
+        else:
+            uv_int = int(uv[0] if uv else 0)
+        self.assertEqual(uv_int, 8)
+
 
     def test_foreign_key_check_after_fresh_init(self):
         db.init_db()
@@ -227,7 +236,7 @@ class TestLegacyShadowMigration(unittest.TestCase):
         self.assertEqual(report["copied"]["chapters"]["deduped"], 1)
         # 校验迁移后的库
         db.configure_db(legacy)
-        self.assertEqual(db.schema_version(), 7)
+        self.assertEqual(db.schema_version(), 8)  # V5.5.1: 包含 0008 迁移
         self.assertEqual(db.fetch_all("PRAGMA foreign_key_check"), [])
         # 重复章节被合并，lesson.chapter_id 已重映射到保留的章节 id=1
         lesson = db.fetch_one("SELECT chapter_id FROM lessons")
