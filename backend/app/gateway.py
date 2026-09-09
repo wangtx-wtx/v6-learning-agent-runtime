@@ -92,6 +92,31 @@ class GatewayClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.api_key = api_key
+        self._closed = False
+
+    async def aclose(self) -> None:
+        """V5.5.1 修复：实例方法版 aclose。
+
+        关闭共享 httpx 连接池（lifespan 停机时调用），关闭后置 _pool=None
+        并打 _closed 标记避免重复关闭。
+        旧版是模块级函数，导致 lifecycle 中的 `await gw.aclose()` 实际调用
+        模块级 aclose，错误地共享闭包里的 _pool。实例方法 + 双重清空杜绝
+        ResourceWarning: unclosed transport。
+        """
+        global _pool
+        with _pool_lock:
+            if _pool is not None:
+                client = _pool
+                _pool = None
+            else:
+                client = None
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception as e:
+                logger.warning("网关连接池关闭异常: %s", e)
+        self._closed = True
+        logger.info("网关连接池已关闭")
 
     def _headers(self, trace: str = "", extra: dict | None = None) -> dict:
         h = {"Content-Type": "application/json"}
@@ -263,12 +288,8 @@ def _audit_model_call(model_id: str, gateway_model: str, messages_text: str,
 
 
 async def aclose() -> None:
-    """关闭共享连接池（应用停机时调用，方案 3.1）。"""
-    global _pool
-    with _pool_lock:
-        if _pool is not None:
-            await _pool.aclose()
-            _pool = None
+    """模块级 aclose（V5.5.1 保留作兼容层）：转发到实例方法。"""
+    await gateway.aclose()
 
 
 # 兼容别名

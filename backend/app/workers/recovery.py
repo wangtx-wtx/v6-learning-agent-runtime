@@ -37,18 +37,21 @@ def recover_interrupted_tasks() -> dict:
         )
         report["parse_tasks_gave_up"] = int(cur.rowcount or 0)
 
-        # 2) 其余中断任务恢复为 queued（原本就是 queued 的不重复修改）
+        # 2) interrupted 状态全部回到 queued（stop() 留下的标记）
+        # V5.5.1: 不再重置所有 running 行——running 由 stale_leases() 单独
+        # 按 lease_expires_at 判断是否回收；本机单实例假设下不会命中，
+        # 但代码不再依赖该假设，理论支持"另一个实例仍持有租约"。
         cur = conn.execute(
-            "UPDATE run_tasks SET status='queued', error=?, updated_at=datetime('now','localtime'), "
+            "UPDATE run_tasks SET status='queued', error=?, updated_at=datetime('now'), "
             " lease_owner=NULL, lease_expires_at=NULL, cancel_requested=0 "
-            "WHERE status IN ('running','interrupted')",
+            "WHERE status='interrupted'",
             (RECOVERY_MARKER,),
         )
         report["run_tasks_recovered"] = int(cur.rowcount or 0)
         cur = conn.execute(
-            "UPDATE parse_tasks SET status='queued', error=?, updated_at=datetime('now','localtime'), "
+            "UPDATE parse_tasks SET status='queued', error=?, updated_at=datetime('now'), "
             " lease_owner=NULL, lease_expires_at=NULL, cancel_requested=0 "
-            "WHERE status IN ('running','interrupted')",
+            "WHERE status='interrupted'",
             (RECOVERY_MARKER,),
         )
         report["parse_tasks_recovered"] = int(cur.rowcount or 0)
@@ -58,10 +61,10 @@ def recover_interrupted_tasks() -> dict:
         )
         report["sync_jobs_recovered"] = int(cur.rowcount or 0)
 
-        # 3) 运行/中断状态的工作流随任务一起回到 queued
+        # 3) workflow_runs 的 interrupted 回到 queued；running 留给 stale_leases
         cur = conn.execute(
-            "UPDATE workflow_runs SET status='queued', updated_at=datetime('now','localtime') "
-            "WHERE status IN ('running','interrupted') AND id IN "
+            "UPDATE workflow_runs SET status='queued', updated_at=datetime('now') "
+            "WHERE status='interrupted' AND id IN "
             "  (SELECT run_id FROM run_tasks WHERE status='queued')"
         )
         report["runs_recovered"] = int(cur.rowcount or 0)
@@ -74,7 +77,7 @@ def recover_interrupted_tasks() -> dict:
         for r in orphan_rows:
             conn.execute(
                 "INSERT INTO run_tasks (run_id, status, created_at, updated_at) "
-                "VALUES (?, 'queued', datetime('now','localtime'), datetime('now','localtime'))",
+                "VALUES (?, 'queued', datetime('now'), datetime('now'))",
                 (r["id"],),
             )
         report["runs_reenqueued"] = len(orphan_rows)
@@ -85,18 +88,34 @@ def recover_interrupted_tasks() -> dict:
 
 
 def stale_leases() -> int:
-    """清理过期 lease 的 running 任务（worker 崩溃遗留），交还队列。"""
+    """仅回收 lease_expires_at 已经过期的 running 任务（worker 崩溃遗留）。
+
+    V5.5.1: 比较用 ``datetime('now')`` 与写入的 ``lease_expires_at`` 都
+    是 SQLite UTC 字面量，跨时区不再漂移；不再无条件重置所有 running。
+    """
     from ..database import execute
     n1 = execute(
         "UPDATE run_tasks SET status='queued', error='lease_expired', "
-        " lease_owner=NULL, lease_expires_at=NULL, updated_at=datetime('now','localtime') "
-        "WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at < datetime('now','localtime')"
+        " lease_owner=NULL, lease_expires_at=NULL, updated_at=datetime('now') "
+        "WHERE status='running' AND lease_expires_at IS NOT NULL "
+        "  AND lease_expires_at < datetime('now')"
     )
     n2 = execute(
         "UPDATE parse_tasks SET status='queued', error='lease_expired', "
-        " lease_owner=NULL, lease_expires_at=NULL, updated_at=datetime('now','localtime') "
-        "WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at < datetime('now','localtime')"
+        " lease_owner=NULL, lease_expires_at=NULL, updated_at=datetime('now') "
+        "WHERE status='running' AND lease_expires_at IS NOT NULL "
+        "  AND lease_expires_at < datetime('now')"
     )
+    # workflow_runs 跟随 run_tasks 一起回到 queued
+    try:
+        execute(
+            "UPDATE workflow_runs SET status='queued', updated_at=datetime('now') "
+            "WHERE status='running' AND id IN ("
+            "  SELECT run_id FROM run_tasks WHERE status='queued' AND error='lease_expired'"
+            ")"
+        )
+    except Exception:
+        pass
     return int(n1 or 0) + int(n2 or 0)
 
 

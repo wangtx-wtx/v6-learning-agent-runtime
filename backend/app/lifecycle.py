@@ -1,16 +1,22 @@
-"""FastAPI Lifespan（方案 3.1）：启动/关闭的完整生命周期管理。
+"""FastAPI Lifespan（V5.5.1 收尾 B.2）。
 
-启动：数据库初始化（含 schema 版本校验，遗留库拒绝启动）→ 任务恢复 →
-      启动 Worker（工作流 + 材料）→ 健康自检。
-关闭：停止领取 → 取消在跑任务 → 未完成任务标记 interrupted → 关闭网关连接池 →
-      关闭数据库读连接。
+启动：数据库初始化 → 任务恢复 → 启动 Worker → 健康自检。
+关闭：停止领取 → 取消在跑任务 → 关闭网关连接池 → 释放数据库读连接 →
+      释放单实例锁。
+
+B.2 关键修复：单实例锁在 ``init_db()`` 之前获取，**所有启动阶段
+（migration / vault / 备份 / 恢复 / Worker / 自检）都被外层
+``try/finally`` 包裹**。任一步失败（包括 init_db 抛 MigrationRequiredError）
+都进入 finally，先停止已启动的子系统（worker_manager / gateway），
+再释放锁。
 """
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from typing import Optional
 
-from .database import fetch_one, init_db
+from .database import fetch_one, init_db, is_override
 from .obsidian import ensure_vault_structure
 from .workers import recover_all, worker_manager
 
@@ -29,48 +35,108 @@ def _health_selfcheck() -> dict:
     return info
 
 
+async def _shutdown_subsystems():
+    """统一收尾：worker → gateway → DB 连接。任一异常均不向上抛。"""
+    try:
+        await worker_manager.stop()
+    except Exception as e:
+        logger.exception("worker_manager.stop 失败: %s", e)
+    try:
+        from .gateway import gateway as gw
+        await gw.aclose()
+    except Exception as e:
+        logger.warning("网关连接池关闭失败: %s", e)
+    try:
+        from .database import reset_connections
+        reset_connections()
+    except Exception as e:
+        logger.warning("DB 连接清理失败: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app):
-    # ---- 启动 ----
-    init_db()  # 遗留库在此抛 MigrationRequiredError，应用拒绝启动
-    ensure_vault_structure()
+    # C.5 收尾：startup / shutdown 严格幂等，shutdown 最多执行一次。
+    # 启动失败与正常运行退出走同一 finally 路径，状态变量保证不重复。
+    lock_acquired: bool = False
+    worker_started: bool = False
+    shutdown_done: bool = False
+
+    async def _shutdown_once():
+        nonlocal shutdown_done
+        if shutdown_done:
+            return
+        shutdown_done = True
+        if worker_started:
+            await _shutdown_subsystems()
+        if lock_acquired:
+            try:
+                from .instance_lock import release_instance_lock
+                release_instance_lock()
+            except Exception as e:
+                logger.warning(f"释放单实例锁失败: {e}")
+        logger.info("v5.5.1 后端已关闭")
+
     try:
-        from .seed_data import seed_calendar
-        seed_calendar(force=False)
-    except Exception as e:
-        logger.warning(f"seed_calendar skipped: {e}")
-    from .database import is_override
-    if not is_override():  # 测试注入库时不产生真实备份副作用
+        # 1) 单实例锁
+        if not is_override():
+            from .instance_lock import acquire_instance_lock
+            try:
+                acquire_instance_lock()
+                lock_acquired = True
+            except RuntimeError as e:
+                logger.error(f"单实例锁冲突: {e}")
+                raise
+            except Exception as e:
+                logger.exception("获取单实例锁失败，拒绝启动: %s", e)
+                raise RuntimeError(f"获取单实例锁失败: {e}") from e
+
+        # 2) 数据库初始化
+        init_db()
+        ensure_vault_structure()
+
+        # 3) 可选副作用
         try:
-            from .backup import backup_database
-            backup_database()
+            from .seed_data import seed_calendar
+            seed_calendar(force=False)
         except Exception as e:
-            logger.warning(f"startup backup skipped: {e}")
+            logger.warning(f"seed_calendar skipped: {e}")
+        if not is_override():
+            try:
+                from .backup import backup_database
+                backup_database()
+            except Exception as e:
+                logger.warning(f"startup backup skipped: {e}")
 
-    recovery = recover_all()
-    logger.info("任务恢复: %s", recovery)
+        # 4) 任务恢复
+        recovery = recover_all()
+        logger.info("任务恢复: %s", recovery)
 
-    # 清理上次进程崩溃遗留的上传临时文件（方案 4.4）
-    try:
-        from .services.blob_gc import cleanup_tmp_files
-        n = cleanup_tmp_files(max_age_hours=24.0)
-        if n:
-            logger.info("已清理 %d 个超龄上传临时文件", n)
-    except Exception as e:
-        logger.warning(f"tmp cleanup skipped: {e}")
-
-    worker_manager.start()
-    selfcheck = _health_selfcheck()
-    logger.info("v5.5 后端启动完成，自检: %s", selfcheck)
-    app.state.worker_manager = worker_manager
-    try:
-        yield
-    finally:
-        # ---- 关闭 ----
-        await worker_manager.stop()
+        # 5) 临时文件清理
         try:
-            from .gateway import gateway as gw
-            await gw.aclose()
-        except Exception:
-            pass
-        logger.info("v5.5 后端已优雅关闭")
+            from .services.blob_gc import cleanup_tmp_files
+            n = cleanup_tmp_files(max_age_hours=24.0)
+            if n:
+                logger.info("已清理 %d 个超龄上传临时文件", n)
+        except Exception as e:
+            logger.warning(f"tmp cleanup skipped: {e}")
+
+        # 6) Worker 启动
+        worker_manager.start()
+        worker_started = True
+        selfcheck = _health_selfcheck()
+        logger.info("v5.5.1 后端启动完成，自检: %s", selfcheck)
+        app.state.worker_manager = worker_manager
+
+        try:
+            yield
+        finally:
+            # 正常运行退出
+            await _shutdown_once()
+    except BaseException:
+        # 启动失败或 yield 内未捕获异常
+        logger.exception("v5.5.1 后端启动或运行异常")
+        try:
+            await _shutdown_once()
+        except Exception as e:
+            logger.exception("关闭阶段异常: %s", e)
+        raise

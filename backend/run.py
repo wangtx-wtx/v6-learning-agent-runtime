@@ -96,6 +96,18 @@ if __name__ == "__main__":
     host = os.environ.get("V5_HOST", "0.0.0.0")
     port = int(os.environ.get("V5_PORT", "8800"))
 
+    # V5.5.1: 默认单实例（reload=False）；显式设置 V5_DEV_RELOAD=1 才打开 reload
+    # 防止多进程实例同时争抢同一 SQLite 库 + 任务表，导致租约误判过期。
+    dev_reload = os.environ.get("V5_DEV_RELOAD", "").strip() in ("1", "true", "TRUE", "yes")
+    workers = int(os.environ.get("V5_WORKERS", "1"))
+    if workers > 1:
+        # V5.5.1: 明确多进程模式下禁止启动；避免误用导致任务被两个进程同时领取
+        _safe_print(
+            f"[WARN] V5_WORKERS={workers} > 1 与单实例 SQLite + Worker 假设冲突，"
+            "已强制回退为 1。"
+        )
+        workers = 1
+
     # V5.2:让 print() 在 cp1252 等非 UTF-8 终端也能安全打印中文
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -106,5 +118,8 @@ if __name__ == "__main__":
     _safe_print(BANNER.format(host=host, port=port))
     _print_token_hint()
     _print_tailscale_hint(port)
+    _safe_print(f"  · reload    : {'ON (V5_DEV_RELOAD)' if dev_reload else 'OFF (single instance)'}")
+    _safe_print(f"  · workers   : {workers}")
     _safe_print("")
-    uvicorn.run("app.main:app", host=host, port=port, reload=True)
+    uvicorn.run("app.main:app", host=host, port=port,
+                reload=dev_reload, workers=workers)

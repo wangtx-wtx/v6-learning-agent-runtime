@@ -38,10 +38,13 @@ def _insert_run(status="queued", workflow="lesson", input_json="{}") -> int:
     )
 
 
-def _insert_task(run_id: int, status="queued"):
+def _insert_task(run_id: int, status="queued", lease_owner: str | None = None,
+                 lease_expires_at: str | None = None):
     db.insert(
-        "INSERT INTO run_tasks (run_id, status, created_at, updated_at) VALUES (?,?,?,?)",
-        (run_id, status, "2026-01-01T00:00:00", "2026-01-01T00:00:00"),
+        "INSERT INTO run_tasks (run_id, status, created_at, updated_at, "
+        "lease_owner, lease_expires_at) VALUES (?,?,?,?,?,?)",
+        (run_id, status, "2026-01-01T00:00:00", "2026-01-01T00:00:00",
+         lease_owner, lease_expires_at),
     )
 
 
@@ -74,9 +77,12 @@ class WorkerTestBase(unittest.TestCase):
 
 
 class TestRecovery(WorkerTestBase):
-    def test_running_run_recovers_after_restart(self):
-        rid = _insert_run(status="running")
-        _insert_task(rid, status="running")
+    def test_interrupted_run_recovers_after_restart(self):
+        """V5.5.1: 只有 interrupted 状态会被启动恢复；running 行由 stale_leases
+        按 lease_expires_at 单独判断。模拟"上次进程崩溃/被 stop() 标为
+        interrupted"的情形。"""
+        rid = _insert_run(status="interrupted")
+        _insert_task(rid, status="interrupted")
         from app.workers import recover_all
         report = recover_all()
         self.assertEqual(report["run_tasks_recovered"], 1)
@@ -84,6 +90,19 @@ class TestRecovery(WorkerTestBase):
         self.assertEqual(db.fetch_one("SELECT status FROM workflow_runs WHERE id=?", (rid,))["status"], "queued")
         # 恢复标记写入
         self.assertEqual(db.fetch_one("SELECT error FROM run_tasks")["error"], "recovered_after_restart")
+
+    def test_running_with_valid_lease_preserved(self):
+        """V5.5.1: 拥有有效租约的 running 行不应被启动恢复重置。"""
+        rid = _insert_run(status="running")
+        # 写入一个 10 分钟有效的租约
+        from app.time_utils import utc_now_plus_sql
+        _insert_task(rid, status="running",
+                     lease_owner="wk-other", lease_expires_at=utc_now_plus_sql(600))
+        from app.workers import recover_all
+        recover_all()
+        # 状态应保持 running
+        self.assertEqual(db.fetch_one("SELECT status FROM run_tasks")["status"], "running")
+        self.assertEqual(db.fetch_one("SELECT status FROM workflow_runs WHERE id=?", (rid,))["status"], "running")
 
     def test_completed_run_not_recovered(self):
         rid = _insert_run(status="completed")

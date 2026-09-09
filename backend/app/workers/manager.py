@@ -60,17 +60,17 @@ class WorkerManager:
             t.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
-        # 兜底：任何仍处 running 的任务标记 interrupted（等当前事务结束后执行）
+        # 兜底：任何仍处 running 的任务标记 interrupted（V5.5.1: UTC 基准）
         execute(
             "UPDATE run_tasks SET status='interrupted', error='interrupted_by_shutdown', "
-            " updated_at=datetime('now','localtime') WHERE status='running'"
+            " updated_at=datetime('now') WHERE status='running'"
         )
         execute(
             "UPDATE parse_tasks SET status='interrupted', error='interrupted_by_shutdown', "
-            " updated_at=datetime('now','localtime') WHERE status='running'"
+            " updated_at=datetime('now') WHERE status='running'"
         )
         execute(
-            "UPDATE workflow_runs SET status='interrupted', updated_at=datetime('now','localtime') "
+            "UPDATE workflow_runs SET status='interrupted', updated_at=datetime('now') "
             "WHERE status='running'"
         )
         reset_connections()
@@ -122,7 +122,7 @@ class WorkerManager:
                 continue
             if is_cancel_requested(run_id):
                 execute(
-                    "UPDATE workflow_runs SET status='cancelled', updated_at=datetime('now','localtime') "
+                    "UPDATE workflow_runs SET status='cancelled', updated_at=datetime('now') "
                     "WHERE id=? AND status IN ('queued','running')",
                     (run_id,),
                 )

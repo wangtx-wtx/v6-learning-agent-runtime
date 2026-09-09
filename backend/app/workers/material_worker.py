@@ -1,13 +1,16 @@
-"""材料解析 Worker（方案 3.1/3.2/4.3）：原子领取 + lease + 取消 + 状态机。"""
+"""材料解析 Worker（方案 3.1/3.2/4.3）：原子领取 + lease + 取消 + 状态机。
+
+V5.5.1: 租约统一 UTC（time_utils.utc_now_plus_sql）。
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timedelta
 from typing import Optional
 
 from ..database import execute, transaction
+from ..time_utils import utc_now_plus_sql
 
 logger = logging.getLogger(__name__)
 
@@ -16,8 +19,8 @@ _PARSE_WORKER_ID = "pw-" + uuid.uuid4().hex[:8]
 
 
 def claim_next_parse_task(max_attempts: int = 3) -> Optional[dict]:
-    now = datetime.utcnow()
-    lease_until = (now + timedelta(seconds=PARSE_LEASE_SECONDS)).isoformat()
+    """原子领取：UTC 租约 + lease_owner + 事务内 SELECT-UPDATE-COMMIT。"""
+    lease_until = utc_now_plus_sql(PARSE_LEASE_SECONDS)
     with transaction() as conn:
         row = conn.execute(
             "SELECT id, material_id, attempts, max_attempts FROM parse_tasks "
@@ -28,15 +31,15 @@ def claim_next_parse_task(max_attempts: int = 3) -> Optional[dict]:
         if (row["attempts"] or 0) >= (row["max_attempts"] or max_attempts):
             conn.execute(
                 "UPDATE parse_tasks SET status='failed', error='exceeded max attempts', "
-                " finished_at=datetime('now','localtime'), updated_at=datetime('now','localtime') "
+                " finished_at=datetime('now'), updated_at=datetime('now') "
                 "WHERE id=?",
                 (row["id"],),
             )
             return None
         conn.execute(
             "UPDATE parse_tasks SET status='running', lease_owner=?, lease_expires_at=?, "
-            " started_at=COALESCE(started_at, datetime('now','localtime')), "
-            " updated_at=datetime('now','localtime'), attempts=attempts+1 "
+            " started_at=COALESCE(started_at, datetime('now')), "
+            " updated_at=datetime('now'), attempts=attempts+1 "
             "WHERE id=? AND status='queued'",
             (_PARSE_WORKER_ID, lease_until, row["id"]),
         )
@@ -47,15 +50,15 @@ def claim_next_parse_task(max_attempts: int = 3) -> Optional[dict]:
 def finish_parse_task(task_id: int, status: str, error: str = "") -> None:
     if status == "done":
         execute(
-            "UPDATE parse_tasks SET status='done', error='', finished_at=datetime('now','localtime'), "
-            " updated_at=datetime('now','localtime'), lease_owner=NULL, lease_expires_at=NULL "
+            "UPDATE parse_tasks SET status='done', error='', finished_at=datetime('now'), "
+            " updated_at=datetime('now'), lease_owner=NULL, lease_expires_at=NULL "
             "WHERE id=?",
             (task_id,),
         )
     else:
         execute(
-            "UPDATE parse_tasks SET status=?, error=?, finished_at=datetime('now','localtime'), "
-            " updated_at=datetime('now','localtime'), lease_owner=NULL, lease_expires_at=NULL "
+            "UPDATE parse_tasks SET status=?, error=?, finished_at=datetime('now'), "
+            " updated_at=datetime('now'), lease_owner=NULL, lease_expires_at=NULL "
             "WHERE id=?",
             (status, error[:500], task_id),
         )

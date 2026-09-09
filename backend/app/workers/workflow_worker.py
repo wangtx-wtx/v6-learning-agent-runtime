@@ -1,15 +1,20 @@
-"""工作流 Worker（方案 3.3）：原子领取 + lease + 真并发执行。"""
+"""工作流 Worker（方案 3.3）：原子领取 + lease + 真并发执行。
+
+V5.5.1: 租约时间统一使用 UTC ISO 8601（time_utils.utc_now_plus），
+不再使用 naive datetime.utcnow()。这样与 SQLite datetime('now') 写入
+的时区基准一致，跨时区不再发生 8 小时漂移导致的误过期。
+"""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import uuid
-from datetime import datetime, timedelta
 from typing import Optional
 
-from ..database import execute, fetch_one, insert, transaction
+from ..database import execute, fetch_one, transaction
 from ..dag import DAGContext, RunCancelledError
+from ..time_utils import now_utc, utc_now_plus_sql
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +27,10 @@ def claim_next_run_task(max_attempts: int = 3) -> Optional[dict]:
     原子领取一个 queued 任务（方案 3.3 伪流程）：
     BEGIN IMMEDIATE → SELECT → UPDATE running+lease → COMMIT。
     超过 max_attempts 的任务在此直接判负。
+
+    V5.5.1: 租约统一 UTC（写入 SQLite datetime 字面量），比较用同格式。
     """
-    now = datetime.utcnow()
-    lease_until = (now + timedelta(seconds=LEASE_SECONDS)).isoformat()
+    lease_until = utc_now_plus_sql(LEASE_SECONDS)
     with transaction() as conn:
         row = conn.execute(
             "SELECT id, run_id, attempts, max_attempts, cancel_requested FROM run_tasks "
@@ -35,15 +41,15 @@ def claim_next_run_task(max_attempts: int = 3) -> Optional[dict]:
         if (row["attempts"] or 0) >= (row["max_attempts"] or max_attempts):
             conn.execute(
                 "UPDATE run_tasks SET status='failed', error='exceeded max attempts', "
-                " finished_at=datetime('now','localtime'), updated_at=datetime('now','localtime') "
+                " finished_at=datetime('now'), updated_at=datetime('now') "
                 "WHERE id=?",
                 (row["id"],),
             )
             return None
         conn.execute(
             "UPDATE run_tasks SET status='running', lease_owner=?, lease_expires_at=?, "
-            " started_at=COALESCE(started_at, datetime('now','localtime')), "
-            " updated_at=datetime('now','localtime'), attempts=attempts+1 "
+            " started_at=COALESCE(started_at, datetime('now')), "
+            " updated_at=datetime('now'), attempts=attempts+1 "
             "WHERE id=? AND status='queued'",
             (WORKER_ID, lease_until, row["id"]),
         )
@@ -53,26 +59,28 @@ def claim_next_run_task(max_attempts: int = 3) -> Optional[dict]:
 
 
 def finish_run_task(run_id: int, status: str, error: str = "") -> None:
+    """V5.5.1: 写时间统一 UTC（datetime('now')）以与租约基准一致。"""
     if status == "done":
         execute(
-            "UPDATE run_tasks SET status='done', error='', finished_at=datetime('now','localtime'), "
-            " updated_at=datetime('now','localtime'), lease_owner=NULL, lease_expires_at=NULL "
+            "UPDATE run_tasks SET status='done', error='', finished_at=datetime('now'), "
+            " updated_at=datetime('now'), lease_owner=NULL, lease_expires_at=NULL "
             "WHERE run_id=?",
             (run_id,),
         )
     else:
         execute(
-            "UPDATE run_tasks SET status=?, error=?, finished_at=datetime('now','localtime'), "
-            " updated_at=datetime('now','localtime'), lease_owner=NULL, lease_expires_at=NULL "
+            "UPDATE run_tasks SET status=?, error=?, finished_at=datetime('now'), "
+            " updated_at=datetime('now'), lease_owner=NULL, lease_expires_at=NULL "
             "WHERE run_id=?",
             (status, error[:500], run_id),
         )
 
 
 def renew_lease(run_id: int) -> None:
-    lease_until = (datetime.utcnow() + timedelta(seconds=LEASE_SECONDS)).isoformat()
+    """V5.5.1: 续租时间统一 UTC（SQLite datetime 字面量）。"""
+    lease_until = utc_now_plus_sql(LEASE_SECONDS)
     execute(
-        "UPDATE run_tasks SET lease_expires_at=?, updated_at=datetime('now','localtime') "
+        "UPDATE run_tasks SET lease_expires_at=?, updated_at=datetime('now') "
         "WHERE run_id=? AND status='running' AND lease_owner=?",
         (lease_until, run_id, WORKER_ID),
     )

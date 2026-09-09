@@ -72,11 +72,43 @@ def _check_magic(data_head: bytes, ext: str) -> bool:
     return data_head.startswith(expected)
 
 app = FastAPI(
-    title="v5.5 学习 Agent Runtime",
+    title="v5.5.1 学习 Agent Runtime",
     description="以课程章节为核心、以证据链为约束的本地学习 Agent Runtime。",
-    version="5.5.0",
+    version="5.5.1",
     lifespan=lifespan,
 )
+
+# V5.5.1 收尾 C.6 + D.7: 集中版本号常量
+# - PRODUCT_VERSION 来自 V5.5.1 release tag
+# - SCHEMA_VERSION 不再硬编码，从 migrations 目录动态读，避免双版本源漂移
+PRODUCT_VERSION = "5.5.1"
+
+
+def _detect_schema_version() -> int:
+    """从 backend/migrations 目录动态读最大版本号。
+
+    单文件实现，懒加载（lifespan 启动后第一次调用时计算）。
+    """
+    try:
+        from pathlib import Path
+        from .config import BASE_DIR
+        mig_dir = BASE_DIR / "migrations"
+        if not mig_dir.exists():
+            return 0
+        max_v = 0
+        for p in mig_dir.glob("*.sql"):
+            try:
+                v = int(p.stem.split("_", 1)[0])
+                if v > max_v:
+                    max_v = v
+            except (ValueError, OSError):
+                continue
+        return max_v
+    except Exception:
+        return 0
+
+
+SCHEMA_VERSION = _detect_schema_version()
 
 # ---------- CORS:收紧到明确白名单(避免任意 Origin 携带 Token) ----------
 ALLOWED_ORIGINS = [
@@ -258,7 +290,93 @@ def _sha256_hex(data: bytes) -> str:
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "5.5.0"}
+    """公开健康端点 (V5.5.1 收尾 C.2/C.6)。
+
+    仅返回非敏感信息：产品版本、API 版本、UTC 时间。
+    详细诊断路 /api/admin/diagnostics，且**无条件**仅本机可访问。
+    """
+    from .time_utils import now_utc_iso
+    degraded_reasons: list[str] = []
+    try:
+        from .database import fetch_one
+        fetch_one("SELECT 1")
+    except Exception:
+        degraded_reasons.append("database_unavailable")
+    try:
+        from .workers import worker_manager
+        if not (worker_manager._supervisor and not worker_manager._supervisor.done()):
+            degraded_reasons.append("worker_supervisor_dead")
+    except Exception:
+        degraded_reasons.append("worker_check_failed")
+    info = {
+        "status": "degraded" if degraded_reasons else "ok",
+        "version": PRODUCT_VERSION,
+        "api_version": "v1",
+        "now_utc": now_utc_iso(),
+    }
+    if degraded_reasons:
+        info["degraded_reasons"] = degraded_reasons
+        return JSONResponse(status_code=503, content=info)
+    return info
+
+
+@app.get("/api/admin/diagnostics")
+async def admin_diagnostics(request: Request):
+    """受保护诊断端点 (V5.5.1 收尾 C.2)。**无条件**调用 _require_local_admin。"""
+    _require_local_admin(request)
+    import os
+    from .database import schema_version, _active_db_path, is_override
+    from .time_utils import now_utc_iso
+    info: dict[str, Any] = {
+        "status": "ok",
+        "version": PRODUCT_VERSION,
+        "api_version": "v1",
+        "now_utc": now_utc_iso(),
+        "pid": os.getpid(),
+        "instance": {},
+        "database": {},
+        "schema": {},
+        "worker": {},
+    }
+    try:
+        info["database"]["path"] = str(_active_db_path())
+    except Exception:
+        info["database"]["error"] = "read_failed"
+    try:
+        sv = schema_version()
+        info["schema"]["schema_migrations_max"] = sv
+        from .database import fetch_one
+        uv = fetch_one("PRAGMA user_version")
+        info["schema"]["user_version"] = (
+            (uv or {}).get("user_version", 0) if isinstance(uv, dict)
+            else int(uv[0] if uv else 0)
+        )
+        info["schema"]["consistent"] = (info["schema"]["user_version"] == sv)
+    except Exception:
+        info["schema"]["error"] = "read_failed"
+    try:
+        from .instance_lock import read_instance_lock
+        info["instance"]["lock"] = read_instance_lock()
+    except Exception:
+        info["instance"]["error"] = "read_failed"
+    try:
+        from .workers import worker_manager
+        info["worker"]["running_tasks"] = len(worker_manager.running_tasks)
+        info["worker"]["running_parses"] = len(worker_manager.running_parses)
+        info["worker"]["supervisor_alive"] = bool(
+            worker_manager._supervisor and not worker_manager._supervisor.done()
+        )
+    except Exception:
+        info["worker"]["error"] = "read_failed"
+    degraded = (
+        not info["schema"].get("consistent", True)
+        or not info["worker"].get("supervisor_alive", True)
+        or bool(info["database"].get("error"))
+    )
+    if degraded:
+        info["status"] = "degraded"
+        return JSONResponse(status_code=503, content=info)
+    return info
 
 
 # ---------- 课程 ----------
