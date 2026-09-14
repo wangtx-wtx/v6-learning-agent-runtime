@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 title V6.0 Learning Agent Runtime
 echo ============================================================
@@ -46,15 +46,15 @@ if /i "%~1"=="check" (
   exit /b 0
 )
 
-if /i "%V5_GATEWAY_MODE%"=="live" (
+if /i "!V5_GATEWAY_MODE!"=="live" (
   powershell -NoProfile -Command "exit -not (Test-NetConnection 127.0.0.1 -Port 8317 -InformationLevel Quiet)" >nul 2>nul
   if errorlevel 1 (
-    if exist "%V5_GATEWAY_HOME%\Start-Gateway.ps1" (
+    if exist "!V5_GATEWAY_HOME!\Start-Gateway.ps1" (
       echo [INFO] Starting Local LLM Gateway on port 8317...
-      powershell -NoProfile -ExecutionPolicy Bypass -File "%V5_GATEWAY_HOME%\Start-Gateway.ps1" -NoBrowser
+      powershell -NoProfile -ExecutionPolicy Bypass -File "!V5_GATEWAY_HOME!\Start-Gateway.ps1" -NoBrowser
     ) else (
       echo [WARN] Local LLM Gateway port 8317 is not listening.
-      echo [WARN] Gateway launcher was not found: %V5_GATEWAY_HOME%
+      echo [WARN] Gateway launcher was not found: !V5_GATEWAY_HOME!
       echo [HINT] For zero-token demo use: 启动 v5.bat fake
       echo.
     )
