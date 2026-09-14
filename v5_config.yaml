@@ -1,7 +1,7 @@
 # v5.1 model routing config
 models:
   deepseek_v4_free:
-    gateway_model: "Deepseek-v4-flash"
+    gateway_model: "DeepSeek-flash"
     provider: wechat
   deepseek_v4_official:
     gateway_model: "deepseekv4-flash"
@@ -39,5 +39,5 @@ quota_policy:
       conservative: 90
 
 gateway:
-  base_url: "http://127.0.0.1:8080"
+  base_url: "http://127.0.0.1:8317"
   read_only: true

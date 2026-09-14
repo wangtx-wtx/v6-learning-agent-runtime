@@ -67,6 +67,7 @@ if ENV == "test":
     BACKUP_DIR = DATA_DIR / "backups"
     QUARANTINE_DIR = DATA_DIR / "quarantine"
     OBSIDIAN_VAULT_ROOT = DATA_DIR / "obsidian_vault"
+    ARTIFACTS_DIR = DATA_DIR / "artifacts"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 else:
     # development / production：兼容旧 V5_DATA_ROOT（默认正式 backend/data）
@@ -76,8 +77,11 @@ else:
     BACKUP_DIR = Path(os.environ.get("V5_BACKUP_DIR", str(DATA_DIR / "backups"))).resolve()
     QUARANTINE_DIR = Path(os.environ.get("V5_QUARANTINE_DIR", str(DATA_DIR / "quarantine"))).resolve()
     OBSIDIAN_VAULT_ROOT = Path(os.environ.get("V5_OBSIDIAN_VAULT", str(DATA_DIR / "obsidian_vault"))).resolve()
-    for _d in (DATA_DIR, UPLOAD_DIR, BACKUP_DIR, QUARANTINE_DIR, OBSIDIAN_VAULT_ROOT):
+    ARTIFACTS_DIR = Path(os.environ.get("V5_ARTIFACTS_DIR", str(DATA_DIR / "artifacts"))).resolve()
+    for _d in (DATA_DIR, UPLOAD_DIR, BACKUP_DIR, QUARANTINE_DIR, OBSIDIAN_VAULT_ROOT, ARTIFACTS_DIR):
         _d.mkdir(parents=True, exist_ok=True)
+
+ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def assert_not_production(path: str | Path | None = None,
@@ -102,7 +106,7 @@ def _active_db_guard() -> Path:
     from .database import _active_db_path
     return _active_db_path()
 
-GATEWAY_BASE_URL = os.environ.get("V5_GATEWAY_URL", "http://127.0.0.1:8080")
+GATEWAY_BASE_URL = os.environ.get("V5_GATEWAY_URL", "http://127.0.0.1:8317")
 # Unified API Gateway 鉴权 Key（自动读取 .env 或环境变量）
 def _load_env_file():
     """读取 backend/.env 文件（如果存在），返回 dict"""
@@ -172,7 +176,9 @@ def _auto_detect_gateway_key() -> str:
     return ""
 
 GATEWAY_API_KEY = _auto_detect_gateway_key()
-GATEWAY_TIMEOUT = float(os.environ.get("V5_GATEWAY_TIMEOUT", "60"))
+# 长文审查（critic）等节点单次生成常超过 60s；read 超时过短会导致
+# “重试 3 次仍失败”且错误消息为空的假故障。默认放宽到 180s。
+GATEWAY_TIMEOUT = float(os.environ.get("V5_GATEWAY_TIMEOUT", "180"))
 
 # V5.6.1: 路径统一由上方 ENV 分支派生；DATA_ROOT 作为受控根别名保留（== DATA_DIR）
 DATA_ROOT = DATA_DIR
@@ -196,16 +202,18 @@ def set_mobile_token(value: str) -> None:
 DEFAULT_ROUTE = {
     "student_simulator": "deepseek_v4_free",
     "note_writer": "deepseek_v4_free",
-    "critic": "qwen3_8_27b",
-    "evidence_auditor": "qwen3_8_27b",
-    "scope_auditor": "qwen3_8_27b",
+    "critic": "glm_flash",
+    "evidence_auditor": "glm_flash",
+    "scope_auditor": "glm_flash",
     "solver": "deepseek_v4_free",
-    "parallel_solver": "minimax_m3",
-    "solution_explainer": "qwen3_8_27b",
+    "parallel_solver": "glm_flash",
+    "solution_explainer": "glm_flash",
     "error_analyst": "deepseek_v4_free",
     "review_writer": "deepseek_v4_free",
     "self_test_writer": "qwen3_flash",
-    "vision_reader": "qwen3_vl",
+    "vision_reader": "qwen3_flash",
     "transcriber_splitter": "qwen3_flash",
     "lesson_structurer": "qwen3_flash",
+    # V6 Phase 2：分段理解角色
+    "segment_understanding": "qwen3_flash",
 }

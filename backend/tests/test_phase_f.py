@@ -1,6 +1,7 @@
 """V5.5 阶段F 测试：Prompt 外置加载、Schema 绑定、混合检索、model_calls 审计。"""
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -141,28 +142,63 @@ class TestHybridRetrieval(Base):
 class TestModelCallAudit(Base):
     def test_audit_on_success_and_failure(self):
         from app.gateway import GatewayClient, set_call_context, reset_call_context
+        from app.gateway import _get_engine, reset_engine_for_test
+        from app import gateway as gw_mod
         from app.dag import RetryableModelError
 
         gc = GatewayClient()
-        # 伪造 post_json：成功一次、失败一次
-        async def ok_post(path, payload):
-            return 200, {"choices": [{"message": {"content": "hi"}}],
-                         "usage": {"prompt_tokens": 5, "completion_tokens": 2}}, "trace-ok"
-        async def fail_post(path, payload):
+        # V5.6.4: gateway.chat 直接委托 engine.chat；monkey-patch 当前引擎实例
+        # 切到 live 模式才能进入真实路径（fake 永远 tokens=0）
+        os.environ["V5_GATEWAY_MODE"] = "live"
+        os.environ["V5_ALLOW_LIVE_MODEL_TESTS"] = "1"
+        os.environ["V5_GATEWAY_URL"] = "http://127.0.0.1:8080"
+        os.environ["V5_GATEWAY_API_KEY"] = "test-key"
+        reset_engine_for_test()
+
+        async def ok_chat(contract, model_id, messages, temperature, max_tokens,
+                          response_format):
+            return {
+                "content": "hi",
+                "reasoning_content": "",
+                "tokens_in": 5,
+                "tokens_out": 2,
+                "model": "test-model",
+                "elapsed_ms": 1,
+            }
+
+        async def fail_chat(contract, model_id, messages, temperature, max_tokens,
+                            response_format):
             raise RetryableModelError("网络不可达")
 
         run_id = db.insert("INSERT INTO workflow_runs (workflow, mode, status) VALUES ('t','solve','running')")
         token = set_call_context(run_id=run_id, node_id="solver", attempt=2,
                                  prompt_name="homework/solver", prompt_version="v1")
         try:
-            gc.post_json = ok_post
-            r = asyncio.run(gc.chat("qwen3_flash", [{"role": "user", "content": "你好"}]))
-            self.assertEqual(r["tokens_in"], 5)
-            gc.post_json = fail_post
-            with self.assertRaises(RetryableModelError):
-                asyncio.run(gc.chat("qwen3_flash", [{"role": "user", "content": "再见"}]))
+            # 先跑成功用例：临时替换 engine 实例
+            mode, engine = _get_engine()
+            orig_chat = engine.chat
+            engine.chat = ok_chat
+            try:
+                r = asyncio.run(gc.chat("qwen3_flash",
+                                        [{"role": "user", "content": "你好"}],
+                                        contract="homework/solver"))
+                self.assertEqual(r["tokens_in"], 5)
+            finally:
+                engine.chat = orig_chat
+            # 再跑失败用例
+            engine.chat = fail_chat
+            try:
+                with self.assertRaises(RetryableModelError):
+                    asyncio.run(gc.chat("qwen3_flash",
+                                        [{"role": "user", "content": "再见"}],
+                                        contract="homework/solver"))
+            finally:
+                engine.chat = orig_chat
         finally:
             reset_call_context(token)
+            # 恢复 fake 模式避免污染其他用例
+            os.environ["V5_GATEWAY_MODE"] = "fake"
+            reset_engine_for_test()
 
         rows = db.fetch_all("SELECT * FROM model_calls ORDER BY id")
         self.assertEqual(len(rows), 2)

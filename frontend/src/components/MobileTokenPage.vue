@@ -7,6 +7,7 @@ import {
   type TokenShareUrls,
 } from '../api/endpoints'
 import { useToast } from '../composables/useToast'
+import Icon from './widgets/Icon.vue'
 
 const toast = useToast()
 
@@ -135,14 +136,19 @@ onMounted(loadStatus)
 
 <template>
   <div class="mx-auto max-w-4xl px-4 py-6 text-slate-100">
-    <header class="mb-6">
-      <p class="text-xs font-semibold uppercase tracking-[.18em] text-blue-400">
-        v5.1 Control Panel
-      </p>
-      <h1 class="mt-1 text-2xl font-bold text-white">🔐 远程上传凭证</h1>
-      <p class="mt-2 text-sm text-slate-400">
-        管理移动端上传 Token。Token 修改后立即生效，无需重启后端。
-      </p>
+    <header class="mb-6 flex items-start gap-3.5">
+      <span class="icon-badge mt-0.5">
+        <Icon name="key" :size="19" />
+      </span>
+      <div>
+        <p class="text-[10.5px] font-semibold uppercase tracking-[.2em] text-[var(--accent-hi)]">
+          v5.1 Control Panel
+        </p>
+        <h1 class="mt-0.5 text-[24px] font-semibold tracking-tight text-t1">远程上传凭证</h1>
+        <p class="mt-1.5 text-[13px] leading-6 text-t3">
+          管理移动端上传 Token。Token 修改后立即生效，无需重启后端。
+        </p>
+      </div>
     </header>
 
     <!-- 状态 -->
@@ -168,7 +174,7 @@ onMounted(loadStatus)
         </button>
       </div>
 
-      <div v-if="statusError" class="mt-3 rounded-lg border border-rose-900 bg-rose-950/40 p-3 text-sm text-rose-200">
+      <div v-if="statusError" class="mt-3 rounded-lg border border-rose-900 bg-rose-950/40 p-3 text-sm text-[var(--acc-red)]">
         {{ statusError }}
       </div>
 
@@ -180,8 +186,11 @@ onMounted(loadStatus)
     <!-- 手机远程上传入口（常驻显示） -->
     <section class="mt-6 rounded-xl border border-emerald-900/60 bg-emerald-950/20 p-4">
       <div class="flex items-center justify-between gap-4">
-        <h2 class="text-sm font-semibold text-emerald-200">📱 手机远程上传入口</h2>
-        <span class="rounded-full border border-emerald-700 bg-emerald-900/40 px-2 py-0.5 text-[11px] text-emerald-300">
+        <h2 class="flex items-center gap-2 text-sm font-semibold text-[var(--acc-green)]">
+          <Icon name="smartphone" :size="16" />
+          手机远程上传入口
+        </h2>
+        <span class="rounded-full border border-emerald-700 bg-emerald-900/40 px-2 py-0.5 text-[11px] text-[var(--acc-green)]">
           {{ enabled ? '鉴权已启用' : '无鉴权' }}
         </span>
       </div>
@@ -191,7 +200,7 @@ onMounted(loadStatus)
           <div v-for="{ key, label } in shareLabels" :key="key">
             <p class="mb-1 text-xs text-slate-400">{{ label }}</p>
             <div class="flex items-center gap-2">
-              <code class="flex-1 break-all rounded bg-slate-950 px-2 py-2 text-xs text-emerald-300">
+              <code class="flex-1 break-all rounded bg-slate-950 px-2 py-2 text-xs text-[var(--acc-green)]">
                 {{ currentLinks[key] || '不可用' }}
               </code>
               <button
@@ -206,15 +215,15 @@ onMounted(loadStatus)
 
         <p class="mt-3 text-xs text-slate-400">
           上方为基础链接。点击「一键生成新 Token」或「保存自定义 Token」后，
-          会立即显示出带 <code class="text-amber-300">?token=</code> 的专属链接，复制后发给手机即可。
+          会立即显示出带 <code class="text-[var(--acc-orange)]">?token=</code> 的专属链接，复制后发给手机即可。
         </p>
       </template>
 
-      <p v-else-if="statusError" class="mt-3 text-sm text-rose-200">
+      <p v-else-if="statusError" class="mt-3 text-sm text-[var(--acc-red)]">
         无法获取远程地址：{{ statusError }}
       </p>
 
-      <p v-else class="mt-3 text-sm text-amber-300">
+      <p v-else class="mt-3 text-sm text-[var(--acc-orange)]">
         正在获取远程地址…
       </p>
     </section>
@@ -259,8 +268,8 @@ onMounted(loadStatus)
 
     <!-- 重置 -->
     <section class="mt-6 rounded-xl border border-rose-900/60 bg-rose-950/20 p-4">
-      <h2 class="text-sm font-semibold text-rose-200">重置 / 关闭 Token</h2>
-      <p class="mt-1 text-xs text-rose-200/80">
+      <h2 class="text-sm font-semibold text-[var(--acc-red)]">重置 / 关闭 Token</h2>
+      <p class="mt-1 text-xs text-[var(--acc-red)]/80">
         关闭后所有请求不再校验 Token。Funnel 公网模式下存在安全风险。
       </p>
       <button
@@ -279,19 +288,19 @@ onMounted(loadStatus)
       <div v-if="result.token" class="mt-3 rounded-lg border border-slate-700 bg-slate-950 p-3">
         <p class="text-xs text-slate-400">新 Token（仅本次显示）</p>
         <div class="mt-1 flex items-center gap-2">
-          <code class="flex-1 break-all text-emerald-300">{{ result.token }}</code>
+          <code class="flex-1 break-all text-[var(--acc-green)]">{{ result.token }}</code>
           <button class="btn btn-ghost !px-2 !py-1 text-xs" @click="copyText(result.token)">
             复制
           </button>
         </div>
       </div>
 
-      <p class="mt-3 text-xs text-amber-300">
+      <p class="mt-3 text-xs text-[var(--acc-orange)]">
         上面「手机远程上传入口」中的链接已自动更新为带新 token 的完整链接。请使用新链接重新打开手机端页面，否则手机端本地保存的旧 Token 不会自动更新。
       </p>
     </section>
 
-    <p v-if="actionError" class="mt-4 rounded-lg border border-rose-900 bg-rose-950/40 p-3 text-sm text-rose-200">
+    <p v-if="actionError" class="mt-4 rounded-lg border border-rose-900 bg-rose-950/40 p-3 text-sm text-[var(--acc-red)]">
       {{ actionError }}
     </p>
 

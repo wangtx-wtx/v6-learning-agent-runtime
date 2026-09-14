@@ -173,15 +173,17 @@ class TestCancelSemantics(WorkerTestBase):
         resp = TestClient(app).post(f"/api/runs/{rid}/cancel")
         self.assertEqual(resp.status_code, 409)
 
-    def test_cancel_running_run_requests_cancel(self):
+    def test_cancel_orphaned_running_run_finishes_cancelled(self):
         rid = _insert_run(status="running")
         _insert_task(rid, status="running")
         from fastapi.testclient import TestClient
         from app.main import app
         resp = TestClient(app).post(f"/api/runs/{rid}/cancel")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json()["status"], "cancellation_requested")
+        self.assertEqual(resp.json()["status"], "cancelled")
         self.assertEqual(db.fetch_one("SELECT cancel_requested FROM workflow_runs WHERE id=?", (rid,))["cancel_requested"], 1)
+        self.assertEqual(db.fetch_one("SELECT status FROM workflow_runs WHERE id=?", (rid,))["status"], "cancelled")
+        self.assertEqual(db.fetch_one("SELECT status FROM run_tasks WHERE run_id=?", (rid,))["status"], "cancelled")
 
 
 class TestExecution(WorkerTestBase):

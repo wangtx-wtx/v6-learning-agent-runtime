@@ -6,6 +6,7 @@ import { createRouter, createWebHashHistory, type RouteRecordRaw } from 'vue-rou
 const routes: RouteRecordRaw[] = [
   { path: '/', name: 'dashboard', component: () => import('../components/DashboardPage.vue') },
   { path: '/courses', name: 'courses', component: () => import('../components/CoursesPage.vue') },
+  { path: '/calendar', name: 'calendar', component: () => import('../components/CalendarManagePage.vue') },
   { path: '/chapters', name: 'chapters', component: () => import('../components/ChaptersPage.vue') },
   { path: '/upload', name: 'upload', component: () => import('../components/UploadPage.vue') },
   { path: '/lesson-flow', name: 'lesson-flow', component: () => import('../components/LessonFlowPage.vue') },

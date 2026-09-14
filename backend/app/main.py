@@ -2,6 +2,7 @@
 FastAPI 主应用 + API 路由。
 """
 import asyncio
+import httpx
 import json
 import logging
 import os
@@ -11,7 +12,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any, Optional
 import re
 import secrets
@@ -20,10 +21,10 @@ from urllib.parse import quote
 
 from . import config
 from .config import OBSIDIAN_VAULT_ROOT, FRONTEND_PORT
-from .database import init_db, query, query_one, execute, fetch_one, insert
+from .database import init_db, query, query_one, execute, fetch_one, insert, transaction
 from .lifecycle import lifespan
 from .gateway import gateway
-from .dag import DAGContext
+from .dag import DAGContext, is_terminal_run_status
 from .dag_lesson import build_lesson_dag
 from .dag_homework import build_homework_dag
 from .dag_error import build_error_dag
@@ -32,16 +33,29 @@ from .routing import load_usage_from_gateway, make_route_for_workflow
 from .obsidian import ensure_vault_structure, list_sync_status
 from .tailscale import get_tailscale_info
 from .env_file import upsert_env_key
+from .schedule_calendar import (
+    bootstrap_schedule_data,
+    effective_schedule,
+    list_adjustments,
+    list_rules,
+    list_terms,
+    save_adjustment,
+    save_rule,
+    save_term,
+)
+from .document_artifacts import artifact_public, render_artifact, safe_artifact_file
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
 # ---------- 上传安全常量 ----------
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB；上传过程流式落盘，不整文件驻留内存
+MAX_INLINE_TRANSCRIPT_CHARS = 2_000_000
+TRANSCRIPT_WARNING_CHARS = 200_000
 ALLOWED_EXTS = {
     ".pdf", ".ppt", ".pptx", ".doc", ".docx",
-    ".md", ".txt", ".png", ".jpg", ".jpeg", ".webp",
+    ".md", ".txt", ".srt", ".vtt", ".json", ".png", ".jpg", ".jpeg", ".webp",
     ".gif", ".mp3", ".m4a", ".wav",
 }
 # 简易 magic bytes 校验表:type → 前 4 字节 (hex)
@@ -61,10 +75,21 @@ def _safe_filename(name: str) -> str:
     return "".join(c for c in base if c.isprintable() and c not in '\x00\r\n')
 
 
+# ---------- V6 Learning Engine Phase 1 运行标识 ----------
+def _v6_engine_info() -> dict:
+    """当前引擎模式。V5 / V6 运行必须可区分（设计文档 §14）。"""
+    from .learning_engine import config as v6cfg
+    return {"mode": v6cfg.engine_mode(), "engine_version": v6cfg.engine_version(),
+            "enabled": v6cfg.engine_enabled(),
+            # 出版层语义必须如实展示：shadow 不接管，on 使用 Composer V2。
+            "publication_mode": v6cfg.publication_mode(),
+            "real_notes_publish_enabled": v6cfg.real_notes_publish_enabled()}
+
+
 def _check_magic(data_head: bytes, ext: str) -> bool:
     """根据扩展名核对文件头几个字节。文本类直接放行。"""
     ext = ext.lower().lstrip(".")
-    if ext in ("md", "txt"):
+    if ext in ("md", "txt", "srt", "vtt", "json"):
         return True  # 纯文本不做 magic 校验
     expected = _MAGIC_BYTES.get(ext)
     if not expected:
@@ -72,16 +97,14 @@ def _check_magic(data_head: bytes, ext: str) -> bool:
     return data_head.startswith(expected)
 
 app = FastAPI(
-    title="v5.5.1 学习 Agent Runtime",
+    title="V6.0 学习 Agent Runtime",
     description="以课程章节为核心、以证据链为约束的本地学习 Agent Runtime。",
-    version="5.5.1",
+    version="6.0.0",
     lifespan=lifespan,
 )
 
-# V5.5.1 收尾 C.6 + D.7: 集中版本号常量
-# - PRODUCT_VERSION 来自 V5.5.1 release tag
-# - SCHEMA_VERSION 不再硬编码，从 migrations 目录动态读，避免双版本源漂移
-PRODUCT_VERSION = "5.5.1"
+# 集中版本号常量；schema 版本仍从 migrations 动态读取，避免双版本源漂移。
+PRODUCT_VERSION = "6.0.0"
 
 
 def _detect_schema_version() -> int:
@@ -191,6 +214,14 @@ class ChapterCreate(BaseModel):
     chapter_no: Optional[int] = None
     title: str
     syllabus_ref: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class ChapterUpdate(BaseModel):
+    chapter_no: Optional[int] = None
+    title: str
+    notes: Optional[str] = None
+    status: str = "not_started"
 
 
 class LessonCreate(BaseModel):
@@ -249,6 +280,46 @@ class AcademicCalendarCreate(BaseModel):
     title: str
     date: Optional[str] = None
     detail: Optional[str] = None
+
+
+class AcademicTermPayload(BaseModel):
+    name: str
+    school_year: Optional[str] = None
+    semester: Optional[str] = None
+    start_date: str
+    end_date: str
+    first_week_monday: str
+    teaching_weeks: int = 16
+    exam_start: Optional[str] = None
+    exam_end: Optional[str] = None
+    source: Optional[str] = "manual"
+    active: bool = True
+
+
+class ScheduleRulePayload(BaseModel):
+    course_id: int
+    weekday: int
+    start_week: int = 1
+    end_week: int = 16
+    week_parity: str = "all"
+    periods: list[int] = Field(default_factory=list)
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    location: Optional[str] = None
+    teacher: Optional[str] = None
+    note: Optional[str] = None
+    source: Optional[str] = "manual"
+    enabled: bool = True
+
+
+class CalendarAdjustmentPayload(BaseModel):
+    adjustment_type: str
+    date: str
+    source_date: Optional[str] = None
+    periods: list[int] = Field(default_factory=list)
+    title: Optional[str] = None
+    detail: Optional[str] = None
+    source: Optional[str] = "manual"
 
 
 
@@ -337,10 +408,35 @@ async def health():
         "fts": fts_flag,
         "tokenizer": tokenizer_flag,
     }
+    # V5.6.4: 网关模式 + 公开 model_gateway 别名（前端徽标读这里；不泄露路径/Key）
+    try:
+        from .gateway_mode import resolve_mode
+        gw_mode = resolve_mode()
+        info["gateway_mode"] = gw_mode
+        info["model_gateway"] = {
+            "fake": "simulated",
+            "replay": "replay",
+            "live": "live",
+        }.get(gw_mode, "unavailable")
+    except Exception:
+        info["gateway_mode"] = "unavailable"
+        info["model_gateway"] = "unavailable"
     if degraded_reasons:
         info["degraded_reasons"] = degraded_reasons
         return JSONResponse(status_code=503, content=info)
     return info
+
+
+@app.get("/api/capabilities/limits")
+async def capability_limits():
+    """前端预检使用的稳定、非敏感限制，避免传完整文件后才收到 413。"""
+    return {
+        "max_upload_bytes": MAX_FILE_SIZE,
+        "max_inline_transcript_chars": MAX_INLINE_TRANSCRIPT_CHARS,
+        "transcript_warning_chars": TRANSCRIPT_WARNING_CHARS,
+        "allowed_extensions": sorted(ALLOWED_EXTS),
+        "large_input_strategy": "stream_upload_then_segment",
+    }
 
 
 @app.get("/api/admin/diagnostics")
@@ -360,6 +456,7 @@ async def admin_diagnostics(request: Request):
         "database": {},
         "schema": {},
         "worker": {},
+        "gateway": {},
     }
     try:
         info["database"]["path"] = str(_active_db_path())
@@ -403,6 +500,12 @@ async def admin_diagnostics(request: Request):
         info["tokenizer"] = _tok.get_tokenizer_status()
     except Exception:
         info["tokenizer"] = {"status": "unavailable", "error": "read_failed"}
+    # V5.6.4: 网关模式 + 计数（仅本机；不暴露路径/Key）
+    try:
+        from .gateway_mode import snapshot as _gw_snapshot
+        info["gateway"] = _gw_snapshot()
+    except Exception as e:
+        info["gateway"] = {"error": f"snapshot_failed: {type(e).__name__}"}
     degraded = (
         not info["schema"].get("consistent", True)
         or not info["worker"].get("supervisor_alive", True)
@@ -434,11 +537,59 @@ async def list_courses():
     return query("SELECT * FROM courses ORDER BY id")
 
 
+COURSE_DELETE_IMPACT_TABLES = (
+    "chapters", "lessons", "materials", "source_chunks", "notes", "homeworks",
+    "errors", "reviews", "workflow_runs", "graph_nodes", "academic_calendar",
+    "course_schedule_rules",
+)
+
+
+def _course_delete_impact(course_id: int, conn=None) -> dict[str, int]:
+    db = conn
+    counts: dict[str, int] = {}
+    for table in COURSE_DELETE_IMPACT_TABLES:
+        if db is None:
+            row = query_one(f"SELECT COUNT(*) AS n FROM {table} WHERE course_id=?", (course_id,))
+        else:
+            raw = db.execute(f"SELECT COUNT(*) AS n FROM {table} WHERE course_id=?", (course_id,)).fetchone()
+            row = dict(raw) if raw else None
+        counts[table] = int((row or {}).get("n") or 0)
+    return counts
+
+
+@app.get("/api/courses/{course_id}/delete-impact")
+async def course_delete_impact(course_id: int):
+    course = query_one("SELECT id, name, code FROM courses WHERE id=?", (course_id,))
+    if not course:
+        raise HTTPException(404, "课程不存在")
+    return {"course": course, "counts": _course_delete_impact(course_id)}
+
+
+@app.delete("/api/courses/{course_id}")
+async def delete_course(course_id: int, confirm_name: str):
+    """删除课程及级联数据；必须精确输入课程名称，防止误删和绕过前端确认。"""
+    with transaction() as conn:
+        raw = conn.execute("SELECT id, name, code FROM courses WHERE id=?", (course_id,)).fetchone()
+        course = dict(raw) if raw else None
+        if not course:
+            raise HTTPException(404, "课程不存在")
+        if confirm_name != course["name"]:
+            raise HTTPException(409, "课程名称不匹配，已拒绝删除")
+        counts = _course_delete_impact(course_id, conn)
+        conn.execute("DELETE FROM courses WHERE id=?", (course_id,))
+    return {"id": course_id, "name": course["name"], "status": "deleted", "counts": counts}
+
+
 @app.post("/api/chapters")
 async def create_chapter(ch: ChapterCreate):
+    title = ch.title.strip()
+    if not title:
+        raise HTTPException(422, "章节名称不能为空")
+    if not query_one("SELECT id FROM courses WHERE id=?", (ch.course_id,)):
+        raise HTTPException(404, "课程不存在")
     rid = insert(
-        "INSERT INTO chapters (course_id, chapter_no, title, syllabus_ref, status) VALUES (?,?,?,?,'not_started')",
-        (ch.course_id, ch.chapter_no, ch.title, ch.syllabus_ref),
+        "INSERT INTO chapters (course_id, chapter_no, title, syllabus_ref, notes, status) VALUES (?,?,?,?,?,'not_started')",
+        (ch.course_id, ch.chapter_no, title, ch.syllabus_ref, (ch.notes or "").strip() or None),
 
 )
     return {"id": rid, "status": "created"}
@@ -449,6 +600,41 @@ async def list_chapters(course_id: Optional[int] = None):
     if course_id:
         return query("SELECT * FROM chapters WHERE course_id=? ORDER BY chapter_no", (course_id,))
     return query("SELECT * FROM chapters ORDER BY course_id, chapter_no")
+
+
+CHAPTER_STATUSES = {"not_started", "in_progress", "completed", "reviewed"}
+
+
+@app.put("/api/chapters/{chapter_id}")
+async def update_chapter(chapter_id: int, body: ChapterUpdate):
+    current = query_one("SELECT id FROM chapters WHERE id=?", (chapter_id,))
+    if not current:
+        raise HTTPException(404, "章节不存在")
+    title = body.title.strip()
+    if not title:
+        raise HTTPException(422, "章节名称不能为空")
+    if body.status not in CHAPTER_STATUSES:
+        raise HTTPException(422, "章节状态无效")
+    notes = (body.notes or "").strip() or None
+    execute(
+        "UPDATE chapters SET chapter_no=?, title=?, notes=?, status=?, "
+        "completed_at=CASE WHEN ? IN ('completed','reviewed') THEN COALESCE(completed_at,datetime('now','localtime')) ELSE NULL END, "
+        "reviewed_at=CASE WHEN ?='reviewed' THEN COALESCE(reviewed_at,datetime('now','localtime')) ELSE NULL END, "
+        "review_status=CASE WHEN ?='reviewed' THEN 'reviewed' ELSE review_status END WHERE id=?",
+        (body.chapter_no, title, notes, body.status, body.status, body.status, body.status, chapter_id),
+    )
+    return query_one("SELECT * FROM chapters WHERE id=?", (chapter_id,))
+
+
+@app.delete("/api/chapters/{chapter_id}")
+async def delete_chapter(chapter_id: int, confirm_title: str):
+    current = query_one("SELECT id, title FROM chapters WHERE id=?", (chapter_id,))
+    if not current:
+        raise HTTPException(404, "章节不存在")
+    if confirm_title != current["title"]:
+        raise HTTPException(409, "章节名称不匹配，已拒绝删除")
+    execute("DELETE FROM chapters WHERE id=?", (chapter_id,))
+    return {"id": chapter_id, "title": current["title"], "status": "deleted"}
 
 
 @app.post("/api/lessons")
@@ -472,10 +658,96 @@ async def list_lessons(chapter_id: Optional[int] = None, course_id: Optional[int
 
 # ---------- 模型与路由 ----------
 
+class ModelProfileUpsert(BaseModel):
+    id: str
+    gateway_model: str
+    provider: str
+    family: str = "other"
+    capability: str = "text"
+    enabled: bool = True
+    context_window: Optional[int] = None
+    embedding_dimensions: Optional[int] = None
+    input_cost: Optional[float] = None
+    output_cost: Optional[float] = None
+    cost_unit: str = "unknown"
+    notes: str = ""
+
+
+class ModelEnabledUpdate(BaseModel):
+    enabled: bool
+
+
+class ModelRoleRouteUpdate(BaseModel):
+    model_ids: list[str]
+
 @app.get("/api/models")
 async def list_models_api():
     from .models_registry import list_models
     return list_models()
+
+
+@app.get("/api/models/gateway-services")
+async def list_gateway_service_models_api():
+    """Return native embedding/rerank/OCR metadata without exposing secrets."""
+    base_url = config.GATEWAY_BASE_URL.rstrip("/")
+    admin_url = base_url + "/admin/specialists.html"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(base_url + "/api/admin/service-models")
+        if response.status_code != 200:
+            return {
+                "available": False, "models": [],
+                "detail": f"网关返回 HTTP {response.status_code}",
+                "admin_url": admin_url,
+            }
+        payload = response.json()
+        return {
+            "available": True, "models": payload.get("models", []),
+            "detail": "", "admin_url": admin_url,
+        }
+    except (httpx.HTTPError, ValueError) as exc:
+        return {
+            "available": False, "models": [], "detail": str(exc),
+            "admin_url": admin_url,
+        }
+
+
+@app.put("/api/models/{model_id}")
+async def save_model_api(model_id: str, body: ModelProfileUpsert):
+    from .models_registry import save_model
+    if model_id != body.id:
+        raise HTTPException(status_code=400, detail="路径 ID 与表单 ID 不一致")
+    try:
+        return save_model(body.model_dump())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.patch("/api/models/{model_id}/enabled")
+async def set_model_enabled_api(model_id: str, body: ModelEnabledUpdate):
+    from .models_registry import set_model_enabled
+    try:
+        set_model_enabled(model_id, body.enabled)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail="模型不存在") from e
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"id": model_id, "enabled": body.enabled}
+
+
+@app.get("/api/model-routes")
+async def list_model_routes_api():
+    from .models_registry import list_role_routes
+    return list_role_routes()
+
+
+@app.put("/api/model-routes/{role}")
+async def save_model_route_api(role: str, body: ModelRoleRouteUpdate):
+    from .models_registry import set_role_models
+    try:
+        return {"role": role, "model_ids": set_role_models(role, body.model_ids)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @app.get("/api/usage")
@@ -497,16 +769,514 @@ async def get_routes(workflow: str):
 @app.post("/api/workflows/lesson", status_code=202)
 async def run_lesson(req: LessonRunRequest):
     payload = req.model_dump(exclude_none=True)
+    transcript = payload.get("transcript") or ""
+    if len(transcript) > MAX_INLINE_TRANSCRIPT_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=(f"粘贴文本共 {len(transcript):,} 字，超过 {MAX_INLINE_TRANSCRIPT_CHARS:,} 字的单次请求上限。"
+                    "请保存为 UTF-8 TXT/SRT/VTT 后从材料收件箱上传；文件会流式落盘并自动分段，内容不会被截断。"),
+        )
     return await enqueue_workflow("lesson", "attend", payload)
 
 
 @app.get("/api/workflows/lesson/{run_id}")
-async def get_lesson_run(run_id: int):
-    run = query_one("SELECT * FROM workflow_runs WHERE id=? AND workflow='lesson'", (run_id,))
+async def get_lesson_run(run_id: int, include_payloads: bool = False):
+    run = query_one(
+        "SELECT id, workflow, mode, course_id, lesson_id, chapter_id, status, error, "
+        "created_at, updated_at, parent_run_id, output_json "
+        "FROM workflow_runs WHERE id=? AND workflow='lesson'", (run_id,))
     if not run:
         raise HTTPException(404, "run 不存在")
-    nodes = query("SELECT * FROM run_nodes WHERE run_id=? ORDER BY id", (run_id,))
-    return {"run": run, "nodes": nodes}
+    if not include_payloads:
+        run.pop("output_json", None)
+    nodes = query(
+        "SELECT rn.id, rn.run_id, rn.node_name, rn.status, rn.agent_role, rn.model, rn.attempt, "
+        "rn.input_ref, COALESCE(rn.output_ref, substr(rn.output_json,1,4000)) AS output_ref, "
+        "rn.started_at, rn.finished_at, rn.tokens_in, rn.tokens_out, rn.latency_ms, rn.error, "
+        "COALESCE(mp.gateway_model, rn.model) AS model_display "
+        "FROM run_nodes rn LEFT JOIN model_profiles mp ON mp.id=rn.model "
+        "WHERE rn.run_id=? ORDER BY rn.id",
+        (run_id,),
+    )
+    domain = query_one("SELECT id, engine_version FROM material_domains WHERE run_id=?", (run_id,))
+    return {"run": run, "nodes": nodes,
+            "engine": _v6_engine_info(),
+            "engine_version": (domain or {}).get("engine_version") or _v6_engine_info()["engine_version"],
+            "domain_id": (domain or {}).get("id")}
+
+
+# ---------- V6 Learning Engine Phase 1：Material Domain / Coverage / Source Span ----------
+#
+# 安全约束（任务书 §九）:
+#   * 不返回文件系统路径（materials.file_path / 上传目录 / vault 路径）。
+#   * 不返回任何 API Key / Token。
+#   * SourceSpan 原文只允许读取属于该 run/domain 的有效来源；跨 run 越权 → 404。
+
+
+def _public_domain_item(row: dict) -> dict:
+    """domain item 的公开投影：保留判定依据，剔除文件系统路径。"""
+    return {
+        "domain_item_id": row.get("id"),
+        "material_id": row.get("material_id"),
+        "source_kind": row.get("source_kind"),
+        "ordinal": row.get("ordinal"),
+        "required": bool(row.get("required")),
+        "raw_chars": row.get("raw_chars"),
+        "raw_tokens": row.get("raw_tokens"),
+        "content_hash": row.get("content_hash"),
+        "state": row.get("state"),
+        "reason_code": row.get("reason_code"),
+        "reason_detail": row.get("reason_detail"),
+        "duplicate_of_item_id": row.get("duplicate_of_item_id"),
+    }
+
+
+#: 每个 domain item 最多回传的 Source ID 数（避免超大材料把响应撑爆）。
+MAX_SPAN_IDS_PER_ITEM = 20
+
+
+@app.get("/api/runs/{run_id}/material-domain")
+async def get_run_material_domain(run_id: int):
+    """Material Domain 快照（材料总数 / 唯一材料 / 逐项终态与原因）。
+
+    * run 不存在 → 404
+    * flag=off 或该 run 未建立 domain → 404（语义：没有材料域可查）
+    """
+    run = query_one("SELECT id, workflow, status FROM workflow_runs WHERE id=?", (run_id,))
+    if not run:
+        raise HTTPException(404, "run 不存在")
+    domain = query_one("SELECT * FROM material_domains WHERE run_id=?", (run_id,))
+    if not domain:
+        raise HTTPException(404, "该运行未建立 Material Domain（V6_LEARNING_ENGINE=off 或运行早于 V6）")
+    items = query(
+        "SELECT * FROM material_domain_items WHERE domain_id=? ORDER BY ordinal, id",
+        (domain["id"],),
+    )
+    unique_items = [i for i in items if i.get("state") != "duplicate"]
+    exempt = [i for i in items if i.get("state") in ("unsupported", "failed", "excluded_with_reason")]
+    # 每个 item 的真实 Source ID 列表（供前端按 ID 取原文；不猜测、不拼接）
+    span_rows = query(
+        "SELECT domain_item_id, source_id, span_state FROM source_spans WHERE domain_id=? "
+        "ORDER BY ordinal, id",
+        (domain["id"],),
+    )
+    spans_by_item: dict[int, dict] = {}
+    for s in span_rows:
+        item_id = s.get("domain_item_id")
+        if item_id is None:
+            continue
+        bucket = spans_by_item.setdefault(int(item_id), {"span_count": 0, "source_ids": []})
+        bucket["span_count"] += 1
+        if len(bucket["source_ids"]) < MAX_SPAN_IDS_PER_ITEM:
+            bucket["source_ids"].append(s["source_id"])
+    public_items = []
+    for row in items:
+        public = _public_domain_item(row)
+        bucket = spans_by_item.get(int(row["id"]))
+        public["span_count"] = bucket["span_count"] if bucket else 0
+        public["source_ids"] = bucket["source_ids"] if bucket else []
+        public_items.append(public)
+    return {
+        "engine": _v6_engine_info(),
+        "domain": {
+            "domain_id": domain["id"],
+            "run_id": domain["run_id"],
+            "scope": domain.get("scope"),
+            "course_id": domain.get("course_id"),
+            "chapter_id": domain.get("chapter_id"),
+            "lesson_id": domain.get("lesson_id"),
+            "version": domain.get("version"),
+            "schema_version": domain.get("schema_version"),
+            "domain_hash": domain.get("domain_hash"),
+            "state": domain.get("state"),
+            "engine_version": domain.get("engine_version"),
+            "transcript_chars": domain.get("transcript_chars"),
+            "frozen_at": domain.get("frozen_at"),
+            "created_at": domain.get("created_at"),
+        },
+        "counts": {
+            "total_items": len(items),
+            "unique_items": len(unique_items),
+            "duplicate_items": len(items) - len(unique_items),
+            "exempt_items": len(exempt),
+            "included_items": sum(1 for i in items if i.get("state") == "included"),
+        },
+        "items": public_items,
+    }
+
+
+@app.get("/api/runs/{run_id}/coverage")
+async def get_run_coverage(run_id: int):
+    """覆盖报告 + 账本汇总 + 未处理原因。覆盖率由本地确定性程序计算。"""
+    run = query_one("SELECT id, workflow, status FROM workflow_runs WHERE id=?", (run_id,))
+    if not run:
+        raise HTTPException(404, "run 不存在")
+    report = query_one("SELECT * FROM coverage_reports WHERE run_id=?", (run_id,))
+    if not report:
+        raise HTTPException(404, "该运行暂无覆盖报告（V6_LEARNING_ENGINE=off 或覆盖审计未执行）")
+    metrics: dict = {}
+    try:
+        metrics = json.loads(report.get("metrics_json") or "{}")
+    except Exception:
+        metrics = {}
+    plan = query_one("SELECT * FROM coverage_plans WHERE domain_id=?", (report["domain_id"],))
+    ledger_rows = query(
+        "SELECT stage, outcome, reason_code, COUNT(*) AS n FROM coverage_ledger "
+        "WHERE run_id=? GROUP BY stage, outcome, reason_code ORDER BY stage, outcome",
+        (run_id,),
+    )
+    reasons = query(
+        "SELECT reason_code, stage, COUNT(*) AS n FROM coverage_ledger "
+        "WHERE run_id=? AND outcome IN ('not_used','noise','duplicate','unsupported','failed','excluded') "
+        "GROUP BY reason_code, stage ORDER BY n DESC, reason_code",
+        (run_id,),
+    )
+    return {
+        "engine": _v6_engine_info(),
+        "run": {"run_id": run["id"], "workflow": run.get("workflow"), "status": run.get("status"),
+                "degraded": run.get("status") == "degraded"},
+        "report": {
+            "domain_id": report["domain_id"],
+            "engine_version": report.get("engine_version"),
+            "engine_mode": report.get("engine_mode"),
+            "gate": report.get("gate"),
+            "silent_dropped": report.get("silent_dropped"),
+            "degradation_reason": report.get("degradation_reason"),
+            "metrics": metrics,
+            "created_at": report.get("created_at"),
+            "updated_at": report.get("updated_at"),
+        },
+        "plan": None if not plan else {
+            "strategy": plan.get("strategy"),
+            "model_profile_id": plan.get("model_profile_id"),
+            "context_window": plan.get("context_window"),
+            "input_budget_tokens": plan.get("input_budget_tokens"),
+            "output_budget_tokens": plan.get("output_budget_tokens"),
+            "planned_span_count": plan.get("planned_span_count"),
+            "unassigned_count": plan.get("unassigned_count"),
+        },
+        "ledger": ledger_rows,
+        "unprocessed_reasons": reasons,
+    }
+
+
+@app.get("/api/runs/{run_id}/segments")
+async def get_run_segments(run_id: int):
+    """Phase 2：segment 清单（顺序 / 每段 Source ID / 状态 / 模型 / 重试 / 耗时）。"""
+    run = query_one("SELECT id, workflow FROM workflow_runs WHERE id=?", (run_id,))
+    if not run:
+        raise HTTPException(404, "run 不存在")
+    domain = query_one("SELECT id FROM material_domains WHERE run_id=?", (run_id,))
+    if not domain:
+        raise HTTPException(404, "该运行未建立 Material Domain")
+    from .learning_engine.segment import segment_plan_summary
+    summary = segment_plan_summary(int(domain["id"]))
+    return {"engine": _v6_engine_info(), "run_id": run_id,
+            "domain_id": int(domain["id"]), **summary}
+
+
+@app.get("/api/runs/{run_id}/understanding")
+async def get_run_understanding(run_id: int):
+    """Phase 2：全局理解 + 逐段理解。
+
+    只返回**结构化理解结果**；不返回模型思维链、prompt 文本或任何路径。
+    """
+    run = query_one("SELECT id, workflow FROM workflow_runs WHERE id=?", (run_id,))
+    if not run:
+        raise HTTPException(404, "run 不存在")
+    domain = query_one("SELECT id FROM material_domains WHERE run_id=?", (run_id,))
+    if not domain:
+        raise HTTPException(404, "该运行未建立 Material Domain")
+    from .learning_engine.understanding import (
+        get_lesson_understanding, get_segment_understandings,
+    )
+    lesson = get_lesson_understanding(run_id)
+    segments = get_segment_understandings(int(domain["id"]))
+    if lesson is None and not segments:
+        raise HTTPException(404, "该运行尚无 LessonUnderstanding（Phase 2 理解未执行）")
+    public_segments = [{
+        "segment_id": int(s["segment_id"]),
+        "segment_ordinal": int(s.get("ordinal") or 0),
+        "status": s.get("status"),
+        "model_used": s.get("model_used"),
+        "prompt_version": s.get("prompt_version"),
+        "schema_version": s.get("schema_version"),
+        "input_hash": s.get("input_hash"),
+        "content_hash": s.get("content_hash"),
+        "source_ref_count": s.get("source_ref_count"),
+        "attempts": s.get("attempts"),
+        "error": s.get("error"),
+        "understanding": s.get("structured") or {},
+    } for s in segments]
+    lesson_public = None
+    if lesson:
+        structured = lesson.get("structured") or {}
+        lesson_public = {
+            "status": lesson.get("status"),
+            "model_used": lesson.get("model_used"),
+            "prompt_version": lesson.get("prompt_version"),
+            "schema_version": lesson.get("schema_version"),
+            "input_hash": lesson.get("input_hash"),
+            "content_hash": lesson.get("content_hash"),
+            "consumed_segment_count": lesson.get("consumed_segment_count"),
+            "segment_count": lesson.get("segment_count"),
+            "valid_source_count": lesson.get("valid_source_count"),
+            "merge_levels": lesson.get("merge_levels"),
+            "error": lesson.get("error"),
+            "understanding": structured,
+        }
+    return {"engine": _v6_engine_info(), "run_id": run_id,
+            "domain_id": int(domain["id"]),
+            "lesson_understanding": lesson_public,
+            "segment_understandings": public_segments}
+
+
+@app.get("/api/runs/{run_id}/cognitive-map")
+async def get_run_cognitive_map(run_id: int):
+    """Phase 3：认知分析审计（CognitiveMap + 八类认知项 + 输入覆盖率）。
+
+    只返回结构化认知项；不返回模型思维链、prompt 文本或任何路径。
+    """
+    run = query_one("SELECT id, workflow FROM workflow_runs WHERE id=?", (run_id,))
+    if not run:
+        raise HTTPException(404, "run 不存在")
+    domain = query_one("SELECT id FROM material_domains WHERE run_id=?", (run_id,))
+    if not domain:
+        raise HTTPException(404, "该运行未建立 Material Domain")
+    from .learning_engine.cognition import cognitive_input_coverage, get_cognitive_map
+    cmap = get_cognitive_map(run_id)
+    if cmap is None:
+        raise HTTPException(404, "该运行尚无 CognitiveMap（Phase 3 认知分析未执行）")
+    coverage = cognitive_input_coverage(run_id)
+    structured = cmap.get("structured") or {}
+    items = []
+    for row in cmap.get("items") or []:
+        items.append({
+            "item_id": row.get("id"),
+            "stable_key": row.get("stable_key"),
+            "item_type": row.get("item_type"),
+            "title": row.get("title"),
+            "explanation": row.get("explanation"),
+            "severity": row.get("severity"),
+            "confidence": row.get("confidence"),
+            "recommended_treatment": row.get("recommended_treatment"),
+            "origin": row.get("origin"),
+            "status": row.get("status"),
+            "source_refs": [s for s in (row.get("source_ids") or "").split(",") if s],
+            "knowledge_unit_refs": [k for k in (row.get("knowledge_unit_keys") or "").split(",") if k],
+        })
+    by_type: dict[str, int] = {}
+    for item in items:
+        key = str(item["item_type"])
+        by_type[key] = by_type.get(key, 0) + 1
+    return {
+        "engine": _v6_engine_info(),
+        "run_id": run_id,
+        "domain_id": int(domain["id"]),
+        "cognitive_map": {
+            "status": cmap.get("status"),
+            "model_used": cmap.get("model_used"),
+            "prompt_version": cmap.get("prompt_version"),
+            "schema_version": cmap.get("schema_version"),
+            "input_hash": cmap.get("input_hash"),
+            "content_hash": cmap.get("content_hash"),
+            "knowledge_unit_total": cmap.get("knowledge_unit_total"),
+            "knowledge_unit_processed": cmap.get("knowledge_unit_processed"),
+            "cognitive_input_coverage": cmap.get("cognitive_input_coverage"),
+            "batch_count": cmap.get("batch_count"),
+            "error": cmap.get("error"),
+            "availability": structured.get("availability") or {},
+            "note": structured.get("note"),
+        },
+        "input_coverage": coverage,
+        "by_type": by_type,
+        "items": items,
+        "publication": {
+            "included_in_document": False,
+            "reason": "Composer V2（Phase 5）尚未实施：认知分析仅用于审计，不进入 HTML/PDF",
+        },
+    }
+
+
+@app.get("/api/runs/{run_id}/evidence-v2")
+async def get_run_evidence_v2(run_id: int):
+    """Phase 4：Evidence V2 只读审计（claims + 逐来源绑定 + 门禁）。
+
+    安全边界（与 cognitive-map 同口径）:
+    * 只返回结构化 claim / 绑定 / locator，**不返回**模型思维链、完整 system
+      prompt、API key、uploads 绝对路径或任何数据库内部路径；
+    * ``bound_quote`` 是**数据库原文**（不是模型生成的 quote）；
+    * ``ai_explanation`` 明确标注 ``is_ai_explanation``，供前端显示「模型教学补充
+      （非课堂原话）」。
+
+    该端点**不依赖** legacy ``evidence_links``。
+    """
+    run = query_one("SELECT id, workflow FROM workflow_runs WHERE id=?", (run_id,))
+    if not run:
+        raise HTTPException(404, "run 不存在")
+    domain = query_one("SELECT id FROM material_domains WHERE run_id=?", (run_id,))
+    if not domain:
+        raise HTTPException(404, "该运行未建立 Material Domain")
+    from .learning_engine.evidence_v2 import get_claims, get_evidence_report
+
+    report = get_evidence_report(run_id)
+    if report is None:
+        raise HTTPException(404, "该运行尚无 Evidence V2（Phase 4 绑定未执行）")
+    claims = get_claims(run_id)
+
+    light_claims = []
+    for claim in claims:
+        sources = []
+        for src in claim.get("sources") or []:
+            sources.append({
+                "source_id": src.get("source_id"),
+                "source_span_id": src.get("source_span_id"),
+                "relation": src.get("relation"),
+                "binding_status": src.get("binding_status"),
+                "binding_method": src.get("binding_method"),
+                "bound_quote": src.get("bound_quote"),
+                "quote_hash": src.get("quote_hash"),
+                "source_text_hash": src.get("source_text_hash"),
+                "locator": src.get("locator"),
+                "start_ms": src.get("start_ms"),
+                "end_ms": src.get("end_ms"),
+                "page_no": src.get("page_no"),
+                "slide_no": src.get("slide_no"),
+                "source_kind": src.get("source_kind"),
+                "presented_to_producer": bool(src.get("presented_to_producer")),
+                "visibility": src.get("visibility"),
+                "visible_invocations": src.get("visible_invocations") or [],
+                "failure_reason": src.get("failure_reason"),
+            })
+        light_claims.append({
+            "claim_id": claim.get("id"),
+            "claim_key": claim.get("claim_key"),
+            "claim_type": claim.get("claim_type"),
+            "claim_text": claim.get("claim_text"),
+            "importance": claim.get("importance"),
+            "producer_node": claim.get("producer_node"),
+            "evidence_status": claim.get("evidence_status"),
+            "requires_source": bool(claim.get("requires_source")),
+            "is_ai_explanation": bool(claim.get("is_ai_explanation")),
+            "input_hash": claim.get("input_hash"),
+            "content_hash": claim.get("content_hash"),
+            # Phase 4.1：只暴露**安全摘要**（节点/调用引用/可见性/依据），
+            # 不含 prompt、模型上下文、路径或 reasoning。
+            "provenance": claim.get("provenance") or {},
+            "sources": sources,
+        })
+    grouped: dict[str, list[dict]] = {}
+    for claim in light_claims:
+        grouped.setdefault(str(claim["claim_type"]), []).append(claim)
+
+    return {
+        "engine": _v6_engine_info(),
+        "run_id": run_id,
+        "domain_id": int(domain["id"]),
+        "report": report,
+        "by_type": grouped,
+        "claims": light_claims,
+        "ai_explanation_label": "模型教学补充（非课堂原话）",
+        "evidence_semantics": {
+            "verified_by_binder": ["引用存在", "归属正确", "quote 来自数据库",
+                                   "来源进入产出该 claim 的模型调用", "类型与证据要求一致"],
+            "not_verified_by_binder": ["语义等价 / 语义真实性（属 Phase 5 Critic）"],
+            "visibility_scope": "claim_producer_invocations（逐 claim、逐生产者）",
+            "visibility_note": "「数据库里存在」≠「该 claim 的 producer 读过」；"
+                              "其他 batch 读过也不算已读。",
+        },
+        "publication": {
+            "included_in_document": _v6_engine_info().get("mode") == "on",
+            "reason": ("Composer V2 已使用 Evidence V2 组装正式笔记"
+                       if _v6_engine_info().get("mode") == "on"
+                       else "shadow/off 模式仅审计，不覆盖正式笔记"),
+            "real_notes_publish_enabled": _v6_engine_info().get("mode") == "on",
+        },
+    }
+
+
+@app.get("/api/runs/{run_id}/quality")
+async def get_run_quality(run_id: int):
+    """V6 Phase 5 independent quality/publication/sync dimensions."""
+    if not query_one("SELECT id FROM workflow_runs WHERE id=?", (run_id,)):
+        raise HTTPException(404, "运行不存在")
+    from .learning_engine.quality import get_quality_state
+    state = get_quality_state(run_id)
+    if not state:
+        raise HTTPException(404, "该运行尚无 V6 质量状态")
+    revisions = query(
+        "SELECT id,note_id,run_id,revision,schema_version,content_hash,evidence_status,"
+        "coverage_status,review_status,created_at FROM note_revisions WHERE run_id=? ORDER BY revision",
+        (run_id,))
+    state.pop("metrics_json", None)
+    return {"run_id": run_id, "quality": state, "revisions": revisions}
+
+
+@app.get("/api/learning/mastery")
+async def get_learning_mastery(course_id: Optional[int] = None,
+                               chapter_id: Optional[int] = None):
+    from .learning_engine.learning_loop import mastery_snapshot
+    return {"items": mastery_snapshot(course_id=course_id, chapter_id=chapter_id)}
+
+
+@app.get("/api/errors/{error_id}/learning-trace")
+async def get_error_learning_trace(error_id: int):
+    if not query_one("SELECT id FROM errors WHERE id=?", (error_id,)):
+        raise HTTPException(404, "错题不存在")
+    from .learning_engine.learning_loop import source_trace_for_error
+    return source_trace_for_error(error_id)
+
+
+@app.get("/api/source-spans/{source_id}")
+async def get_source_span(source_id: str, run_id: int):
+    """按 Source ID 读取 span 原文与定位。
+
+    ``run_id`` 是**必填查询参数**：Source ID 只在所属 Material Domain 内唯一，
+    缺少 ``run_id`` 会被 FastAPI 直接判为 422，从而不会退化成「跨课程全库
+    Source ID 读取入口」。跨 run / domain → 404。
+    """
+    run = query_one("SELECT id FROM workflow_runs WHERE id=?", (run_id,))
+    if not run:
+        raise HTTPException(404, "run 不存在")
+    domain = query_one("SELECT id FROM material_domains WHERE run_id=?", (run_id,))
+    if not domain:
+        raise HTTPException(404, "该运行未建立 Material Domain")
+    span = query_one(
+        "SELECT * FROM source_spans WHERE domain_id=? AND source_id=?",
+        (domain["id"], source_id),
+    )
+    if not span:
+        raise HTTPException(404, f"Source ID {source_id} 不属于 run {run_id}")
+    canonical = None
+    if span.get("canonical_span_id"):
+        canonical = query_one(
+            "SELECT source_id, locator FROM source_spans WHERE id=? AND domain_id=?",
+            (span["canonical_span_id"], domain["id"]),
+        )
+    return {
+        "engine": _v6_engine_info(),
+        "source_id": span["source_id"],
+        "domain_id": span["domain_id"],
+        "run_id": run_id,
+        "material_id": span.get("material_id"),
+        "domain_item_id": span.get("domain_item_id"),
+        "source_chunk_id": span.get("source_chunk_id"),
+        "source_kind": span.get("source_kind"),
+        "locator": span.get("locator"),
+        "ordinal": span.get("ordinal"),
+        "start_ms": span.get("start_ms"),
+        "end_ms": span.get("end_ms"),
+        "page_no": span.get("page_no"),
+        "slide_no": span.get("slide_no"),
+        "text": span.get("text"),
+        "normalized_text_hash": span.get("normalized_text_hash"),
+        "token_count": span.get("token_count"),
+        "char_count": span.get("char_count"),
+        "span_state": span.get("span_state"),
+        "reason_code": span.get("reason_code"),
+        "reason_detail": span.get("reason_detail"),
+        "canonical_source_id": canonical.get("source_id") if canonical else None,
+    }
 
 
 # ---------- 作业流 ----------
@@ -603,7 +1373,12 @@ async def get_homework_run(run_id: int):
     run = query_one("SELECT * FROM workflow_runs WHERE id=? AND workflow='homework'", (run_id,))
     if not run:
         raise HTTPException(404, "run 不存在")
-    nodes = query("SELECT * FROM run_nodes WHERE run_id=? ORDER BY id", (run_id,))
+    nodes = query(
+        "SELECT rn.*, COALESCE(mp.gateway_model, rn.model) AS model_display "
+        "FROM run_nodes rn LEFT JOIN model_profiles mp ON mp.id=rn.model "
+        "WHERE rn.run_id=? ORDER BY rn.id",
+        (run_id,),
+    )
     return {"run": run, "nodes": nodes}
 
 
@@ -641,7 +1416,7 @@ def _error_event(error_id: int, event_type: str, old: str, new: str, payload: di
 @app.post("/api/errors/{error_id}/confirm")
 async def confirm_error(error_id: int):
     """确认错题（方案 8.3）：rowcount 判定 + 终态 409 + error_events 留痕。"""
-    row = query_one("SELECT status FROM errors WHERE id=?", (error_id,))
+    row = query_one("SELECT * FROM errors WHERE id=?", (error_id,))
     if not row:
         raise HTTPException(404, "错题不存在")
     old = row["status"]
@@ -651,7 +1426,20 @@ async def confirm_error(error_id: int):
     if n == 0:
         raise HTTPException(409, "状态已变化，请刷新后重试")
     _error_event(error_id, "confirmed", old, "confirmed")
-    return {"id": error_id, "status": "confirmed"}
+    from .learning_engine.learning_loop import record_feedback, source_trace_for_error
+    final = {}
+    try:
+        final = json.loads(row.get("final_error_json") or "{}")
+    except Exception:
+        final = {}
+    links = record_feedback(
+        source_type="error", source_id=error_id, relation="mistake_on", weight=-0.20,
+        text=" ".join(str(x or "") for x in
+                      (row.get("question_text"), row.get("user_explanation"), final.get("cause"))),
+        course_id=row.get("course_id"), chapter_id=row.get("chapter_id"),
+        lesson_id=row.get("lesson_id"), explicit_points=final.get("knowledge_points") or [])
+    return {"id": error_id, "status": "confirmed", "mastery_updates": links,
+            "learning_trace": source_trace_for_error(error_id)}
 
 
 @app.post("/api/errors/{error_id}/reject")
@@ -667,7 +1455,9 @@ async def reject_error(error_id: int):
     if n == 0:
         raise HTTPException(409, "状态已变化，请刷新后重试")
     _error_event(error_id, "rejected", old, "rejected")
-    return {"id": error_id, "status": "rejected"}
+    from .learning_engine.learning_loop import deactivate_feedback
+    return {"id": error_id, "status": "rejected",
+            "mastery_updates": deactivate_feedback("error", error_id)}
 
 
 # ---------- 复习流 ----------
@@ -797,10 +1587,21 @@ async def submit_review_attempt(review_id: int, body: ReviewAttemptRequest):
         )
     execute("UPDATE reviews SET status='in_progress' WHERE id=? AND status='generated'", (review_id,))
 
+    from .learning_engine.learning_loop import record_feedback
+    mastery_updates = record_feedback(
+        source_type="review_attempt", source_id=attempt_id, relation="reviewed",
+        weight=0.15 if is_correct else -0.25,
+        text=f"{q.get('q','')} {expected} {body.user_answer}",
+        course_id=review.get("course_id"), chapter_id=review.get("chapter_id"),
+        explicit_points=q.get("knowledge_points") or [],
+        evidence={"review_id": review_id, "question_no": str(body.question_no),
+                  "is_correct": bool(is_correct)})
+
     return {"attempt_id": attempt_id, "question_no": body.question_no,
             "is_correct": is_correct, "expected_answer": expected,
             "mastery_before": mastery_before, "mastery_after": mastery_after,
-            "interval_after_days": interval_after, "next_review_at": next_review_at}
+            "interval_after_days": interval_after, "next_review_at": next_review_at,
+            "knowledge_mastery_updates": mastery_updates}
 
 
 @app.post("/api/reviews/{review_id}/complete")
@@ -1087,16 +1888,54 @@ async def vault_info():
 
 @app.get("/api/runs")
 async def list_runs(limit: int = 50):
-    return query("SELECT * FROM workflow_runs ORDER BY id DESC LIMIT ?", (limit,))
+    """运行列表。附带 V6 引擎版本与覆盖门禁摘要（V5 运行为 NULL）。
+
+    用 LEFT JOIN 而非逐行查询，避免 N+1；不返回任何文件系统路径或 Key。
+    """
+    return query(
+        "SELECT r.id, r.workflow, r.mode, r.course_id, r.lesson_id, r.chapter_id, "
+        "r.status, r.error, r.created_at, r.updated_at, r.parent_run_id, "
+        "d.id AS domain_id, d.engine_version AS engine_version, "
+        " c.gate AS coverage_gate, c.silent_dropped AS silent_dropped "
+        "FROM workflow_runs r "
+        "LEFT JOIN material_domains d ON d.run_id = r.id "
+        "LEFT JOIN coverage_reports c ON c.run_id = r.id "
+        "ORDER BY r.id DESC LIMIT ?",
+        (limit,),
+    )
 
 
 @app.get("/api/runs/{run_id}")
 async def get_run(run_id: int):
-    run = query_one("SELECT * FROM workflow_runs WHERE id=?", (run_id,))
+    run = query_one(
+        "SELECT id, workflow, mode, course_id, lesson_id, chapter_id, status, error, "
+        "created_at, updated_at, parent_run_id FROM workflow_runs WHERE id=?", (run_id,))
     if not run:
         raise HTTPException(404, "run 不存在")
-    nodes = query("SELECT * FROM run_nodes WHERE run_id=? ORDER BY id", (run_id,))
-    return {"run": run, "nodes": nodes}
+    nodes = query(
+        "SELECT rn.id, rn.run_id, rn.node_name, rn.status, rn.agent_role, rn.model, rn.attempt, "
+        "rn.input_ref, COALESCE(rn.output_ref, substr(rn.output_json,1,4000)) AS output_ref, "
+        "rn.started_at, rn.finished_at, rn.tokens_in, rn.tokens_out, rn.latency_ms, rn.error, "
+        "COALESCE(mp.gateway_model, rn.model) AS model_display "
+        "FROM run_nodes rn LEFT JOIN model_profiles mp ON mp.id=rn.model "
+        "WHERE rn.run_id=? ORDER BY rn.id",
+        (run_id,),
+    )
+    # V5/V6 运行必须可区分（设计文档 §14）；degraded 原因来自覆盖门禁。
+    domain = query_one("SELECT id, engine_version, domain_hash FROM material_domains WHERE run_id=?",
+                       (run_id,))
+    report = query_one("SELECT gate, degradation_reason, silent_dropped FROM coverage_reports WHERE run_id=?",
+                       (run_id,))
+    return {"run": run, "nodes": nodes,
+            "engine": _v6_engine_info(),
+            "engine_version": (domain or {}).get("engine_version") or _v6_engine_info()["engine_version"],
+            "domain_id": (domain or {}).get("id"),
+            "domain_hash": (domain or {}).get("domain_hash"),
+            "coverage": None if not report else {
+                "gate": report.get("gate"),
+                "silent_dropped": report.get("silent_dropped"),
+                "degradation_reason": report.get("degradation_reason"),
+            }}
 
 
 @app.get("/api/runs/{run_id}/events")
@@ -1109,18 +1948,25 @@ async def run_events(request: Request, run_id: int):
         try:
             while True:
                 run = query_one("SELECT status, error FROM workflow_runs WHERE id=?", (run_id,))
-                nodes = query("SELECT node_name, status, model FROM run_nodes WHERE run_id=? ORDER BY id", (run_id,))
+                nodes = query(
+                    "SELECT rn.node_name, rn.status, rn.model, "
+                    "COALESCE(mp.gateway_model, rn.model) AS model_display "
+                    "FROM run_nodes rn LEFT JOIN model_profiles mp ON mp.id=rn.model "
+                    "WHERE rn.run_id=? ORDER BY rn.id",
+                    (run_id,),
+                )
                 status = run.get("status") if run else "missing"
                 payload = {
                     "run_id": run_id,
                     "status": status,
                     "error": run.get("error", "") if run else None,
-                    "nodes": [{"node_name": n["node_name"], "status": n["status"], "model": n["model"]} for n in nodes],
+                    "nodes": [{"node_name": n["node_name"], "status": n["status"],
+                               "model": n["model"], "model_display": n["model_display"]} for n in nodes],
                 }
                 if payload != last:
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                     last = payload
-                if status in ("completed", "failed", "cancelled", "missing"):
+                if is_terminal_run_status(status) or status == "missing":
                     yield "event: done\n\n"
                     break
                 await asyncio.sleep(1.0)
@@ -1142,7 +1988,7 @@ async def cancel_run(run_id: int):
     if not run:
         raise HTTPException(404, "run 不存在")
     status = run.get("status")
-    if status in ("completed", "failed", "cancelled"):
+    if is_terminal_run_status(status):
         raise HTTPException(409, f"运行已结束（{status}），不能取消")
     if status == "queued":
         execute(
@@ -1161,7 +2007,23 @@ async def cancel_run(run_id: int):
     # running：请求取消（节点边界 / 模型重试边界 / 硬中断三层保障）
     execute("UPDATE workflow_runs SET cancel_requested=1, updated_at=datetime('now','localtime') WHERE id=?", (run_id,))
     execute("UPDATE run_tasks SET cancel_requested=1, updated_at=datetime('now','localtime') WHERE run_id=?", (run_id,))
-    await worker_manager.cancel(run_id)
+    cancelled_live_task = await worker_manager.cancel(run_id)
+    if not cancelled_live_task:
+        # 重启/崩溃后可能遗留 workflow_runs=running，但新进程没有对应的
+        # asyncio task。仅设置 cancel_requested 会产生永久“幽灵运行”；此时
+        # 当前进程已确认没有可中断任务，可安全直接收敛为 cancelled。
+        execute(
+            "UPDATE workflow_runs SET status='cancelled', updated_at=datetime('now','localtime') "
+            "WHERE id=? AND status='running'",
+            (run_id,),
+        )
+        execute(
+            "UPDATE run_tasks SET status='cancelled', error='cancelled orphaned run', "
+            "finished_at=datetime('now','localtime'), updated_at=datetime('now','localtime') "
+            "WHERE run_id=? AND status IN ('queued','running','interrupted')",
+            (run_id,),
+        )
+        return {"run_id": run_id, "status": "cancelled"}
     return {"run_id": run_id, "status": "cancellation_requested"}
 
 
@@ -1214,16 +2076,6 @@ async def run_result(run_id: int):
     if not run:
         raise HTTPException(404, "run 不存在")
     workflow = run.get("workflow") or ""
-    nodes = query(
-        "SELECT node_name, status, output_json FROM run_nodes WHERE run_id=? ORDER BY id",
-        (run_id,),
-    )
-    outputs = {}
-    for n in nodes:
-        try:
-            outputs[n["node_name"]] = json.loads(n["output_json"]) if n["output_json"] else {}
-        except Exception:
-            outputs[n["node_name"]] = {}
     result: dict = {"workflow": workflow, "status": run.get("status"),
                     "error": run.get("error")}
     if workflow == "lesson":
@@ -1377,6 +2229,67 @@ async def list_notes(lesson_id: Optional[int] = None, chapter_id: Optional[int] 
     return query(sql, tuple(params))
 
 
+# ---------- HTML / PDF 学习产出 ----------
+
+@app.get("/api/artifacts")
+async def list_artifacts(owner_type: Optional[str] = None, owner_id: Optional[int] = None):
+    sql, params = "SELECT * FROM document_artifacts WHERE 1=1", []
+    if owner_type:
+        if owner_type not in ("note", "review") or owner_id is None:
+            raise HTTPException(400, "owner_type 必须是 note/review，并提供 owner_id")
+        sql += f" AND {'note_id' if owner_type == 'note' else 'review_id'}=?"
+        params.append(owner_id)
+    return [artifact_public(r) for r in query(sql + " ORDER BY id DESC", tuple(params))]
+
+
+@app.get("/api/artifacts/{artifact_id}")
+async def get_artifact(artifact_id: int):
+    row = fetch_one("SELECT * FROM document_artifacts WHERE id=?", (artifact_id,))
+    if not row:
+        raise HTTPException(404, "产出不存在")
+    return artifact_public(row)
+
+
+@app.get("/api/artifacts/{artifact_id}/content")
+async def preview_artifact(artifact_id: int):
+    row = fetch_one("SELECT * FROM document_artifacts WHERE id=?", (artifact_id,))
+    if not row:
+        raise HTTPException(404, "产出不存在")
+    try:
+        return FileResponse(safe_artifact_file(row, "html"), media_type="text/html; charset=utf-8")
+    except (FileNotFoundError, ValueError):
+        raise HTTPException(404, "HTML 尚未生成")
+
+
+@app.get("/api/artifacts/{artifact_id}/download")
+async def download_artifact(artifact_id: int, format: str = "pdf"):
+    if format not in ("html", "pdf"):
+        raise HTTPException(400, "format 必须是 html 或 pdf")
+    row = fetch_one("SELECT * FROM document_artifacts WHERE id=?", (artifact_id,))
+    if not row:
+        raise HTTPException(404, "产出不存在")
+    try:
+        path = safe_artifact_file(row, format)
+    except (FileNotFoundError, ValueError):
+        raise HTTPException(404, f"{format.upper()} 尚未生成")
+    return FileResponse(path, media_type="application/pdf" if format == "pdf" else "text/html; charset=utf-8",
+                        filename=f"v5-{row['document_type']}-{artifact_id}.{format}")
+
+
+@app.post("/api/artifacts/{artifact_id}/regenerate")
+async def regenerate_artifact(artifact_id: int):
+    row = fetch_one("SELECT * FROM document_artifacts WHERE id=?", (artifact_id,))
+    if not row:
+        raise HTTPException(404, "产出不存在")
+    owner_type = "note" if row.get("note_id") else "review"
+    try:
+        result = render_artifact(owner_type=owner_type, owner_id=row.get("note_id") or row.get("review_id"),
+                                 document=json.loads(row["structured_json"]))
+    except Exception as exc:
+        raise HTTPException(500, f"重新生成失败: {exc}")
+    return artifact_public(result)
+
+
 # ---------- 章节 ----------
 
 @app.post("/api/chapters/{chapter_id}/status")
@@ -1461,6 +2374,111 @@ async def create_backup_api():
 
 # ---------- 校历 & 课程表 ----------
 
+@app.get("/api/academic-terms")
+async def get_academic_terms():
+    return list_terms()
+
+
+@app.post("/api/academic-terms")
+async def create_academic_term(body: AcademicTermPayload):
+    try:
+        return save_term(body.model_dump())
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.put("/api/academic-terms/{term_id}")
+async def update_academic_term(term_id: int, body: AcademicTermPayload):
+    try:
+        return save_term(body.model_dump(), term_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.delete("/api/academic-terms/{term_id}")
+async def delete_academic_term(term_id: int):
+    if not execute("DELETE FROM academic_terms WHERE id=?", (term_id,)):
+        raise HTTPException(404, "学期不存在")
+    return {"id": term_id, "status": "deleted"}
+
+
+@app.get("/api/schedule-rules")
+async def get_schedule_rules(course_id: Optional[int] = None):
+    return list_rules(course_id)
+
+
+@app.post("/api/schedule-rules")
+async def create_schedule_rule(body: ScheduleRulePayload):
+    try:
+        return save_rule(body.model_dump())
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.put("/api/schedule-rules/{rule_id}")
+async def update_schedule_rule(rule_id: int, body: ScheduleRulePayload):
+    try:
+        return save_rule(body.model_dump(), rule_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.delete("/api/schedule-rules/{rule_id}")
+async def delete_schedule_rule(rule_id: int):
+    if not execute("DELETE FROM course_schedule_rules WHERE id=?", (rule_id,)):
+        raise HTTPException(404, "固定课表规则不存在")
+    return {"id": rule_id, "status": "deleted"}
+
+
+@app.get("/api/calendar-adjustments")
+async def get_calendar_adjustments(start: Optional[str] = None, end: Optional[str] = None):
+    try:
+        return list_adjustments(start, end)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/calendar-adjustments")
+async def create_calendar_adjustment(body: CalendarAdjustmentPayload):
+    try:
+        return save_adjustment(body.model_dump())
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.put("/api/calendar-adjustments/{adjustment_id}")
+async def update_calendar_adjustment(adjustment_id: int, body: CalendarAdjustmentPayload):
+    try:
+        return save_adjustment(body.model_dump(), adjustment_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.delete("/api/calendar-adjustments/{adjustment_id}")
+async def delete_calendar_adjustment(adjustment_id: int):
+    if not execute("DELETE FROM calendar_adjustments WHERE id=?", (adjustment_id,)):
+        raise HTTPException(404, "临时调整不存在")
+    return {"id": adjustment_id, "status": "deleted"}
+
+
+@app.get("/api/schedule/effective")
+async def get_effective_schedule(start: Optional[str] = None, days: int = 7):
+    try:
+        return effective_schedule(start, days)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/schedule/bootstrap")
+async def bootstrap_schedule():
+    return bootstrap_schedule_data()
+
 @app.get("/api/calendar")
 async def list_calendar(course_id: Optional[int] = None, event_type: Optional[str] = None):
     sql = "SELECT * FROM academic_calendar WHERE 1=1"
@@ -1500,12 +2518,6 @@ async def delete_calendar_event(event_id: int):
     return {"id": event_id, "status": "deleted"}
 
 
-@app.post("/api/calendar/seed")
-async def seed_calendar_api(force: bool = False):
-    from .seed_data import seed_calendar
-    return seed_calendar(force=force)
-
-
 @app.get("/api/exams")
 async def list_exams():
     return query(
@@ -1513,94 +2525,6 @@ async def list_exams():
         "FROM academic_calendar e LEFT JOIN courses c ON c.id = e.course_id "
         "WHERE e.event_type='exam' ORDER BY e.date"
     )
-
-
-# ---------- 教学大纲导入（支持手动粘贴/后续从ECNU抓取） ----------
-
-class SyllabusChaptersItem(BaseModel):
-    chapter_no: Optional[int] = None
-    title: Optional[str] = None
-    lessons: Optional[list] = None
-
-
-class SyllabusImportReq(BaseModel):
-    course_code: Optional[str] = None
-    course_name: Optional[str] = None
-    course_id: Optional[int] = None
-    chapters: list[SyllabusChaptersItem] = []
-
-
-@app.post("/api/syllabus/import")
-async def import_syllabus(req: SyllabusImportReq):
-    """导入课程教学大纲 JSON，自动创建 chapter + lesson 节点。
-
-    示例:
-    {
-      "course_code": "PHYS2509",
-      "course_name": "光学",
-      "chapters": [
-        {"chapter_no": 1, "title": "几何光学", "lessons": ["L01 ...", "L02 ..."]}
-      ]
-    }
-    """
-    if not (req.course_code or req.course_name or req.course_id):
-        raise HTTPException(400, "需要 course_code / course_name / course_id 中的至少一个")
-    # locate course
-    course = None
-    if req.course_id:
-        course = query_one("SELECT * FROM courses WHERE id=?", (req.course_id,))
-    if not course and req.course_code:
-        course = query_one("SELECT * FROM courses WHERE code=?", (req.course_code,))
-    if not course and req.course_name:
-        course = query_one("SELECT * FROM courses WHERE name=?", (req.course_name,))
-    if not course:
-        # 自动创建课程
-        course_id = insert(
-            "INSERT INTO courses (name, code, semester) VALUES (?,?,?)",
-            (req.course_name or req.course_code or "未命名课程", req.course_code, None),
-
-)
-        course = {"id": course_id}
-    stats = {"chapters": 0, "lessons": 0}
-    chapters_payload = [
-        item.model_dump() if hasattr(item, "model_dump") else item
-        for item in req.chapters or []
-    ]
-    for ch in chapters_payload:
-        ch_no = ch.get("chapter_no")
-        ch_title = ch.get("title") or f"第{ch_no}章"
-        existing = query_one("SELECT id FROM chapters WHERE course_id=? AND title=?", (course["id"], ch_title))
-        if existing:
-            ch_id = existing["id"]
-        else:
-            placeholder = query_one(
-                "SELECT id FROM chapters WHERE course_id=? AND title LIKE '第1章（未定）' ORDER BY id LIMIT 1",
-                (course["id"],),
-            )
-            if placeholder and ch_no in (1, None):
-                ch_id = placeholder["id"]
-                execute("UPDATE chapters SET chapter_no=?, title=? WHERE id=?", (ch_no, ch_title, ch_id))
-            else:
-                ch_id = insert(
-                    "INSERT INTO chapters (course_id, chapter_no, title, status) VALUES (?,?,?,'not_started')",
-                    (course["id"], ch_no, ch_title),
-
-)
-            stats["chapters"] += 1
-        for ls in ch.get("lessons") or []:
-            if isinstance(ls, str):
-                lesson_title = ls
-                lesson_no = None
-            else:
-                lesson_no = ls.get("lesson_no")
-                lesson_title = ls.get("title") or ls.get("lesson_no") or "未命名课时"
-            date = ls.get("date") if isinstance(ls, dict) else None
-            insert(
-                "INSERT INTO lessons (chapter_id, course_id, lesson_no, title, date, status) VALUES (?,?,?,?,?,'not_started')",
-                (ch_id, course["id"], lesson_no, lesson_title, date),
-            )
-            stats["lessons"] += 1
-    return {"status": "ok", "course_id": course["id"], "stats": stats}
 
 
 # ---------- 移动端 / 局域网发现 ----------
@@ -1854,7 +2778,7 @@ if _FRONTEND_DIST.exists():
     async def serve_spa(full_path: str):
         """兜底路由:返回前端 SPA 的 index.html,交由前端 hash 路由处理。"""
         # API 路径已被上面的 @app.get 捕获;此处只处理静态文件 + SPA 兜底
-        if not full_path or full_path.startswith("api/") or full_path == "api":
+        if full_path.startswith("api/") or full_path == "api":
             raise HTTPException(404, "API 不存在")
         # P0 安全:拒绝路径穿越,并强制将路径锚定到 dist 根目录内
         if ".." in full_path or "\\" in full_path:

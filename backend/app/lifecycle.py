@@ -74,7 +74,7 @@ async def lifespan(app):
                 release_instance_lock()
             except Exception as e:
                 logger.warning(f"释放单实例锁失败: {e}")
-        logger.info("v5.5.1 后端已关闭")
+        logger.info("V6.0.0 后端已关闭")
 
     try:
         # 1) 单实例锁
@@ -123,6 +123,15 @@ async def lifespan(app):
             seed_calendar(force=False)
         except Exception as e:
             logger.warning(f"seed_calendar skipped: {e}")
+        try:
+            from .schedule_calendar import bootstrap_schedule_data
+            schedule_stats = bootstrap_schedule_data()
+            if any(schedule_stats.get(key) for key in (
+                "term_created", "rules_created", "adjustments_created"
+            )):
+                logger.info("课表规范化导入: %s", schedule_stats)
+        except Exception as e:
+            logger.warning(f"schedule bootstrap skipped: {e}")
         if not is_override():
             try:
                 from .backup import backup_database
@@ -147,7 +156,7 @@ async def lifespan(app):
         worker_manager.start()
         worker_started = True
         selfcheck = _health_selfcheck()
-        logger.info("v5.5.1 后端启动完成，自检: %s", selfcheck)
+        logger.info("V6.0.0 后端启动完成，自检: %s", selfcheck)
         app.state.worker_manager = worker_manager
 
         try:
@@ -157,7 +166,7 @@ async def lifespan(app):
             await _shutdown_once()
     except BaseException:
         # 启动失败或 yield 内未捕获异常
-        logger.exception("v5.5.1 后端启动或运行异常")
+        logger.exception("V6.0.0 后端启动或运行异常")
         try:
             await _shutdown_once()
         except Exception as e:

@@ -466,5 +466,24 @@ async def retrieve_chunks(
 
     scored.sort(key=lambda x: x["score"], reverse=True)
     selected = scored[:top_k]
+    # 专用 rerank 端点可用时，对第一阶段候选做语义精排；失败保持原排序。
+    if final_mode == "hybrid" and len(scored) > 1:
+        candidates = scored[:max(top_k * 4, 12)]
+        try:
+            reranked = await gateway.rerank(
+                query_text, [item["text"] for item in candidates], top_k,
+            )
+            ordered = []
+            for rank in reranked:
+                idx = int(rank.get("index", -1))
+                if 0 <= idx < len(candidates):
+                    item = dict(candidates[idx])
+                    item["rerank_score"] = float(rank.get("relevance_score", 0.0))
+                    ordered.append(item)
+            if ordered:
+                selected = ordered[:top_k]
+                final_mode = "hybrid_rerank"
+        except Exception as e:
+            logger.info("rerank 不可用，保留混合检索排序: %s", e)
     _persist(selected, final_mode)
     return selected

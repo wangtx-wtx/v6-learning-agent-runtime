@@ -82,7 +82,7 @@ function toggle(id: number) {
 <template>
   <div class="page-shell">
     <PageHeader
-      emoji="❌"
+      icon="circle-x"
       title="错题确认"
       subtitle="Provisional → Confirmed / Rejected 三态流转；展示 AI 候选错因、相关知识点、用户解释。"
     >
@@ -112,7 +112,7 @@ function toggle(id: number) {
       :loading="loading"
       :error="error"
       :empty="!errors.length"
-      empty-icon="❌"
+      empty-icon="circle-x"
       :empty-title="filter === 'provisional' ? '没有待确认错题' : filter === 'confirmed' ? '没有已确认错题' : '没有已拒绝错题'"
       :empty-hint="filter === 'provisional' ? '运行作业流后会自动写入 provisional 错题。' : '可在左侧切换筛选。'"
     >
@@ -140,13 +140,13 @@ function toggle(id: number) {
         <div class="grid gap-3 md:grid-cols-2">
           <div>
             <p class="text-xs font-medium text-slate-400">学生答案</p>
-            <p class="mt-1 whitespace-pre-line text-sm text-rose-200">
+            <p class="mt-1 whitespace-pre-line text-sm text-[var(--acc-red)]">
               {{ e.student_answer || '（无）' }}
             </p>
           </div>
           <div>
             <p class="text-xs font-medium text-slate-400">正确答案</p>
-            <p class="mt-1 whitespace-pre-line text-sm text-emerald-200">
+            <p class="mt-1 whitespace-pre-line text-sm text-[var(--acc-green)]">
               {{ e.correct_answer || '（未填）' }}
             </p>
           </div>

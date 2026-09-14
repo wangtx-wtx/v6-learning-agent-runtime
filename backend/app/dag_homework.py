@@ -44,8 +44,9 @@ async def resolve_input_node(ctx: DAGContext, model: str) -> dict:
         splitted = _split_questions(homework_text)
     if images:
         from .gateway import gateway
+        ocr_model = ctx.resolve_model("ocr")
         for idx, img in enumerate(images):
-            text = await _ocr_image(gateway, ctx, model, img)
+            text = await _ocr_image(gateway, ctx, ocr_model, img)
             if text:
                 splitted.extend(_split_questions(text))
     dedup = []
@@ -101,13 +102,24 @@ async def _ocr_image(gateway, ctx, model: str, img) -> str:
         return ""
     p = render_prompt("homework/ocr", "v1")
     try:
+        from .models_registry import get_model
+        if get_model(model).capability == "ocr":
+            raw = await gateway.ocr_document(f"data:image/jpeg;base64,{image_b64}")
+            text = raw.get("md_results") or raw.get("text") or raw.get("content") or raw.get("result") or ""
+            if not text:
+                text = (((raw.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+            if isinstance(text, (dict, list)):
+                text = json.dumps(text, ensure_ascii=False)
+            if text:
+                return str(text)
+            raise RetryableModelError("GLM-OCR 返回中没有可识别文本")
         resp = await gateway.chat(model, [
             {"role": "system", "content": p["text"]},
             {"role": "user", "content": [
                 {"type": "text", "text": "识别图中题目文字。"},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
             ]},
-        ], temperature=0.2)
+        ], contract="homework/ocr", temperature=0.2)
         data = parse_model_output(OcrOut, resp.get("content", ""), "ocr")
         return data.get("text", "") or ""
     except Exception as e:
@@ -174,7 +186,7 @@ async def solver_node(ctx: DAGContext, model: str) -> dict:
         resp = await gateway.chat(model, [
             {"role": "system", "content": p["text"]},
             {"role": "user", "content": f"题目：\n{it.get('text','')}"},
-        ], temperature=0.3)
+        ], contract="homework/solver", temperature=0.3)
         total_in += resp.get("tokens_in", 0)
         total_out += resp.get("tokens_out", 0)
         data = parse_model_output(SolverOut, resp.get("content", ""), f"solver(q{it.get('question_no')})")
@@ -201,7 +213,7 @@ async def parallel_solver_node(ctx: DAGContext, model: str) -> dict:
         resp = await gateway.chat(model, [
             {"role": "system", "content": p["text"]},
             {"role": "user", "content": f"题目：\n{it.get('text','')}"},
-        ], temperature=0.7)
+        ], contract="homework/parallel_solver", temperature=0.7)
         total_in += resp.get("tokens_in", 0)
         total_out += resp.get("tokens_out", 0)
         data = parse_model_output(ParallelSolverOut, resp.get("content", ""), f"parallel_solver(q{it.get('question_no')})")
@@ -239,7 +251,7 @@ async def adjudicator_node(ctx: DAGContext, model: str) -> dict:
             resp = await gateway.chat(model, [
                 {"role": "system", "content": pj["text"]},
                 {"role": "user", "content": f"甲:{s.get('final_answer')}\n乙:{p.get('final_answer')}"},
-            ], temperature=0.2)
+            ], contract="homework/adjudicator", temperature=0.2)
             data = parse_model_output(AdjudicatorOut, resp.get("content", ""), "adjudicator")
             if data.get("decision") == "agree":
                 judgement, reason = "agree", data.get("reason", "复核后一致")
@@ -264,7 +276,7 @@ async def teaching_explainer_node(ctx: DAGContext, model: str) -> dict:
             {"role": "system", "content": pt["text"]},
             {"role": "user", "content": json.dumps(
                 {"answer": it.get("final_answer"), "plan": it.get("solution_plan")}, ensure_ascii=False)},
-        ], temperature=0.4)
+        ], contract="homework/teaching", temperature=0.4)
         data = parse_model_output(TeachingOut, resp.get("content", ""), f"teaching(q{it.get('question_no')})")
         out.append({**it, "teaching": data.get("teaching", "")})
     return {"items": out}
@@ -321,6 +333,26 @@ async def persist_answers_node(ctx: DAGContext, model: str) -> dict:
              teach_map.get(a["question_no"], {}).get("teaching", ""),
              "needs_review" if h_review else "ok", "needs_review" if h_review else None),
         )
+        # A solved question is linked to its Knowledge Unit, but does not change
+        # mastery until the student's correctness is known.
+        if qid:
+            try:
+                from .learning_engine.learning_loop import record_feedback
+                hw = fetch_one("SELECT h.course_id,h.chapter_id,h.lesson_id,q.text,q.knowledge_points_json "
+                               "FROM questions q JOIN homeworks h ON h.id=q.homework_id WHERE q.id=?",
+                               (qid,)) or {}
+                try:
+                    points = json.loads(hw.get("knowledge_points_json") or "[]")
+                except Exception:
+                    points = []
+                record_feedback(source_type="homework_question", source_id=qid,
+                                relation="tests", weight=0.0,
+                                text=hw.get("text") or "", course_id=hw.get("course_id"),
+                                chapter_id=hw.get("chapter_id"), lesson_id=hw.get("lesson_id"),
+                                explicit_points=points,
+                                evidence={"homework_id": ctx.input.get("homework_id")})
+            except Exception as exc:
+                logger.warning("homework question learning link failed: %s", exc)
     homework_id = ctx.input.get("homework_id") or ctx.outputs.get("persist_questions", {}).get("homework_id")
     if homework_id:
         execute("UPDATE homeworks SET status=? WHERE id=?",
@@ -337,19 +369,19 @@ def build_homework_dag() -> DAG:
     dag.add(DAGNode("risk_classifier", "risk_classifier", risk_classifier_node,
                     preferred_models=["qwen3_flash"], depends_on=["persist_questions"]))
     dag.add(DAGNode("solver", "solver", solver_node,
-                    preferred_models=["deepseek_v4_free"], fallback_models=["deepseek_v4_official"],
+                    preferred_models=["deepseek_v4_free"], fallback_models=["glm_flash"],
                     depends_on=["risk_classifier"], kind="llm"))
     dag.add(DAGNode("parallel_solver", "parallel_solver", parallel_solver_node,
-                    preferred_models=["minimax_m3"], fallback_models=["qwen3_8_27b"],
+                    preferred_models=["glm_flash"], fallback_models=["qwen3_flash"],
                     depends_on=["risk_classifier"], kind="llm"))
     dag.add(DAGNode("adjudicator", "adjudicator", adjudicator_node,
-                    preferred_models=["qwen3_8_27b"], fallback_models=["minimax_m3"],
+                    preferred_models=["glm_flash"], fallback_models=["qwen3_flash"],
                     depends_on=["solver", "parallel_solver"], kind="llm"))
     dag.add(DAGNode("teaching_explainer", "solution_explainer", teaching_explainer_node,
-                    preferred_models=["qwen3_8_27b"], depends_on=["adjudicator"], kind="llm"))
+                    preferred_models=["glm_flash"], depends_on=["adjudicator"], kind="llm"))
     dag.add(DAGNode("provenance_checker", "local", provenance_checker_node, depends_on=["teaching_explainer"], kind="local"))
     dag.add(DAGNode("scope_checker", "scope_auditor", scope_checker_node,
-                    preferred_models=["qwen3_8_27b"], depends_on=["provenance_checker"], kind="llm"))
+                    preferred_models=["glm_flash", "qwen3_flash"], depends_on=["provenance_checker"], kind="llm"))
     dag.add(DAGNode("persist_answers", "local", persist_answers_node, depends_on=["scope_checker"], kind="local"))
     return dag
 

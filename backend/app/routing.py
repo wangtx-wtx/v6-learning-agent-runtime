@@ -39,9 +39,9 @@ def route_for_role(agent_role: str, usage_5h_pct: float, risk: str = "low") -> s
     """
     # 非 DeepSeek 角色的路由原则
     if agent_role in {"critic", "solution_explainer", "evidence_auditor", "scope_auditor"}:
-        return "qwen3_8_27b"
+        return "glm_flash"
     if agent_role in {"vision_reader"}:
-        return "qwen3_vl"
+        return "qwen3_flash"
     if agent_role in {"transcriber_splitter", "lesson_structurer", "self_test_writer"}:
         return "qwen3_flash"
 
@@ -51,11 +51,11 @@ def route_for_role(agent_role: str, usage_5h_pct: float, risk: str = "low") -> s
     elif usage_5h_pct < CONSERVATIVE_THRESHOLD:
         # 70%-90%：正式写作/解题转官方
         if agent_role in {"student_simulator", "note_writer", "solver", "error_analyst", "review_writer"}:
-            return "deepseek_v4_official"
+            return "deepseek_v4_free"
         return "deepseek_v4_free"
     else:
         # >= 90%：全部 DeepSeek 转官方
-        return "deepseek_v4_official"
+        return "deepseek_v4_free"
 
 
 async def load_usage_from_gateway(gateway_client) -> dict:
@@ -68,39 +68,45 @@ async def load_usage_from_gateway(gateway_client) -> dict:
 
 def make_route_for_workflow(workflow_type: str, quota_pct: float) -> dict:
     """生成某个 workflow 的角色→模型 完整路由表"""
+    from .models_registry import get_role_models
+
+    def selected(role: str) -> str:
+        models = get_role_models(role)
+        return models[0] if models else route_for_role(role, quota_pct)
+
     routes = {}
     # 听课流
     if workflow_type in ("lesson", "attendance", "listen"):
         for role in ["transcriber_splitter", "lesson_structurer", "student_simulator", "note_writer"]:
-            routes[role] = _resolve(role, quota_pct)
-        routes["critic"] = "qwen3_8_27b"
-        routes["evidence_auditor"] = "qwen3_8_27b"
-        routes["scope_auditor"] = "qwen3_8_27b"
-        routes["vision_reader"] = "qwen3_vl"
+            routes[role] = selected(role)
+        routes["critic"] = selected("critic")
+        routes["evidence_auditor"] = selected("evidence_auditor")
+        routes["scope_auditor"] = selected("scope_auditor")
+        routes["vision_reader"] = selected("vision_reader")
 
     # 作业流
     elif workflow_type in ("homework", "solve"):
-        routes["vision_reader"] = "qwen3_vl"
-        routes["transcriber_splitter"] = "qwen3_flash"
-        routes["solver"] = _resolve("solver", quota_pct)
-        routes["parallel_solver"] = "minimax_m3"
-        routes["solution_explainer"] = "qwen3_8_27b"
-        routes["evidence_auditor"] = "qwen3_8_27b"
-        routes["scope_auditor"] = "qwen3_8_27b"
+        routes["vision_reader"] = selected("vision_reader")
+        routes["transcriber_splitter"] = selected("transcriber_splitter")
+        routes["solver"] = selected("solver")
+        routes["parallel_solver"] = selected("parallel_solver")
+        routes["solution_explainer"] = selected("solution_explainer")
+        routes["evidence_auditor"] = selected("evidence_auditor")
+        routes["scope_auditor"] = selected("scope_auditor")
 
     # 错题流
     elif workflow_type in ("error", "wrong", "miss"):
-        routes["vision_reader"] = "qwen3_vl"
-        routes["error_analyst"] = _resolve("error_analyst", quota_pct)
-        routes["critic"] = "qwen3_8_27b"
+        routes["vision_reader"] = selected("vision_reader")
+        routes["error_analyst"] = selected("error_analyst")
+        routes["critic"] = selected("critic")
 
     # 复习流
     elif workflow_type in ("review", "exam", "revision"):
-        routes["review_writer"] = _resolve("review_writer", quota_pct)
-        routes["self_test_writer"] = "qwen3_flash"
-        routes["critic"] = "qwen3_8_27b"
-        routes["evidence_auditor"] = "qwen3_8_27b"
-        routes["scope_auditor"] = "qwen3_8_27b"
+        routes["review_writer"] = selected("review_writer")
+        routes["self_test_writer"] = selected("self_test_writer")
+        routes["critic"] = selected("critic")
+        routes["evidence_auditor"] = selected("evidence_auditor")
+        routes["scope_auditor"] = selected("scope_auditor")
 
     return routes
 
@@ -110,5 +116,5 @@ def _resolve(role: str, quota_pct: float) -> str:
     if quota_pct < NORMAL_THRESHOLD:
         return "deepseek_v4_free"
     elif quota_pct < CONSERVATIVE_THRESHOLD:
-        return "deepseek_v4_official"
-    return "deepseek_v4_official"
+        return "deepseek_v4_free"
+    return "deepseek_v4_free"

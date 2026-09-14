@@ -1,0 +1,7 @@
+{
+  "phenomenon": "错答现象：1+1 写成 11",
+  "direct_cause": "字符串拼接混淆",
+  "root_cause": "未区分数值与字符串语义",
+  "knowledge_gaps": ["整数加法定义"],
+  "possible_causes": ["概念混淆", "粗心"]
+}

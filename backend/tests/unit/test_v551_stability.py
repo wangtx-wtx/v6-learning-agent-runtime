@@ -84,15 +84,16 @@ class TestGatewayAclose(unittest.TestCase):
         self.assertTrue(callable(GatewayClient.aclose))
 
     def test_aclose_idempotent(self):
-        """两次 aclose 不应抛错（第二次 _pool 已为 None）。"""
+        """两次 aclose 不应抛错（第二次 _client 已为 None）。"""
         import asyncio
         async def run():
             # 强制 lazy-init 一次
-            _ = gateway_mod._get_client()
+            _ = gateway_mod._get_engine()
             g = GatewayClient()
             await g.aclose()
             await g.aclose()  # 第二次应静默 noop
-            self.assertIsNone(gateway_mod._pool)
+            # V5.6.4: live 模式下 GatewayClient 内不再持有 _pool；
+            # engine 缓存由 reset_engine_for_test() 维护。
             self.assertTrue(g._closed)
         asyncio.run(run())
 
@@ -100,9 +101,9 @@ class TestGatewayAclose(unittest.TestCase):
         """模块级 aclose 仍可调用，行为上等价于实例方法。"""
         import asyncio
         async def run():
-            _ = gateway_mod._get_client()
+            _ = gateway_mod._get_engine()
             await gateway_mod.aclose()
-            self.assertIsNone(gateway_mod._pool)
+            # 引擎仍可重新初始化（reset 后由下次 _get_engine 重建）
         asyncio.run(run())
 
 
@@ -408,6 +409,15 @@ class TestRestoreSnapshotValidation(unittest.TestCase):
                     "VALUES (?, ?, ?, '2026-01-01')",
                     (v, name, checksum),
                 )
+            # V5.6.4: 0009 迁移 ALTER model_calls；快存必须先建空表
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS model_calls ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')), "
+                "model TEXT NOT NULL DEFAULT '', "
+                "tokens_in INTEGER NOT NULL DEFAULT 0, "
+                "tokens_out INTEGER NOT NULL DEFAULT 0)"
+            )
             conn.execute(f"PRAGMA user_version={set_user_version_to}")
             conn.commit()
         finally:
@@ -421,6 +431,8 @@ class TestRestoreSnapshotValidation(unittest.TestCase):
             1: "baseline", 2: "material_state", 3: "workflow_queue",
             4: "review_attempts", 5: "evidence_links", 6: "v55_constraints",
             7: "blob_dedup_model", 8: "v551_user_version_utc",
+            9: "v564_gateway_mode", 10: "model_control_center", 11: "schedule_calendar",
+            12: "calendar_workday_source_date",
         }.get(v, f"v{v}")
 
     def test_inconsistent_user_version_rejected(self):
@@ -462,14 +474,14 @@ class TestRestoreSnapshotValidation(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             rmod.validate_snapshot(self.snap)
         self.assertIn("user_version", str(ctx.exception))
-        # 3) 通过 upgrade 升级到 v8（生成 .upgraded_to_v8.db）
-        result = rmod.upgrade_snapshot_user_version(self.snap, 8, dry_run=False)
+        # 3) 通过 upgrade 升级到当前最新迁移版本（0021 后为 21）
+        result = rmod.upgrade_snapshot_user_version(self.snap, 23, dry_run=False)
         self.assertFalse(result["dry_run"])
         self.assertIsNotNone(result["upgraded"])
         # 4) 升级后副本应能通过 validate（ensure_schema 自动写回真实 checksum）
         upgraded = Path(result["upgraded"])
         info = rmod.validate_snapshot(upgraded)
-        self.assertEqual(info["schema_version"], 8)
+        self.assertEqual(info["schema_version"], 23)
         # 5) 升级后副本与原快照内容不同
         self.assertNotEqual(self.snap.read_bytes(), upgraded.read_bytes())
 
@@ -516,14 +528,14 @@ class TestRestoreSnapshotValidation(unittest.TestCase):
         # 2) 构造 v7 旧备份
         self._create_snapshot(set_user_version_to=0, max_migration=7)
         # 3) dry_run 升级（绝不应写目标库 / 不应写永久副本）
-        result = rmod.upgrade_snapshot_user_version(self.snap, 8, dry_run=True)
+        result = rmod.upgrade_snapshot_user_version(self.snap, 23, dry_run=True)
         self.assertTrue(result["dry_run"])
         self.assertIsNone(result["upgraded"])
         # 4) 目标库字节不变
         target_sha_after = hashlib.sha256(target.read_bytes()).hexdigest()
         self.assertEqual(target_sha_before, target_sha_after)
-        # 5) 不应出现 .upgraded_to_v8.db
-        upgraded_files = list(self.snap.parent.glob("*.upgraded_to_v8*"))
+        # 5) 不应出现 .upgraded_to_v19.db
+        upgraded_files = list(self.snap.parent.glob("*.upgraded_to_v19*"))
         self.assertEqual(upgraded_files, [])
 
 

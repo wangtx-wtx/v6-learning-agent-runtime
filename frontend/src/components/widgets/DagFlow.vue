@@ -4,6 +4,7 @@
  */
 import { computed } from 'vue'
 import StatusBadge from './StatusBadge.vue'
+import Icon from './Icon.vue'
 import type { DagNode } from './dag-types'
 import { statusLabel } from '../../utils/format'
 
@@ -37,8 +38,10 @@ const totalTokens = computed(() => {
 <template>
   <div>
     <div v-if="loading" class="empty">
-      <span class="empty-icon">⏳</span>
-      <p class="empty-text">工作流执行中...</p>
+      <span class="empty-icon">
+        <Icon name="clock" :size="19" class="animate-pulse" />
+      </span>
+      <p class="empty-text">工作流执行中…</p>
     </div>
     <div v-else>
       <div class="flex flex-wrap items-center gap-2">
@@ -52,14 +55,14 @@ const totalTokens = computed(() => {
               <p class="mt-1 text-[11px] text-slate-400">
                 {{ node.agent_role || '—' }}
               </p>
-              <p class="mt-0.5 truncate font-mono text-[11px] text-slate-500" :title="node.model || ''">
-                {{ node.model || '本地' }}
+              <p class="mt-0.5 truncate font-mono text-[11px] text-slate-500" :title="node.model_display || node.model || ''">
+                {{ node.model_display || node.model || '本地' }}
               </p>
               <div class="mt-2 flex items-center justify-between text-[11px] text-slate-400">
                 <StatusBadge :status="node.status">{{ statusLabel(node.status) }}</StatusBadge>
                 <span>{{ duration(node) }}</span>
               </div>
-              <p v-if="node.error" class="mt-1 truncate text-[11px] text-rose-300" :title="node.error">
+              <p v-if="node.error" class="mt-1 truncate text-[11px] text-[var(--acc-red)]" :title="node.error">
                 {{ node.error }}
               </p>
             </div>

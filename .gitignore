@@ -17,6 +17,16 @@ backend/data/backups/
 backend/data/keys/
 backend/data/uploads/
 backend/data/obsidian_vault/
+backend/data/artifacts/
+backend/data/quarantine/
+backend/data/.instance.lock
+
+# --- Runtime and verification residue ---
+backend/tmp/
+tmp/
+output/
+.playwright-cli/
+test_fixtures/
 
 # --- Node ---
 frontend/node_modules/
@@ -33,3 +43,8 @@ backend/.env
 Thumbs.db
 .vscode/
 .idea/
+
+# --- Generated reports / local handoff exports ---
+FULL_CODE_EXPORT.txt
+ChatGPT对话后续工作汇报_*.md
+backend/tmp_verify_issues.py

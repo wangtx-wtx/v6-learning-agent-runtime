@@ -1,4 +1,12 @@
-# v5 自动化学习系统(当前:MVP 稳定化中)
+# V6.0.0 本地课程学习 Agent（正式版）
+
+当前正式版本：`6.0.0`。V6 保留 V5 的课程、章节、课表、网关、运行审计、
+SQLite、Obsidian 与 HTML/PDF 基础设施，正式启用全量材料学习引擎：
+
+`材料域 → 规范化/去重 → Source Map → 安全分段 → 课堂理解 → 学生认知模拟 → 动态学习内容 → Evidence V2 → Coverage/Quality Gate → HTML/PDF/Obsidian`
+
+正式入口：`http://127.0.0.1:8800/`。双击 `启动 v5.bat` 会先执行前端生产构建，
+构建成功后再启动后端和本地网关；任何构建失败都会阻止带病启动。
 
 ## 1. 四级状态说明
 
@@ -26,7 +34,7 @@
 
 ---
 
-# v5.1 本地学习 Agent Runtime
+# v5.6.4 本地学习 Agent Runtime
 
 以课程章节为核心、以原始材料证据链为约束、以学生听课认知过程为生成逻辑、以错题反馈驱动复习的本地学习 Agent Runtime。
 
@@ -36,7 +44,7 @@
 |---|---|
 | 后端 | Python 3.12 + FastAPI |
 | 数据库 | SQLite (MVP 向量检索用 NumPy 暴力召回) |
-| LLM 入口 | 本地网关 `http://127.0.0.1:8080`（Unified API Gateway，纯转发代理，只读访问） |
+| LLM 入口 | 本地网关 `http://127.0.0.1:8317`（Local LLM Gateway 便携版） |
 | 前端 | Vue 3 + Vite + TypeScript + Pinia + Tailwind |
 | 图表 | ECharts |
 | 工作流 | 固定 DAG(V5.2 已加 fallback_models + 状态机) |
@@ -88,25 +96,49 @@ v5/
 
 ## 快速开始
 
+### 首次安装
+
+```powershell
+cd "C:\Users\28595\Desktop\新建文件夹 (4)\v5"
+python -m pip install -r .\backend\requirements.txt
+cd .\frontend
+npm install
+```
+
+如果当前机器只有 `node.exe`、没有 `npm`，但仓库内已有 `node_modules`，启动脚本会自动使用
+`node node_modules\vite\bin\vite.js`。重新安装依赖时仍建议安装包含 npm 的完整 Node.js 发行版。
+
+### Windows 一键启动（推荐）
+
+真实模型模式：双击 `启动 v5.bat`。脚本会检查端口 8317，并在需要时从 `C:\Users\28595\Desktop\新建文件夹 (5)\local-llm-gateway-v1.0.3-windows-x64-portable` 启动网关。
+网关 Key 会按“进程环境变量 → `backend/.env` → 本地 keys.dat”的顺序读取。
+
+零 Token 演示模式：
+
+```powershell
+cd "C:\Users\28595\Desktop\新建文件夹 (4)\v5"
+& ".\启动 v5.bat" fake
+```
+
+演示模式使用项目根下独立的 `demo_data`，不会写入正式 `backend/data`；模型输出来自内置
+fixture，不应作为真实学习答案。可用 `& ".\启动 v5.bat" check` 仅检查启动依赖。
+
 ### 后端
 
-```bash
+```powershell
 cd backend
-pip install -r requirements.txt
-python run.py          # http://127.0.0.1:8800
+$env:V5_ENV = "development"
+$env:V5_GATEWAY_MODE = "live"   # 或 fake / replay
+python run.py                       # http://127.0.0.1:8800
 ```
 
 ### 前端
 
-```bash
+```powershell
 cd frontend
 npm install
 npm run dev            # http://127.0.0.1:5173 (API 代理到 8800)
 ```
-
-### Windows 一键启动
-
-双击 `启动 v5.bat` 即可同时启动后端和前端。
 
 ## 模型路由
 
@@ -123,9 +155,11 @@ npm run dev            # http://127.0.0.1:5173 (API 代理到 8800)
 
 模型 ID 映射（内部逻辑 ID → 网关模型名）：
 
+模型与任务路由可在前端“模型中心”直接管理。模型中心负责模型名、能力、价格、启停和主备顺序；供应商地址与 API Key 仍在本地网关后台维护。保存后的角色路由会直接用于后续新建的工作流。Embedding 向量维度存在历史索引时禁止直接修改，避免混用不兼容向量。
+
 | 内部 ID | 网关模型名 | 用途 |
 |---|---|---|
-| `deepseek_v4_free` | `Deepseek-v4-flash` | 默认生成/解题，微信免费 |
+| `deepseek_v4_free` | `DeepSeek-flash` | 默认生成/解题，支持文本与图片输入 |
 | `deepseek_v4_official` | `deepseekv4-flash` | 官方兜底 |
 | `qwen3_8_27b` | `ecnu-plus` | 独立审查/教学化改写 |
 | `qwen3_flash` | `qwen3.8-flash` | 轻量结构化任务 |
@@ -191,6 +225,8 @@ aggregator → writer → self_test → auditor
 |---|---|---|
 | GET | `/api/courses` | 课程列表 |
 | POST | `/api/courses` | 创建课程 `{name, code?, semester?, teacher?, schedule?}` |
+| GET | `/api/courses/{course_id}/delete-impact` | 删除前预览关联数据影响 |
+| DELETE | `/api/courses/{course_id}?confirm_name=课程名` | 精确课程名确认后删除课程及级联数据 |
 | GET | `/api/chapters` | 章节列表（可按 course_id 过滤） |
 | POST | `/api/chapters` | 创建章节 `{course_id, chapter_no, title, syllabus_ref}` |
 | GET | `/api/lessons` | 课时列表（可按 chapter_id / course_id 过滤） |
@@ -249,14 +285,7 @@ aggregator → writer → self_test → auditor
 | POST | `/api/calendar` | 新增校历事件 / 手动考试时间 |
 | PUT | `/api/calendar/{event_id}` | 改期 / 修改事件 |
 | DELETE | `/api/calendar/{event_id}` | 删除事件 |
-| POST | `/api/calendar/seed` | 从旧项目校历幂等导入 |
 | GET | `/api/exams` | 考试安排（含课程名/编码联查） |
-
-### 教学大纲导入
-
-| 方法 | Path | 描述 |
-|---|---|---|
-| POST | `/api/syllabus/import` | 导入课程教学大纲 JSON，自动创建 chapter + lesson 节点 |
 
 ### 知识图谱
 
@@ -397,4 +426,4 @@ vault/
 
 ## 权限说明
 
-网关路径 `http://127.0.0.1:8080` 只读访问，绝不修改、不重启。
+网关地址为 `http://127.0.0.1:8317`；V5 只通过 HTTP 接口调用，不直接修改网关数据库或密钥文件。

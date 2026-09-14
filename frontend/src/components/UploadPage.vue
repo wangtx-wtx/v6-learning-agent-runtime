@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { ChaptersApi, CoursesApi, LessonsApi, MaterialsApi } from '../api/endpoints'
+import { CapabilitiesApi, ChaptersApi, CoursesApi, LessonsApi, MaterialsApi } from '../api/endpoints'
 import type { Chapter, Course, Lesson } from '../api/endpoints'
 import PageHeader from './widgets/PageHeader.vue'
 import States from './widgets/States.vue'
 import StatusBadge from './widgets/StatusBadge.vue'
+import Icon from './widgets/Icon.vue'
 import { useDataStore } from '../stores/data'
 import { useToast } from '../composables/useToast'
 
@@ -45,6 +46,13 @@ const lessonId = ref<number | ''>('')
 const uploads = ref<UploadRecord[]>([])
 const dragOver = ref(false)
 const globalError = ref('')
+const maxUploadBytes = ref(50 * 1024 * 1024)
+
+function fmtSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
 
 async function loadMeta() {
   loadingMeta.value = true
@@ -78,11 +86,16 @@ const filteredLessons = computed(() => {
 function addFiles(files: FileList | null) {
   if (!files) return
   for (const f of Array.from(files)) {
+    const tooLarge = f.size > maxUploadBytes.value
     uploads.value.push({
       file: f,
-      state: 'pending',
+      state: tooLarge ? 'failed' : 'pending',
       progress: 0,
+      message: tooLarge
+        ? `文件为 ${fmtSize(f.size)}，超过 ${fmtSize(maxUploadBytes.value)} 上限；请先拆分或压缩。`
+        : undefined,
     })
+    if (tooLarge) toast.error(`${f.name} 超过 ${fmtSize(maxUploadBytes.value)} 上限`)
   }
 }
 
@@ -107,6 +120,7 @@ async function startUpload() {
   if (!uploads.value.length) return
   for (const r of uploads.value) {
     if (r.state === 'success') continue
+    if (r.file.size > maxUploadBytes.value) continue
     r.state = 'uploading'
     r.progress = 10
     const form = new FormData()
@@ -136,19 +150,24 @@ function resetAll() {
   uploads.value = []
 }
 
+/** 返回 icons.ts 中的图标名，由 <Icon> 渲染 */
 function fileIcon(name: string): string {
   const lower = name.toLowerCase()
-  if (lower.endsWith('.pdf')) return '📕'
-  if (lower.endsWith('.pptx') || lower.endsWith('.ppt')) return '📊'
-  if (lower.endsWith('.docx') || lower.endsWith('.doc')) return '📄'
-  if (/\.(png|jpe?g|webp|gif|bmp)$/i.test(lower)) return '🖼️'
-  if (lower.endsWith('.md') || lower.endsWith('.txt')) return '📝'
-  return '📦'
+  if (lower.endsWith('.pdf')) return 'file-text'
+  if (lower.endsWith('.pptx') || lower.endsWith('.ppt')) return 'chart-bar'
+  if (lower.endsWith('.docx') || lower.endsWith('.doc')) return 'file'
+  if (/\.(png|jpe?g|webp|gif|bmp)$/i.test(lower)) return 'file-image'
+  if (lower.endsWith('.md') || lower.endsWith('.txt')) return 'file-text'
+  if (/\.(mp3|wav|m4a|aac|ogg|flac)$/i.test(lower)) return 'music'
+  return 'package'
 }
 
 onMounted(async () => {
-  await loadMeta()
-  loadMaterials()
+  await Promise.all([
+    loadMeta(),
+    CapabilitiesApi.limits().then(v => { maxUploadBytes.value = v.max_upload_bytes }).catch(() => {}),
+  ])
+  await loadMaterials()
 })
 
 const materials = ref<Record<string, any>[]>([])
@@ -198,7 +217,7 @@ async function removeMaterial(id: number) {
 <template>
   <div class="page-shell">
     <PageHeader
-      emoji="📥"
+      icon="inbox"
       title="材料收件箱"
       subtitle="上传材料进入收件箱，自动解析并生成检索块；可绑定课程 / 章节 / 课时。"
     >
@@ -260,16 +279,18 @@ async function removeMaterial(id: number) {
         <div class="flex gap-2">
           <label class="btn btn-primary cursor-pointer">
             选择文件
-            <input type="file" multiple class="hidden" @change="onFiles" />
+            <input type="file" multiple accept=".pdf,.ppt,.pptx,.doc,.docx,.md,.txt,.srt,.vtt,.json,.png,.jpg,.jpeg,.webp,.gif,.mp3,.m4a,.wav" class="hidden" @change="onFiles" />
           </label>
           <button class="btn btn-secondary" :disabled="!uploads.length" @click="startUpload">开始上传</button>
         </div>
       </div>
 
-      <States :empty="!uploads.length" empty-icon="📥" empty-title="还没有待上传文件" empty-hint="点击右上角选择文件或拖入此区域。">
+      <States :empty="!uploads.length" empty-icon="inbox" empty-title="还没有待上传文件" empty-hint="点击右上角选择文件或拖入此区域。">
         <ul class="divide-y divide-slate-800 rounded-xl border border-slate-800 bg-slate-950/40">
           <li v-for="(r, idx) in uploads" :key="idx" class="flex items-center gap-3 px-4 py-3">
-            <span class="text-xl">{{ fileIcon(r.file.name) }}</span>
+            <span class="grid h-9 w-9 shrink-0 place-items-center rounded-[10px] border border-white/10 bg-white/[.04] text-t2">
+              <Icon :name="fileIcon(r.file.name)" :size="17" />
+            </span>
             <div class="min-w-0 flex-1">
               <p class="truncate text-sm font-medium text-slate-100">{{ r.file.name }}</p>
               <p class="text-[11px] text-slate-500">
@@ -284,7 +305,7 @@ async function removeMaterial(id: number) {
                 />
               </div>
               <p v-if="r.message" class="mt-1 text-[11px]"
-                 :class="r.state === 'failed' ? 'text-rose-300' : 'text-emerald-300'">
+                 :class="r.state === 'failed' ? 'text-[var(--acc-red)]' : 'text-[var(--acc-green)]'">
                 {{ r.message }}
               </p>
             </div>
@@ -310,7 +331,7 @@ async function removeMaterial(id: number) {
         </div>
         <button class="btn btn-secondary btn-sm" @click="loadMaterials">刷新</button>
       </div>
-      <States :loading="materialsLoading" :empty="!materials.length" empty-icon="🗂️" empty-title="暂无材料"
+      <States :loading="materialsLoading" :empty="!materials.length" empty-icon="layers" empty-title="暂无材料"
         empty-hint="上传文件后这里会显示解析状态。">
         <div class="overflow-x-auto rounded-xl border border-slate-800">
           <table class="w-full text-left text-sm">
@@ -331,7 +352,7 @@ async function removeMaterial(id: number) {
                   <StatusBadge :status="m.status || m.parser_status || 'pending'" :variant="statusColor(m.status || m.parser_status)">
                     {{ m.status || m.parser_status || 'pending' }}
                   </StatusBadge>
-                  <span v-if="m.parse_error" class="block text-[11px] text-rose-300">{{ m.parse_error }}</span>
+                  <span v-if="m.parse_error" class="block text-[11px] text-[var(--acc-red)]">{{ m.parse_error }}</span>
                 </td>
                 <td class="px-4 py-2 text-slate-400">
                   {{ m.size_bytes ? (m.size_bytes / 1024).toFixed(1) + ' KB' : '—' }}
@@ -340,7 +361,7 @@ async function removeMaterial(id: number) {
                   <div class="inline-flex gap-1">
                     <button class="btn btn-ghost !px-2 !py-1 text-xs" @click="retryMaterial(m.id)"
                       :disabled="m.status === 'parsing' || m.status === 'queued'">重试</button>
-                    <button class="btn btn-ghost !px-2 !py-1 text-xs text-rose-300" @click="removeMaterial(m.id)">删除</button>
+                    <button class="btn btn-ghost !px-2 !py-1 text-xs text-[var(--acc-red)]" @click="removeMaterial(m.id)">删除</button>
                   </div>
                 </td>
               </tr>

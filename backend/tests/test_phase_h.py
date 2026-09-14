@@ -84,7 +84,8 @@ class TestFakeGatewayContract(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
-            async def chat(self, model_id, messages, temperature=0.7, max_tokens=None, response_format=None):
+            async def chat(self, model_id, messages, temperature=0.7, max_tokens=None,
+                           response_format=None, contract=None):
                 self.calls.append({"model": model_id, "messages": messages})
                 node = messages[0]["content"][:20]
                 content = script.get("default", "{}")
@@ -139,7 +140,8 @@ class TestFakeGatewayContract(unittest.TestCase):
         note = {"title": "T", "body": "B", "evidence": []}
 
         class FakeGw:
-            async def chat(self, model_id, messages, temperature=0.7, max_tokens=None, response_format=None):
+            async def chat(self, model_id, messages, temperature=0.7, max_tokens=None,
+                           response_format=None, contract=None):
                 return {"content": _json.dumps(note), "tokens_in": 1, "tokens_out": 1,
                         "model": "fake", "elapsed_ms": 1}
 

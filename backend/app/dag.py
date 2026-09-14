@@ -59,14 +59,23 @@ class RunCancelledError(BaseException):
 
 
 # ---- 运行状态机 ----------------------------------------------------------------------
+# V6 Phase 1: 新增终态 ``degraded``（覆盖门禁未通过但产物仍可用）。
 ALLOWED_RUN_TRANSITIONS: dict[str, set[str]] = {
     "queued":     {"running", "cancelled", "failed"},
-    "running":    {"completed", "failed", "cancelled", "interrupted"},
+    "running":    {"completed", "degraded", "failed", "cancelled", "interrupted"},
     "completed":  set(),
+    "degraded":   set(),
     "failed":     set(),
     "cancelled":  set(),
     "interrupted": {"queued"},   # 重启后由 recover_interrupted_tasks 恢复
 }
+
+#: 运行终态集合（API / SSE / 重试 / 恢复共用一处定义，避免各处漏判 degraded）。
+TERMINAL_RUN_STATUSES = frozenset({"completed", "degraded", "failed", "cancelled"})
+
+
+def is_terminal_run_status(status: Optional[str]) -> bool:
+    return bool(status) and status in TERMINAL_RUN_STATUSES
 
 
 def _can_transition(old: str, new: str) -> bool:
@@ -168,6 +177,15 @@ class DAG:
         """
         if not self._validated:
             self._validate()
+        # V5.6.4: 若 ctx.run_id 未设置则自动建 run，避免 run_nodes.run_id NOT NULL
+        if ctx.run_id is None:
+            ctx.create_run(
+                self.name,
+                ctx.input.get("mode") or "attend",
+                course_id=ctx.input.get("course_id"),
+                lesson_id=ctx.input.get("lesson_id"),
+                chapter_id=ctx.input.get("chapter_id"),
+            )
         outputs: dict[str, dict] = {}
         reuse_map = dict(reuse_outputs or {})
         layers = self.topological_layers()
@@ -213,13 +231,30 @@ class DAG:
         return await self._run_with_models(node, ctx)
 
     async def _run_with_models(self, node: DAGNode, ctx: "DAGContext") -> dict:
-        primary = ctx.resolve_model(node.agent_role)
+        configured = ctx.resolve_models(node.agent_role)
+        primary = configured[0] if configured else ""
         if not primary and node.preferred_models:
             primary = node.preferred_models[0]
         candidates = list(dict.fromkeys(
-            [primary] + list(node.fallback_models) + list(node.preferred_models)
+            [primary] + configured[1:] + list(node.fallback_models) + list(node.preferred_models)
         ))
         candidates = [m for m in candidates if m]
+        # DAG definitions retain conservative source-level fallbacks, but the
+        # model control center is the runtime source of truth.  In particular,
+        # a disabled model must never be resurrected merely because it still
+        # appears in a node's preferred/fallback list.
+        from .models_registry import get_model
+        enabled_candidates: list[str] = []
+        for model_id in candidates:
+            try:
+                get_model(model_id)
+            except KeyError:
+                logger.info("节点 %s 跳过未知或已停用模型 %s", node.name, model_id)
+                continue
+            enabled_candidates.append(model_id)
+        candidates = enabled_candidates
+        if not candidates:
+            raise RuntimeError(f"节点 {node.name} 没有可用模型，请在模型与额度页面配置角色 {node.agent_role}")
         last_err: Optional[BaseException] = None
         for idx, model_id in enumerate(candidates):
             attempt = idx + 1
@@ -292,6 +327,8 @@ class DAGContext:
         self.outputs: dict[str, dict] = {}
         self.run_id: Optional[int] = None
         self.model_routes: dict[str, str] = {}
+        # V6 Phase 1: 当前运行的 Material Domain id（flag=off 时保持 None）
+        self.domain_id: Optional[int] = None
 
     def create_run(self, workflow: str, mode: str, course_id=None, lesson_id=None, chapter_id=None) -> int:
         self.run_id = insert(
@@ -308,7 +345,16 @@ class DAGContext:
     def resolve_model(self, agent_role: str) -> str:
         if self.model_routes.get(agent_role):
             return self.model_routes[agent_role]
-        return DEFAULT_ROUTES.get(agent_role, "")
+        models = self.resolve_models(agent_role)
+        return models[0] if models else DEFAULT_ROUTES.get(agent_role, "")
+
+    def resolve_models(self, agent_role: str) -> list[str]:
+        from .models_registry import get_role_models
+        configured = get_role_models(agent_role)
+        explicit = self.model_routes.get(agent_role)
+        if explicit:
+            return list(dict.fromkeys([explicit] + configured))
+        return configured
 
     def update_model_routes(self, routes: dict[str, str]):
         self.model_routes.update(routes)
@@ -318,6 +364,10 @@ class DAGContext:
 
     def mark_completed(self, output: dict):
         self._write_status("completed", output=output)
+
+    def mark_degraded(self, output: dict, reason: str = ""):
+        """V6 Phase 1: 覆盖门禁未通过 —— 产物仍写出，但运行不得显示 completed。"""
+        self._write_status("degraded", output=output, error=reason)
 
     def mark_failed(self, error: str):
         self._write_status("failed", error=error)
@@ -379,17 +429,19 @@ class DAGContext:
 DEFAULT_ROUTES: dict[str, str] = {
     "student_simulator": "deepseek_v4_free",
     "note_writer": "deepseek_v4_free",
-    "critic": "qwen3_8_27b",
-    "evidence_auditor": "qwen3_8_27b",
-    "scope_auditor": "qwen3_8_27b",
+    "critic": "glm_flash",
+    "evidence_auditor": "glm_flash",
+    "scope_auditor": "glm_flash",
     "solver": "deepseek_v4_free",
-    "parallel_solver": "minimax_m3",
-    "solution_explainer": "qwen3_8_27b",
+    "parallel_solver": "glm_flash",
+    "solution_explainer": "glm_flash",
     "error_analyst": "deepseek_v4_free",
     "review_writer": "deepseek_v4_free",
     "self_test_writer": "qwen3_flash",
-    "vision_reader": "qwen3_vl",
+    "vision_reader": "qwen3_flash",
     "transcriber_splitter": "qwen3_flash",
     "lesson_structurer": "qwen3_flash",
-    "adjudicator": "qwen3_8_27b",
+    # V6 Phase 2：分段理解角色
+    "segment_understanding": "qwen3_flash",
+    "adjudicator": "glm_flash",
 }

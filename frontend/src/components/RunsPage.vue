@@ -27,6 +27,9 @@ const filter = ref<string>('all')
 const cancelState = ref<'idle' | 'pending' | 'done' | 'error'>('idle')
 const cancelMsg = ref('')
 
+// V6 Phase 1: degraded 是终态（覆盖门禁未通过，产物仍可用）
+const TERMINAL_RUN = new Set(['completed', 'degraded', 'failed', 'cancelled'])
+
 async function load() {
   loading.value = true
   error.value = ''
@@ -70,10 +73,10 @@ async function selectRun(r: WorkflowRun) {
   // 运行中 → 订阅实时事件（SSE 优先，断线自动退避/降级轮询）
   if (['queued', 'running'].includes(r.status)) {
     runEvents.subscribe(r.id, (run: WorkflowRun, nodes: RunNode[]) => {
-      selectedRun.value = run
+      selectedRun.value = { ...(selectedRun.value || r), ...run }
       selectedNodes.value = toDagNodes((nodes || []) as any)
       liveMode.value = runEvents.mode.value
-      if (['completed', 'failed', 'cancelled'].includes(run.status)) {
+      if (TERMINAL_RUN.has(run.status)) {
         void load()   // 刷新列表状态
       }
     })
@@ -137,7 +140,7 @@ onMounted(async () => {
 <template>
   <div class="page-shell">
     <PageHeader
-      emoji="📜"
+      icon="scroll"
       title="运行日志"
       subtitle="展示最近 100 次工作流运行；点击卡片查看节点流程、状态、模型与错误。"
     >
@@ -150,7 +153,7 @@ onMounted(async () => {
       </template>
     </PageHeader>
 
-    <States :loading="loading" :error="error" :empty="!runs.length" empty-icon="📜" empty-title="还没有运行记录">
+    <States :loading="loading" :error="error" :empty="!runs.length" empty-icon="scroll" empty-title="还没有运行记录">
       <section class="grid gap-3 lg:grid-cols-[1fr_1.5fr]">
         <!-- 列表 -->
         <div class="space-y-2">
@@ -168,8 +171,16 @@ onMounted(async () => {
               </div>
               <StatusBadge :status="r.status">{{ statusLabel(r.status) }}</StatusBadge>
             </div>
+            <p class="mt-1 flex flex-wrap items-center gap-1.5">
+              <span v-if="r.engine_version" class="chip">{{ r.engine_version }}</span>
+              <span v-if="r.coverage_gate" class="chip"
+                    :class="r.coverage_gate === 'passed' ? 'chip-green' : (r.coverage_gate === 'failed' ? 'chip-red' : 'chip-amber')">
+                门禁 {{ statusLabel(r.coverage_gate) }}
+              </span>
+              <span v-if="r.silent_dropped" class="chip chip-red">silent {{ r.silent_dropped }}</span>
+            </p>
             <p class="mt-1 text-[11px] text-slate-500">{{ fmtRelative(r.created_at) }}</p>
-            <p v-if="r.error" class="mt-1 truncate text-[11px] text-rose-300" :title="r.error">{{ r.error }}</p>
+            <p v-if="r.error" class="mt-1 truncate text-[11px] text-[var(--acc-red)]" :title="r.error">{{ r.error }}</p>
           </div>
         </div>
 
@@ -179,7 +190,7 @@ onMounted(async () => {
             :loading="detailLoading"
             :error="detailError"
             :empty="!selectedRun"
-            empty-icon="📜"
+            empty-icon="scroll"
             empty-title="选择左侧运行记录查看详情"
           >
             <div v-if="selectedRun" class="space-y-4">
@@ -198,12 +209,12 @@ onMounted(async () => {
                     <StatusBadge :status="selectedRun.status">{{ statusLabel(selectedRun.status) }}</StatusBadge>
                     <span
                       v-if="liveMode !== 'off'"
-                      class="inline-flex items-center gap-1 rounded-full border border-blue-500/40 bg-blue-950/40 px-2 py-0.5 text-[10px] text-blue-300"
+                      class="inline-flex items-center gap-1 rounded-full border border-blue-500/40 bg-blue-950/40 px-2 py-0.5 text-[10px] text-[var(--acc-blue)]"
                       :title="liveMode === 'sse' ? 'SSE 实时推送已连接' : 'SSE 不可用，已降级为轮询'"
                     >{{ liveMode === 'sse' ? '实时' : '轮询中' }}</span>
                     <button
                       v-if="canCancel"
-                      class="btn btn-ghost !px-2 !py-1 text-xs text-rose-300 disabled:opacity-50"
+                      class="btn btn-ghost !px-2 !py-1 text-xs text-[var(--acc-red)] disabled:opacity-50"
                       :disabled="cancelState === 'pending'"
                       @click="cancelRun"
                     >
@@ -213,11 +224,11 @@ onMounted(async () => {
                   </div>
                 </div>
                 <p v-if="cancelMsg" class="mb-2 rounded-lg px-3 py-2 text-xs"
-                   :class="cancelState === 'error' ? 'bg-rose-950/40 text-rose-200' : 'bg-emerald-950/40 text-emerald-200'">
+                   :class="cancelState === 'error' ? 'bg-rose-950/40 text-[var(--acc-red)]' : 'bg-emerald-950/40 text-[var(--acc-green)]'">
                   {{ cancelState === 'error' ? '取消失败：' : '' }}{{ cancelMsg }}
                 </p>
                 <DagFlow :nodes="selectedNodes" :loading="selectedRun.status === 'running'" />
-                <p v-if="selectedRun.error" class="mt-3 rounded-lg bg-rose-950/40 px-3 py-2 text-xs text-rose-200">
+                <p v-if="selectedRun.error" class="mt-3 rounded-lg bg-rose-950/40 px-3 py-2 text-xs text-[var(--acc-red)]">
                   {{ selectedRun.error }}
                 </p>
               </div>

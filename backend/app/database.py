@@ -95,12 +95,35 @@ def _split_statements(sql: str) -> list[str]:
     return [s.strip() for s in cleaned.split(";") if s.strip()]
 
 
-def _apply_migration(conn: sqlite3.Connection, mig: dict) -> None:
-    """在单个事务中应用一个迁移并记录版本。失败整体回滚并向上抛出（拒绝启动）。"""
+def _apply_migration(conn: sqlite3.Connection, mig: dict,
+                     ledger_only: bool = False, strict: bool = True) -> None:
+    """在单个事务中应用一个迁移并记录版本。失败整体回滚并向上抛出（拒绝启动）。
+
+    两种「宽松模式」用于**测试/夹具用的极简快照**（只有迁移账本，没有完整业务表）：
+
+    * ``ledger_only=True``：库里除 ``schema_migrations`` 外没有任何表 —— 所有 DDL
+      都无处可施，整体跳过、只推进账本（历史 v7 夹具路径）。
+    * ``strict=False``：``ALTER TABLE <不存在表>`` 这类「目标表缺失」错误按「该
+      语句在极简快照下不适用」处理并跳过；**其它任何错误仍然抛出**。
+
+    **全新库与真实库一律使用 ``strict=True``**：任何 DDL 失败都必须让迁移失败，
+    绝不能静默留下缺表。
+    """
     conn.execute("BEGIN IMMEDIATE")
     try:
         for stmt in _split_statements(mig["sql"]):
-            conn.execute(stmt)
+            if ledger_only:
+                continue
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError as e:
+                message = str(e).lower()
+                if not strict and ("no such table" in message or "no such column" in message):
+                    logger.warning(
+                        "迁移 %s 的语句在极简快照下不适用，已跳过: %s",
+                        mig["version"], str(e)[:160])
+                    continue
+                raise
         conn.execute(
             "INSERT INTO schema_migrations (version, name, checksum, applied_at) "
             "VALUES (?, ?, ?, datetime('now','localtime'))",
@@ -113,6 +136,27 @@ def _apply_migration(conn: sqlite3.Connection, mig: dict) -> None:
         except Exception:
             pass
         raise
+
+
+def is_ledger_only_snapshot(conn: sqlite3.Connection) -> bool:
+    """是否为「仅含迁移账本、无任何业务表」的极简快照。
+
+    仅当 ``schema_migrations`` **已有历史行** 且没有任何业务表时为真。
+    全新空库返回 ``False``（必须真正执行建表 DDL）。
+    """
+    try:
+        has_ledger_rows = conn.execute(
+            "SELECT 1 FROM schema_migrations LIMIT 1"
+        ).fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
+    if not has_ledger_rows:
+        return False
+    other = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%' AND name <> 'schema_migrations' LIMIT 1"
+    ).fetchone()
+    return other is None
 
 
 def ensure_schema(conn: sqlite3.Connection) -> dict:
@@ -145,9 +189,9 @@ def ensure_schema(conn: sqlite3.Connection) -> dict:
 
     user_tables = tables - {"schema_migrations"}
     if not user_tables and not applied:
-        # 全新库
+        # 全新库：严格模式，任何 DDL 失败都必须让迁移失败
         for mig in files:
-            _apply_migration(conn, mig)
+            _apply_migration(conn, mig, ledger_only=False, strict=True)
         conn.commit()
         # V5.5.1 收尾 B.3: 全新库也必须在传入的连接上同步 user_version
         sync_user_version(conn)
@@ -162,8 +206,15 @@ def ensure_schema(conn: sqlite3.Connection) -> dict:
 
     pending = [m for m in files if m["version"] not in applied]
     if pending:
+        ledger_only = is_ledger_only_snapshot(conn)
+        if ledger_only:
+            logger.warning(
+                "检测到仅含迁移账本的极简快照（无业务表）：%s 个迁移只推进版本账本，"
+                "跳过 DDL", len(pending))
         for mig in pending:
-            _apply_migration(conn, mig)
+            # 非严格模式：极简快照缺少 ALTER TABLE 的目标表时跳过该语句。
+            # 真实升级库的所有表都存在，因此该分支不会被触发。
+            _apply_migration(conn, mig, ledger_only=ledger_only, strict=False)
         conn.commit()
         logger.info("前向迁移完成: %s", [m["version"] for m in pending])
     # V5.5.1 收尾 B.3: sync_user_version 必须作用于 ensure_schema 传入的

@@ -11,7 +11,7 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api } from '../api/client'
-import { ChaptersApi, CoursesApi, LessonsApi, MaterialsApi } from '../api/endpoints'
+import { CapabilitiesApi, ChaptersApi, CoursesApi, LessonsApi, MaterialsApi } from '../api/endpoints'
 import type { Chapter, Course, Lesson, WorkflowRun } from '../api/endpoints'
 import { useToast } from '../composables/useToast'
 
@@ -79,6 +79,7 @@ interface MobileFile {
   materialId?: number
 }
 const files = ref<MobileFile[]>([])
+const maxUploadBytes = ref(50 * 1024 * 1024)
 
 // 上传状态
 const uploading = ref(false)
@@ -129,7 +130,11 @@ const serverInfoError = ref(false)
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
 onMounted(async () => {
-  await Promise.all([loadMeta(), loadServerInfo()])
+  await Promise.all([
+    loadMeta(),
+    loadServerInfo(),
+    CapabilitiesApi.limits().then(v => { maxUploadBytes.value = v.max_upload_bytes }).catch(() => {}),
+  ])
 })
 
 onBeforeUnmount(() => {
@@ -190,10 +195,21 @@ function addFiles(list: FileList | File[]) {
   const arr = Array.from(list)
   const existing = new Set(files.value.map(f => `${f.file.name}:${f.file.size}`))
   let skipped = 0
+  let oversized = 0
   for (const f of arr) {
     const key = `${f.name}:${f.size}`
     if (existing.has(key)) {
       skipped++
+      continue
+    }
+    if (f.size > maxUploadBytes.value) {
+      oversized++
+      files.value.push({
+        file: f,
+        state: 'failed',
+        progress: 0,
+        message: `超过 ${fmtSize(maxUploadBytes.value)} 上限，请先拆分或压缩`,
+      })
       continue
     }
     existing.add(key)
@@ -201,6 +217,9 @@ function addFiles(list: FileList | File[]) {
   }
   if (skipped > 0) {
     toast.info(`已跳过 ${skipped} 个重复文件`)
+  }
+  if (oversized > 0) {
+    toast.error(`${oversized} 个文件超过 ${fmtSize(maxUploadBytes.value)} 上限`)
   }
 }
 
@@ -264,6 +283,7 @@ async function startUploadAndRun() {
   const uploadedIds: number[] = []
 
   for (const r of files.value) {
+    if (r.file.size > maxUploadBytes.value) continue
     if (r.state === 'success' && r.materialId) {
       uploadedIds.push(r.materialId)
       continue
@@ -415,18 +435,18 @@ function setManualToken() {
   <div class="mx-auto max-w-screen-sm px-4 py-6 text-slate-100">
     <!-- 页头 -->
     <header class="mb-6">
-      <p class="text-xs font-semibold uppercase tracking-[.18em] text-blue-400">v5.1 Control Panel</p>
-      <h1 class="mt-1 text-2xl font-bold text-white">📤 投喂学习材料</h1>
+      <p class="text-[10.5px] font-semibold uppercase tracking-[.2em] text-[var(--accent)]">v5.1 Control Panel</p>
+      <h1 class="mt-0.5 text-[24px] font-semibold tracking-tight text-t1">投喂学习材料</h1>
       <p class="mt-1 text-sm text-slate-400">选好课程和文件,一键上传并触发工作流。</p>
     </header>
 
     <!-- 元数据加载错误 -->
     <div
       v-if="metaError"
-      class="mb-4 rounded-xl border border-rose-700/50 bg-rose-950/40 px-4 py-3 text-sm text-rose-200"
+      class="mb-4 rounded-xl border border-rose-700/50 bg-rose-950/40 px-4 py-3 text-sm text-[var(--acc-red)]"
     >
       <p class="font-semibold">加载课程数据失败</p>
-      <p class="mt-1 text-xs text-rose-300/80">{{ metaError }}</p>
+      <p class="mt-1 text-xs text-[var(--acc-red)]/80">{{ metaError }}</p>
       <button class="btn btn-secondary mt-2 !py-1.5 text-xs" @click="loadMeta">重试</button>
     </div>
 
@@ -458,7 +478,7 @@ function setManualToken() {
           <option value="" disabled>请选择课程</option>
           <option v-for="c in courses" :key="c.id" :value="c.id">{{ c.name }}</option>
         </select>
-        <p v-if="!courses.length && !loadingMeta" class="mt-1 text-xs text-amber-300">
+        <p v-if="!courses.length && !loadingMeta" class="mt-1 text-xs text-[var(--acc-orange)]">
           暂无课程,请先在电脑端添加课程。
         </p>
       </div>
@@ -522,7 +542,7 @@ function setManualToken() {
           <input
             type="file"
             multiple
-            accept="image/*,audio/*,.pdf,.ppt,.pptx,.doc,.docx,.md,.txt"
+            accept="image/*,audio/*,.pdf,.ppt,.pptx,.doc,.docx,.md,.txt,.srt,.vtt,.json"
             class="hidden"
             @change="onFilesPicked"
           />
@@ -555,14 +575,14 @@ function setManualToken() {
               <p
                 v-if="r.message"
                 class="mt-1 text-xs"
-                :class="r.state === 'failed' ? 'text-rose-400' : 'text-emerald-400'"
+                :class="r.state === 'failed' ? 'text-[var(--acc-red)]' : 'text-[var(--acc-green)]'"
               >
                 {{ r.message }}
               </p>
             </div>
             <button
               v-if="r.state !== 'uploading'"
-              class="shrink-0 rounded p-2 text-rose-400 active:text-rose-300"
+              class="shrink-0 rounded p-2 text-[var(--acc-red)] active:text-[var(--acc-red)]"
               aria-label="移除文件"
               @click="removeFile(idx)"
             >✕</button>
@@ -595,14 +615,14 @@ function setManualToken() {
 
     <!-- 状态反馈 -->
     <section v-if="runStatus !== 'idle' || runId" class="mb-6 space-y-2 rounded-xl border border-slate-800 bg-slate-900/40 p-4 text-sm">
-      <p v-if="runStatus === 'running'" class="flex items-center gap-2 text-blue-300">
+      <p v-if="runStatus === 'running'" class="flex items-center gap-2 text-[var(--acc-blue)]">
         <span class="inline-block h-2 w-2 animate-pulse rounded-full bg-blue-400" />
         工作流运行中…（run #{{ runId }}）
       </p>
-      <p v-else-if="runStatus === 'done'" class="text-emerald-300">
+      <p v-else-if="runStatus === 'done'" class="text-[var(--acc-green)]">
         ✅ 处理完成！请到电脑端「运行日志」查看详情。
       </p>
-      <p v-else-if="runStatus === 'failed'" class="text-rose-300">
+      <p v-else-if="runStatus === 'failed'" class="text-[var(--acc-red)]">
         ❌ 处理失败,请到电脑端查看。
       </p>
     </section>
@@ -615,7 +635,7 @@ function setManualToken() {
       <template v-if="serverInfo?.tailscale?.available">
         <div class="mb-2 flex items-center gap-2">
           <span class="h-2 w-2 animate-pulse rounded-full bg-emerald-500" />
-          <span class="text-sm font-medium text-emerald-300">Tailscale 在线</span>
+          <span class="text-sm font-medium text-[var(--acc-green)]">Tailscale 在线</span>
           <span v-if="serverInfo.tailscale.dns_name" class="text-xs text-slate-500">
             {{ serverInfo.tailscale.dns_name }}
           </span>
@@ -624,7 +644,7 @@ function setManualToken() {
         <div v-if="serverInfo.tailscale.serve_url" class="mb-2">
           <p class="mb-1 text-xs text-slate-500">HTTPS 地址(同 tailnet 内手机):</p>
           <div class="flex items-center gap-2">
-            <code class="flex-1 break-all rounded bg-slate-800 px-2 py-1.5 text-xs text-emerald-300">
+            <code class="flex-1 break-all rounded bg-slate-800 px-2 py-1.5 text-xs text-[var(--acc-green)]">
               {{ serverInfo.tailscale.serve_url }}
             </code>
             <button class="btn btn-ghost !px-2 !py-1 text-xs" @click="copyUrl(serverInfo.tailscale.serve_url!)">
@@ -634,9 +654,9 @@ function setManualToken() {
         </div>
 
         <div v-if="serverInfo.tailscale.funnel_url" class="mb-2">
-          <p class="mb-1 text-xs text-amber-400">公网 Funnel 地址(任意设备可访问):</p>
+          <p class="mb-1 text-xs text-[var(--acc-orange)]">公网 Funnel 地址(任意设备可访问):</p>
           <div class="flex items-center gap-2">
-            <code class="flex-1 break-all rounded bg-slate-800 px-2 py-1.5 text-xs text-amber-300">
+            <code class="flex-1 break-all rounded bg-slate-800 px-2 py-1.5 text-xs text-[var(--acc-orange)]">
               {{ serverInfo.tailscale.funnel_url }}
             </code>
             <button class="btn btn-ghost !px-2 !py-1 text-xs" @click="copyUrl(serverInfo.tailscale.funnel_url!)">
@@ -645,7 +665,7 @@ function setManualToken() {
           </div>
         </div>
 
-        <p v-if="serverInfo.mobile_token_required" class="mt-2 rounded bg-amber-950/30 p-2 text-xs text-amber-300">
+        <p v-if="serverInfo.mobile_token_required" class="mt-2 rounded bg-amber-950/30 p-2 text-xs text-[var(--acc-orange)]">
           ⚠ 当前已启用 Token 鉴权。请在电脑端「远程上传凭证」页生成带 <code>?token=</code> 的专属链接,
           或在本页下方「凭证」区手动输入 token。
         </p>
@@ -653,8 +673,8 @@ function setManualToken() {
           手机需安装 Tailscale App 且登录同一账号;Funnel 模式需在 URL 后加 <code>?token=xxx</code>。
         </p>
 
-        <div v-if="!serverInfo.tailscale.serve_url" class="mt-2 rounded bg-slate-950/50 p-2 text-xs text-amber-300">
-          ⚠ Tailscale 已在线但 <code class="text-amber-200">serve</code> 未配置。请在电脑终端运行:<br />
+        <div v-if="!serverInfo.tailscale.serve_url" class="mt-2 rounded bg-slate-950/50 p-2 text-xs text-[var(--acc-orange)]">
+          ⚠ Tailscale 已在线但 <code class="text-[var(--acc-orange)]">serve</code> 未配置。请在电脑终端运行:<br />
           <code class="mt-1 inline-block rounded bg-slate-800 px-2 py-1 font-mono">tailscale serve --bg 8800</code>
         </div>
       </template>
@@ -663,10 +683,10 @@ function setManualToken() {
       <template v-else-if="serverInfo?.lan_ip">
         <div class="mb-2 flex items-center gap-2">
           <span class="h-2 w-2 rounded-full bg-blue-500" />
-          <span class="text-sm font-medium text-blue-300">仅局域网可用</span>
+          <span class="text-sm font-medium text-[var(--acc-blue)]">仅局域网可用</span>
         </div>
         <div class="flex items-center gap-2">
-          <code class="flex-1 break-all rounded bg-slate-800 px-2 py-1.5 text-xs text-blue-300">
+          <code class="flex-1 break-all rounded bg-slate-800 px-2 py-1.5 text-xs text-[var(--acc-blue)]">
             http://{{ serverInfo.lan_ip }}:{{ serverInfo.frontend_port }}/#/m-upload
           </code>
           <button
@@ -677,26 +697,26 @@ function setManualToken() {
           </button>
         </div>
         <p class="mt-2 text-xs text-slate-500">
-          想跨网访问?在电脑运行 <code class="text-amber-300">tailscale up</code> 启用远程模式。
+          想跨网访问?在电脑运行 <code class="text-[var(--acc-orange)]">tailscale up</code> 启用远程模式。
         </p>
       </template>
 
       <!-- 都不可用 -->
       <template v-else-if="!serverInfoError">
-        <p class="text-sm text-amber-300">⚠ 未检测到任何可用连接地址。</p>
+        <p class="text-sm text-[var(--acc-orange)]">⚠ 未检测到任何可用连接地址。</p>
         <p class="mt-1 text-xs text-slate-500">
           请确认电脑后端已启动、监听 <code>0.0.0.0</code>,且 Tailscale / 局域网至少一个可用。
         </p>
       </template>
 
-      <p v-else class="text-sm text-amber-300">
+      <p v-else class="text-sm text-[var(--acc-orange)]">
         ⚠ 无法获取连接信息(后端可能未启动或未暴露 <code>/api/mobile/server-info</code>)。
       </p>
 
       <!-- 鉴权 token 入口 -->
       <div v-if="serverInfo?.mobile_token_required || mobileToken" class="mt-4 border-t border-slate-800 pt-3">
         <p class="mb-1 text-xs text-slate-400">
-          凭证(token):<span v-if="mobileToken" class="ml-1 text-emerald-300">已设置</span><span v-else class="ml-1 text-amber-300">未设置</span>
+          凭证(token):<span v-if="mobileToken" class="ml-1 text-[var(--acc-green)]">已设置</span><span v-else class="ml-1 text-[var(--acc-orange)]">未设置</span>
         </p>
         <div class="flex gap-2">
           <button class="btn btn-secondary !px-2 !py-1 text-xs" @click="setManualToken">

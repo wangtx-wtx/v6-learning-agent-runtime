@@ -57,7 +57,7 @@ async def error_vision_reader(ctx: DAGContext, model: str) -> dict:
                     {"type": "text", "text": "识别这张错题图片。"},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
                 ]},
-            ], temperature=0.2)
+            ], contract="error/vision", temperature=0.2)
             data = parse_model_output(VisionOut, resp.get("content", ""), "error_vision_reader")
             results.append({"image": img, "question_text": data.get("question_text", ""),
                             "student_answer": data.get("student_answer", ""), "confidence": 0.9})
@@ -87,7 +87,7 @@ async def error_analyst(ctx: DAGContext, model: str) -> dict:
             {"role": "user", "content": (f"题目：{item.get('question_text','')}\n"
                                          f"学生作答：{item.get('student_answer','')}\n"
                                          f"正确答案：{ctx.input.get('correct_answer','')}")},
-        ], temperature=0.4)
+        ], contract="error/analyst", temperature=0.4)
         total_in += resp.get("tokens_in", 0)
         total_out += resp.get("tokens_out", 0)
         data = parse_model_output(AnalystOut, resp.get("content", ""), "error_analyst")
@@ -114,7 +114,7 @@ async def error_cross_check(ctx: DAGContext, model: str) -> dict:
                 {"role": "system", "content": pc["text"]},
                 {"role": "user", "content": (f"题目：{ana.get('question_text','')}\n"
                                              f"候选：{json.dumps(po.get('possible_causes', []), ensure_ascii=False)}")},
-            ], temperature=0.2)
+            ], contract="error/cross_check", temperature=0.2)
             data = parse_model_output(CrossCheckOut, resp.get("content", ""), "error_cross_check")
         except Exception as e:
             data = {"confirmed_causes": po.get("possible_causes", []), "uncertain": f"审查失败: {e}"}
@@ -190,12 +190,12 @@ async def _review_scheduler_node(ctx: DAGContext, model: str) -> dict:
 def build_error_dag() -> DAG:
     dag = DAG("error", "collect")
     dag.add(DAGNode("vision_reader", "vision_reader", error_vision_reader,
-                    preferred_models=["qwen3_vl"], fallback_models=["minimax_m3"], kind="llm"))
+                    preferred_models=["deepseek_v4_free", "qwen3_flash"], fallback_models=["glm_flash"], kind="llm"))
     dag.add(DAGNode("analyst", "error_analyst", error_analyst,
-                    preferred_models=["deepseek_v4_free", "deepseek_v4_official"],
-                    fallback_models=["qwen3_8_27b"], depends_on=["vision_reader"], kind="llm"))
+                    preferred_models=["deepseek_v4_free", "glm_flash"],
+                    fallback_models=["qwen3_flash"], depends_on=["vision_reader"], kind="llm"))
     dag.add(DAGNode("cross_check", "critic", error_cross_check,
-                    preferred_models=["qwen3_8_27b"], fallback_models=["minimax_m3"], depends_on=["analyst"], kind="llm"))
+                    preferred_models=["glm_flash"], fallback_models=["qwen3_flash"], depends_on=["analyst"], kind="llm"))
     dag.add(DAGNode("ingest", "local", error_ingest, depends_on=["cross_check"], kind="local"))
     dag.add(DAGNode("schedule_review", "local", _review_scheduler_node, depends_on=["ingest"], kind="local"))
     return dag

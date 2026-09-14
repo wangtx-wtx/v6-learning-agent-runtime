@@ -50,6 +50,7 @@ export function chapterStatusLabel(s?: string | null): string {
   const map: Record<string, string> = {
     not_started: '未开始',
     in_progress: '进行中',
+    completed: '已完成',
     material_ready: '材料已就绪',
     homework_ready: '作业已就绪',
     review_pending: '复习待生成',
@@ -163,6 +164,15 @@ export function statusLabel(s?: string | null): string {
     success: '成功',
     completed: '完成',
     done: '完成',
+    // V6 Phase 1: 覆盖门禁未通过 —— 明确区别于「完成」
+    degraded: '降级',
+    passed: '通过',
+    not_used: '未使用',
+    included: '已纳入',
+    duplicate: '重复',
+    noise: '噪声',
+    unsupported: '不支持',
+    excluded_with_reason: '已排除（有原因）',
     running: '进行中',
     pending: '等待',
     failed: '失败',

@@ -80,11 +80,13 @@ class WorkerManager:
         """有新任务入队时唤醒 supervisor（立即领取而非等轮询）。"""
         self._wake.set()
 
-    async def cancel(self, run_id: int) -> None:
-        """用户取消：DB 打标 + 直接 cancel asyncio 任务（中断进行中的 LLM 调用）。"""
+    async def cancel(self, run_id: int) -> bool:
+        """取消进程内任务；返回是否确实找到了仍在执行的 asyncio task。"""
         t = self.running_tasks.pop(run_id, None)
         if t and not t.done():
             t.cancel()
+            return True
+        return False
 
     # ---------------------------------------------------------------- supervisor
     async def _supervisor_loop(self):

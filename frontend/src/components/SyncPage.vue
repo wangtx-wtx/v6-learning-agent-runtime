@@ -5,6 +5,7 @@ import type { SyncJob } from '../api/endpoints'
 import PageHeader from './widgets/PageHeader.vue'
 import States from './widgets/States.vue'
 import StatusBadge from './widgets/StatusBadge.vue'
+import Icon from './widgets/Icon.vue'
 import { fmtRelative, statusLabel } from '../utils/format'
 import { useToast } from '../composables/useToast'
 
@@ -44,12 +45,15 @@ const stats = computed(() => {
 <template>
   <div class="page-shell">
     <PageHeader
-      emoji="🔄"
+      icon="refresh"
       title="Obsidian 同步"
       subtitle="监听听课 / 复习 / 错题等 DAG 输出写入到本地 Obsidian Vault 的同步状态。"
     >
       <template #actions>
-        <button class="btn btn-secondary" @click="load">刷新</button>
+        <button class="btn btn-secondary" @click="load">
+          <Icon name="refresh" :size="15" />
+          刷新
+        </button>
       </template>
     </PageHeader>
 
@@ -62,12 +66,14 @@ const stats = computed(() => {
           </div>
         </div>
         <div class="card-soft flex items-center gap-3">
-          <span class="text-xl">🗄️</span>
+          <span class="grid h-9 w-9 shrink-0 place-items-center rounded-[10px] border border-[var(--accent-line)] bg-[var(--accent-soft)] text-[var(--accent-hi)]">
+            <Icon name="server" :size="17" />
+          </span>
           <div class="min-w-0">
-            <p class="truncate font-mono text-sm text-slate-100">
+            <p class="truncate font-mono text-[13px] text-slate-100">
               {{ vault?.vault_root || '未配置 Vault 路径' }}
             </p>
-            <p class="mt-0.5 text-[11px] text-slate-500">用于听课笔记 / 复习笔记 / 错题本自动落盘</p>
+            <p class="mt-0.5 text-[11.5px] text-t3">用于听课笔记 / 复习笔记 / 错题本自动落盘</p>
           </div>
         </div>
       </section>
@@ -88,7 +94,7 @@ const stats = computed(() => {
           </div>
         </div>
 
-        <States :empty="!jobs.length" empty-icon="🔄" empty-title="暂无同步任务"
+        <States :empty="!jobs.length" empty-icon="refresh" empty-title="暂无同步任务"
                 empty-hint="运行听课 / 复习 / 错题 DAG 后会自动写入 Vault。">
           <div class="overflow-x-auto rounded-xl border border-slate-800">
             <table class="data-table bg-slate-950/40">
@@ -110,7 +116,7 @@ const stats = computed(() => {
                   <td class="font-mono text-xs text-slate-300">{{ j.target || '—' }}</td>
                   <td>
                     <StatusBadge :status="j.status">{{ statusLabel(j.status) }}</StatusBadge>
-                    <p v-if="j.last_error" class="mt-1 text-[11px] text-rose-300">{{ j.last_error }}</p>
+                    <p v-if="j.last_error" class="mt-1 text-[11px] text-[var(--acc-red)]">{{ j.last_error }}</p>
                   </td>
                   <td class="text-xs text-slate-400">{{ j.retries ?? 0 }}</td>
                   <td class="text-xs text-slate-400">{{ fmtRelative(j.synced_at) }}</td>

@@ -48,7 +48,9 @@ const ordered = computed(() => props.nodes || [])
         <div class="grid gap-2 sm:grid-cols-3">
           <div>
             <span class="text-slate-500">模型：</span>
-            <span class="font-mono text-slate-300">{{ node.model || '本地' }}</span>
+            <span class="font-mono text-slate-300">{{ node.model_display || node.model || '本地' }}</span>
+            <span v-if="node.model_display && node.model && node.model_display !== node.model"
+                  class="ml-1 text-[10px] text-slate-500">({{ node.model }})</span>
           </div>
           <div>
             <span class="text-slate-500">Token：</span>
@@ -66,7 +68,7 @@ const ordered = computed(() => props.nodes || [])
           <span v-if="node.finished_at"> · 结束 {{ fmtTime(node.finished_at) }}</span>
         </div>
         <div v-if="node.error">
-          <p class="mb-1 text-rose-300">错误：</p>
+          <p class="mb-1 text-[var(--acc-red)]">错误：</p>
           <pre class="code-panel max-h-40 whitespace-pre-wrap">{{ outputPreview(node.error) }}</pre>
         </div>
         <div v-else-if="node.output_ref">

@@ -5,6 +5,38 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>v5 学习控制面板</title>
+    <script>
+      /* 首屏防闪：在样式生效前先把主题与玻璃参数落到 <html>。
+         键名必须与 src/composables/useTheme.ts (v5-theme)、useGlass.ts (v5-glass) 保持一致。 */
+      (function () {
+        var el = document.documentElement
+        try {
+          var m = localStorage.getItem('v5-theme') || 'system'
+          var dark = m === 'dark' || (m === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
+          el.setAttribute('data-theme', dark ? 'dark' : 'light')
+        } catch (e) {
+          el.setAttribute('data-theme', 'dark')
+        }
+        try {
+          var st = localStorage.getItem('v5-theme-style')
+          el.setAttribute('data-style', st === 'swiss' || st === 'broadsheet' ? st : 'apple')
+        } catch (e) {
+          el.setAttribute('data-style', 'apple')
+        }
+        try {
+          var g = JSON.parse(localStorage.getItem('v5-glass') || 'null')
+          var on = !g || g.enabled !== false
+          var blur = on ? Math.min(40, Math.max(0, Math.round(g && g.blur != null ? g.blur : 22))) : 0
+          el.setAttribute('data-glass', on ? 'on' : 'off')
+          el.style.setProperty('--glass-blur', blur + 'px')
+          el.style.setProperty('--glass-boost', String(Math.max(0, 1 - blur / 40)))
+        } catch (e) {
+          el.setAttribute('data-glass', 'on')
+          el.style.setProperty('--glass-blur', '22px')
+          el.style.setProperty('--glass-boost', '0')
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="app"></div>

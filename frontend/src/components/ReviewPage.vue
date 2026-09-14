@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { ChaptersApi, CoursesApi, ExamsApi, ReviewWorkflowApi, RunsApi } from '../api/endpoints'
+import { ArtifactsApi, ChaptersApi, CoursesApi, ExamsApi, ReviewWorkflowApi, RunsApi } from '../api/endpoints'
 import type { Chapter, Course, ExamEvent, WorkflowRun } from '../api/endpoints'
 import PageHeader from './widgets/PageHeader.vue'
 import States from './widgets/States.vue'
@@ -52,6 +52,7 @@ const upcomingExams = computed(() => {
 })
 
 const reviewPackage = computed(() => outputs.value?.writer?.review_package || outputs.value?.writer || null)
+const artifact = computed(() => outputs.value?.render_document?.artifact || null)
 const selfTest = computed(() => outputs.value?.self_test || null)
 
 const resources = computed(() => {
@@ -164,7 +165,7 @@ onMounted(loadMeta)
 <template>
   <div class="page-shell">
     <PageHeader
-      emoji="🔁"
+      icon="repeat"
       title="复习中心"
       subtitle="章末复习 / 考前复习：聚合笔记、错题与材料，生成复习大纲、自测题与复习计划。"
     >
@@ -211,10 +212,10 @@ onMounted(loadMeta)
           </select>
         </div>
       </div>
-      <p v-if="error" class="mt-2 text-xs text-rose-300">{{ error }}</p>
+      <p v-if="error" class="mt-2 text-xs text-[var(--acc-red)]">{{ error }}</p>
     </section>
 
-    <States :loading="running" :error="error" :empty="!runDetail && !nodes.length" empty-icon="🔁" empty-title="还没有复习流结果">
+    <States :loading="running" :error="error" :empty="!runDetail && !nodes.length" empty-icon="repeat" empty-title="还没有复习流结果">
       <section v-if="runDetail" class="section">
         <div class="section-head">
           <div>
@@ -258,6 +259,11 @@ onMounted(loadMeta)
             <pre v-else-if="reviewMaterials.kind === 'text'" class="code-panel whitespace-pre-wrap">{{ reviewMaterials.text }}</pre>
             <pre v-else class="code-panel whitespace-pre-wrap">{{ prettyJson(reviewPackage.review_materials || reviewPackage) }}</pre>
           </div>
+        </div>
+        <div v-if="artifact" class="mt-4 flex flex-wrap gap-2 border-t border-slate-700 pt-4">
+          <a class="btn btn-primary" :href="ArtifactsApi.previewUrl(artifact.id)" target="_blank" rel="noopener">预览排版</a>
+          <a class="btn btn-secondary" :href="ArtifactsApi.downloadUrl(artifact.id, 'html')">下载 HTML</a>
+          <a v-if="artifact.has_pdf" class="btn btn-secondary" :href="ArtifactsApi.downloadUrl(artifact.id, 'pdf')">下载 PDF</a>
         </div>
       </section>
 
@@ -310,7 +316,7 @@ onMounted(loadMeta)
         <ol v-if="selfTestQuestions.length" class="space-y-3 list-decimal pl-5">
           <li v-for="(q, i) in selfTestQuestions" :key="i">
             <p class="text-slate-100">{{ q.q || '（题目缺失）' }}</p>
-            <p class="mt-1 text-emerald-200">答案:{{ q.a || '—' }}</p>
+            <p class="mt-1 text-[var(--acc-green)]">答案:{{ q.a || '—' }}</p>
             <p v-if="q.e" class="mt-1 text-slate-400 text-xs">解析:{{ q.e }}</p>
           </li>
         </ol>

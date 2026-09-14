@@ -151,7 +151,7 @@ onMounted(loadMeta)
 <template>
   <div class="page-shell">
     <PageHeader
-      emoji="✏️"
+      icon="file-pen"
       title="作业流"
       subtitle="粘贴或输入作业内容，运行风险分级 → 解题 → 高风险题并行求解（MiniMax）→ 解题解释 → 证据 / 范围审查。"
     >
@@ -197,10 +197,10 @@ onMounted(loadMeta)
           </div>
         </div>
       </div>
-      <p v-if="error" class="mt-2 text-xs text-rose-300">{{ error }}</p>
+      <p v-if="error" class="mt-2 text-xs text-[var(--acc-red)]">{{ error }}</p>
     </section>
 
-    <States :loading="running" :error="error" :empty="!runDetail && !nodes.length" empty-icon="✏️" empty-title="还没有作业流结果">
+    <States :loading="running" :error="error" :empty="!runDetail && !nodes.length" empty-icon="file-pen" empty-title="还没有作业流结果">
       <section v-if="runDetail" class="section">
         <div class="section-head">
           <div>
@@ -269,7 +269,7 @@ onMounted(loadMeta)
             <div class="mt-3 space-y-2 text-xs text-slate-300">
               <div>
                 <p class="text-slate-500">最终答案：</p>
-                <p class="font-mono text-emerald-300">{{ s.final_answer || '（无）' }}</p>
+                <p class="font-mono text-[var(--acc-green)]">{{ s.final_answer || '（无）' }}</p>
               </div>
               <div v-if="s.solution_plan">
                 <p class="text-slate-500">解题计划：</p>
@@ -305,15 +305,15 @@ onMounted(loadMeta)
       <section v-if="provisionalErrors.length" class="section border-rose-800/40 bg-rose-950/30">
         <div class="section-head">
           <div>
-            <h3 class="card-title text-rose-200">Provisional 错题</h3>
-            <p class="card-muted text-rose-300/80">证据 / 范围审查节点判定存在错题风险，可前往「错题确认」做最终确认。</p>
+            <h3 class="card-title text-[var(--acc-red)]">Provisional 错题</h3>
+            <p class="card-muted text-[var(--acc-red)]/80">证据 / 范围审查节点判定存在错题风险，可前往「错题确认」做最终确认。</p>
           </div>
           <StatusBadge status="provisional" variant="purple">{{ provisionalErrors.length }} 条</StatusBadge>
         </div>
         <ul class="space-y-2">
           <li v-for="(p, i) in provisionalErrors" :key="String(i)" class="rounded-lg bg-rose-950/50 p-3 text-xs text-rose-100">
             <p class="font-semibold">{{ p.question_text || p.title || ('错题 #' + String(Number(i) + 1)) }}</p>
-            <p v-if="p.reason" class="mt-1 text-rose-200/80">{{ p.reason }}</p>
+            <p v-if="p.reason" class="mt-1 text-[var(--acc-red)]/80">{{ p.reason }}</p>
           </li>
         </ul>
       </section>
@@ -334,7 +334,7 @@ onMounted(loadMeta)
           <div v-if="scopeAuditor.in_scope !== undefined || scopeAuditor.out_of_scope !== undefined">
             <p class="text-slate-500">范围判断：</p>
             <p class="mt-1">
-              <span :class="scopeAuditor.out_of_scope ? 'text-amber-300' : 'text-emerald-300'">
+              <span :class="scopeAuditor.out_of_scope ? 'text-[var(--acc-orange)]' : 'text-[var(--acc-green)]'">
                 {{ scopeAuditor.out_of_scope ? '超出范围' : '在范围内' }}
               </span>
             </p>

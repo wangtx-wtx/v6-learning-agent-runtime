@@ -1,4 +1,4 @@
-"""v5 后端入口
+"""V6 后端入口
 
 默认监听 0.0.0.0:8800,允许手机/局域网访问。
 可通过环境变量 V5_HOST / V5_PORT 覆盖。
@@ -15,7 +15,7 @@ import uvicorn
 
 BANNER = """
 ============================================================
-  v5 backend started: {host}:{port}
+  V6.0 Learning Agent Runtime: {host}:{port}
   - Local    : http://localhost:{port}/#/m-upload
   - LAN      : http://<your-LAN-IP>:{port}/#/m-upload
 ============================================================

@@ -29,7 +29,11 @@ async def review_aggregator(ctx: DAGContext, model: str) -> dict:
     errors = fetch_all("SELECT * FROM errors WHERE course_id=? AND status='confirmed' ORDER BY next_review_at", (course_id,)) if course_id else []
     if chapter_id:
         errors = fetch_all("SELECT * FROM errors WHERE chapter_id=? AND status='confirmed'", (chapter_id,))
-    resources = {"notes": notes, "confirmed_errors": errors, "kind": kind}
+    from .learning_engine.learning_loop import mastery_snapshot
+    mastery = mastery_snapshot(course_id=course_id, chapter_id=chapter_id)
+    resources = {"notes": notes, "confirmed_errors": errors, "kind": kind,
+                 "knowledge_mastery": mastery,
+                 "review_priority": [m["stable_key"] for m in mastery if float(m.get("mastery") or .5) < .7]}
     if kind == "exam":
         resources["exam_scope"] = ctx.input.get("scope") or {}
         resources["exam_date"] = ctx.input.get("exam_date")
@@ -50,13 +54,17 @@ async def _writer(ctx: DAGContext, model: str) -> dict:
     from .dag import RetryableModelError
 
     notes_txt = "\n".join(f"- {n.get('title','')}: {(n.get('body') or '')[:400]}" for n in notes[:10])
+    mastery = resources.get("knowledge_mastery") or []
     err_txt = "\n".join(f"- {e.get('question_text','')[:200]}" for e in errors[:20])
+    mastery_txt = "\n".join(
+        f"- {m.get('topic')}: mastery={float(m.get('mastery') or .5):.2f}; {m.get('explanation','')}"
+        for m in mastery[:30])
     p = render_prompt("review/writer", "v1", notes_text=notes_txt, errors_text=err_txt)
     try:
         resp = await gateway.chat(model, [
             {"role": "system", "content": p["text"]},
-            {"role": "user", "content": f"笔记：\n{notes_txt}\n\n错题：\n{err_txt}"},
-        ], temperature=0.4)
+            {"role": "user", "content": f"笔记：\n{notes_txt}\n\n错题：\n{err_txt}\n\n掌握度（由低到高）：\n{mastery_txt}"},
+        ], contract="review/writer", temperature=0.4)
         data = parse_model_output(ReviewWriterOut, resp.get("content", ""), "review_writer")
         return {"review_package": data, "insufficient_data": False,
                 "prompt_checksum": p["checksum"],
@@ -79,7 +87,7 @@ async def _self_test(ctx: DAGContext, model: str) -> dict:
         resp = await gateway.chat(model, [
             {"role": "system", "content": p["text"]},
             {"role": "user", "content": f"错题：\n{json.dumps([e.get('question_text') for e in errors[:10]], ensure_ascii=False)}"},
-        ], temperature=0.5)
+        ], contract="review/self_test", temperature=0.5)
         data = parse_model_output(SelfTestOut, resp.get("content", ""), "self_test")
         return {"self_test": data.get("questions", []), "prompt_checksum": p["checksum"],
                 "tokens_in": resp.get("tokens_in", 0),
@@ -117,6 +125,18 @@ async def _persist_node(ctx: DAGContext, model: str) -> dict:
     return {"review_id": rid, "status": "insufficient_data" if insuff else "generated"}
 
 
+async def _render_document_node(ctx: DAGContext, model: str) -> dict:
+    from .document_artifacts import artifact_public, normalize_document, render_artifact
+    persisted = ctx.outputs.get("persist_review", {})
+    if persisted.get("status") == "insufficient_data":
+        return {"artifact": None, "status": "skipped", "reason": "insufficient_data"}
+    package = ctx.outputs.get("writer", {}).get("review_package", {}) or {}
+    doc = normalize_document(package.get("document"), title="复习讲义", body=package.get("materials", ""),
+                             outline=package.get("outline", []), kind="review_handout")
+    artifact = render_artifact(owner_type="review", owner_id=persisted["review_id"], document=doc)
+    return {"artifact": artifact_public(artifact)}
+
+
 # 复习作答（grade）不再是工作流节点：用户作答走独立接口
 # POST /api/reviews/{id}/attempts + POST /api/reviews/{id}/complete（方案 5.3/5.4）。
 
@@ -125,10 +145,11 @@ def build_review_dag() -> DAG:
     dag = DAG("review", "review")
     dag.add(DAGNode("aggregator", "local", review_aggregator, kind="local"))
     dag.add(DAGNode("writer", "review_writer", _writer,
-                    preferred_models=["deepseek_v4_free", "deepseek_v4_official"],
+                    preferred_models=["deepseek_v4_free", "glm_flash"],
                     depends_on=["aggregator"], kind="llm"))
     dag.add(DAGNode("self_test", "self_test_writer", _self_test,
                     preferred_models=["qwen3_flash", "deepseek_v4_free"],
                     depends_on=["writer"], kind="llm"))
     dag.add(DAGNode("persist_review", "local", _persist_node, depends_on=["self_test"], kind="local"))
+    dag.add(DAGNode("render_document", "local", _render_document_node, depends_on=["persist_review"], kind="local"))
     return dag

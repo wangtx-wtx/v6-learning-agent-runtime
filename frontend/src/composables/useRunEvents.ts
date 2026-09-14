@@ -4,7 +4,7 @@
  * - 优先 EventSource(/api/runs/{id}/events)，实时接收 run/nodes 变化；
  * - 连接失败按指数退避重连（1s→2s→4s→8s→16s，最多 5 次）；
  * - 退避耗尽或浏览器不支持 SSE 时，自动降级为 2s 轮询 RunsApi.get；
- * - run 进入终态（completed/failed/cancelled）自动停止并回调。
+ * - run 进入终态（completed/degraded/failed/cancelled）自动停止并回调。
  */
 import { onBeforeUnmount, ref } from 'vue'
 import { RunsApi } from '../api/endpoints'
@@ -15,7 +15,8 @@ export interface RunEventState {
   error: string | null
 }
 
-const TERMINAL = new Set(['completed', 'failed', 'cancelled'])
+// V6 Phase 1: degraded 是终态（覆盖门禁未通过但产物可用），必须一并停止订阅。
+const TERMINAL = new Set(['completed', 'degraded', 'failed', 'cancelled'])
 
 export function useRunEvents() {
   const connected = ref(false)          // SSE 是否在线
@@ -63,8 +64,12 @@ export function useRunEvents() {
       try {
         const payload = JSON.parse(ev.data)
         connected.value = true
-        // 交给调用方渲染；组件传来的 onUpdate 用最新 detail 拉取，保证 DTO 一致
-        if (payload && (payload.status === 'completed' || payload.status === 'failed' || payload.status === 'cancelled')) {
+        if (payload?.status) {
+          onUpdate({ id, status: payload.status, error: payload.error || null } as WorkflowRun,
+            (payload.nodes || []) as RunNode[])
+        }
+        // 终态再拉一次完整轻量 DTO，补齐耗时、token 和输出摘要。
+        if (payload && TERMINAL.has(payload.status)) {
           void RunsApi.get(id).then(d => onUpdate(d.run, d.nodes || [])).catch(() => {})
           stop()
         }

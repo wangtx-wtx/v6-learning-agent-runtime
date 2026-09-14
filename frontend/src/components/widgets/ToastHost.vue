@@ -4,28 +4,38 @@
  * 固定右下角,移动端自适应。
  */
 import { useToast } from '../../composables/useToast'
+import Icon from './Icon.vue'
 
 const { items, dismiss } = useToast()
 
 function toneClass(tone: string) {
   switch (tone) {
     case 'success':
-      return 'border-emerald-500/40 bg-emerald-950/80 text-emerald-100'
+      return 'border-[var(--acc-green-line)]'
     case 'error':
-      return 'border-rose-500/50 bg-rose-950/80 text-rose-100'
+      return 'border-[var(--acc-red-line)]'
     case 'warn':
-      return 'border-amber-500/40 bg-amber-950/80 text-amber-100'
+      return 'border-[var(--acc-orange-line)]'
     default:
-      return 'border-slate-700/60 bg-slate-900/85 text-slate-100'
+      return 'border-[var(--line)]'
   }
 }
 
 function toneIcon(tone: string) {
   switch (tone) {
-    case 'success': return '✓'
-    case 'error': return '✕'
-    case 'warn': return '⚠'
-    default: return 'ℹ'
+    case 'success': return 'check'
+    case 'error': return 'close'
+    case 'warn': return 'alert'
+    default: return 'sparkles'
+  }
+}
+
+function toneIconClass(tone: string) {
+  switch (tone) {
+    case 'success': return 'text-[var(--acc-green)] bg-[var(--acc-green-soft)]'
+    case 'error': return 'text-[var(--acc-red)] bg-[var(--acc-red-soft)]'
+    case 'warn': return 'text-[var(--acc-orange)] bg-[var(--acc-orange-soft)]'
+    default: return 'text-[var(--accent)] bg-[var(--accent-soft)]'
   }
 }
 </script>
@@ -40,18 +50,24 @@ function toneIcon(tone: string) {
       <div
         v-for="t in items"
         :key="t.id"
-        class="pointer-events-auto flex w-full max-w-sm items-start gap-3 rounded-xl border px-4 py-3 shadow-lg backdrop-blur"
+        class="glass-panel pointer-events-auto flex w-full max-w-sm items-start gap-3 rounded-[14px] border px-3.5 py-3"
         :class="toneClass(t.tone)"
+        style="box-shadow: var(--shadow-pop)"
       >
-        <span class="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-white/10 text-xs font-bold">
-          {{ toneIcon(t.tone) }}
+        <span
+          class="mt-0.5 grid h-6 w-6 shrink-0 place-items-center rounded-lg border"
+          :class="toneIconClass(t.tone)"
+        >
+          <Icon :name="toneIcon(t.tone)" :size="14" :stroke="2" />
         </span>
-        <p class="flex-1 text-sm leading-relaxed">{{ t.message }}</p>
+        <p class="flex-1 text-[13px] leading-relaxed">{{ t.message }}</p>
         <button
-          class="shrink-0 rounded p-1 text-xs opacity-60 transition hover:bg-white/10 hover:opacity-100"
+          class="shrink-0 rounded-lg p-1 opacity-55 transition hover:bg-white/10 hover:opacity-100"
           aria-label="关闭通知"
           @click="dismiss(t.id)"
-        >×</button>
+        >
+          <Icon name="close" :size="14" />
+        </button>
       </div>
     </transition-group>
   </div>
@@ -60,14 +76,14 @@ function toneIcon(tone: string) {
 <style scoped>
 .toast-enter-active,
 .toast-leave-active {
-  transition: all 200ms ease;
+  transition: all 220ms cubic-bezier(0.22, 0.61, 0.36, 1);
 }
 .toast-enter-from {
   opacity: 0;
-  transform: translateY(8px);
+  transform: translateY(10px) scale(0.97);
 }
 .toast-leave-to {
   opacity: 0;
-  transform: translateY(-4px);
+  transform: translateY(-4px) scale(0.98);
 }
 </style>

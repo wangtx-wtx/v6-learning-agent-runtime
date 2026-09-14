@@ -41,24 +41,27 @@ class TestFreshDatabase(DatabaseTestBase):
                          "reviews", "review_attempts", "workflow_runs", "run_nodes",
                          "sync_jobs", "file_blobs", "blob_gc_tasks", "error_events",
                          "retrieval_runs", "model_calls", "run_tasks", "parse_tasks",
-                         "evidence_links", "schema_migrations"):
+                         "evidence_links", "model_profiles", "model_role_routes", "academic_terms",
+                         "course_schedule_rules", "calendar_adjustments", "schema_migrations"):
             self.assertIn(expected, tables)
 
     def test_schema_version(self):
         db.init_db()
-        # V5.5.1: 0008 迁移落地后最大版本为 8
-        self.assertEqual(db.schema_version(), 8)
+        # 0016/0017 落地 V6 Phase 1、0018 落地 Phase 2、0019 落地 Phase 3、
+        # 0020 落地 Phase 4（Evidence V2：content_claims / claim_sources）后最大版本为 21
+        self.assertEqual(db.schema_version(), 23)
         versions = sorted(r["version"] for r in db.fetch_all(
             "SELECT version FROM schema_migrations"))
-        self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8])
-        # V5.5.1: PRAGMA user_version 应同步到 8
+        self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                                    16, 17, 18, 19, 20, 21, 22, 23])
+        # PRAGMA user_version 应同步到最新迁移
         uv = db.fetch_one("PRAGMA user_version")
         # fetch_one 对 PRAGMA 返回的是元组/Row；归一为 int
         if isinstance(uv, dict):
             uv_int = int(uv.get("user_version", 0))
         else:
             uv_int = int(uv[0] if uv else 0)
-        self.assertEqual(uv_int, 8)
+        self.assertEqual(uv_int, 23)
 
 
     def test_foreign_key_check_after_fresh_init(self):
@@ -236,7 +239,7 @@ class TestLegacyShadowMigration(unittest.TestCase):
         self.assertEqual(report["copied"]["chapters"]["deduped"], 1)
         # 校验迁移后的库
         db.configure_db(legacy)
-        self.assertEqual(db.schema_version(), 8)  # V5.5.1: 包含 0008 迁移
+        self.assertEqual(db.schema_version(), 23)
         self.assertEqual(db.fetch_all("PRAGMA foreign_key_check"), [])
         # 重复章节被合并，lesson.chapter_id 已重映射到保留的章节 id=1
         lesson = db.fetch_one("SELECT chapter_id FROM lessons")

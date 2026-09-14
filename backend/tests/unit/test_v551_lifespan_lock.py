@@ -70,7 +70,7 @@ class TestLifespanLockReal(unittest.TestCase):
         with TestClient(app) as client:
             r = client.get("/api/health")
             self.assertEqual(r.status_code, 200)
-            self.assertEqual(r.json()["version"], "5.5.1")
+            self.assertEqual(r.json()["version"], "6.0.0")
             self.assertTrue(self._lock_file().exists(),
                             "非 override 启动后锁文件应存在（临时根内）")
             from app.instance_lock import read_instance_lock

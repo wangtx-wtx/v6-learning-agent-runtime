@@ -5,6 +5,7 @@ export interface DagNode {
   name: string
   status: string
   model?: string | null
+  model_display?: string | null
   agent_role?: string | null
   started_at?: string | null
   finished_at?: string | null
@@ -22,6 +23,7 @@ export function toDagNodes<T extends { node_name: string; status: string }>(
     name: n.node_name,
     status: n.status,
     model: (n as any).model ?? null,
+    model_display: (n as any).model_display ?? null,
     agent_role: (n as any).agent_role ?? null,
     started_at: (n as any).started_at ?? null,
     finished_at: (n as any).finished_at ?? null,

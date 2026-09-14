@@ -177,7 +177,7 @@ function fitGraph() {
 <template>
   <div class="page-shell">
     <PageHeader
-      emoji="🕸️"
+      icon="network"
       title="知识图谱"
       subtitle="课程 → 章节 → 课时 → 知识点 → 笔记 / 错题 的层级关系，支持拖拽、缩放、点击查看详情。"
     >
@@ -187,7 +187,7 @@ function fitGraph() {
       </template>
     </PageHeader>
 
-    <States :loading="loading" :error="error" :empty="!nodes.length" empty-icon="🕸️"
+    <States :loading="loading" :error="error" :empty="!nodes.length" empty-icon="network"
             empty-title="暂无图谱数据"
             empty-hint="可通过数据迁移 (POST /api/migrate) 把旧版数据导入，或在听课 / 作业 / 复习流运行时自动生成节点。">
       <section class="grid gap-4 xl:grid-cols-[1fr_320px]">
@@ -203,9 +203,9 @@ function fitGraph() {
               </StatusBadge>
             </div>
           </div>
-          <div v-if="isolatedNodes" class="mb-3 rounded-xl border border-amber-700/40 bg-amber-950/30 px-4 py-3 text-xs text-amber-200">
+          <div v-if="isolatedNodes" class="mb-3 rounded-xl border border-amber-700/40 bg-amber-950/30 px-4 py-3 text-xs text-[var(--acc-orange)]">
             <p class="font-semibold">⚠ 当前图谱仅有 {{ nodes.length }} 个节点、{{ edges.length }} 条边,无任何关联关系。</p>
-            <p class="mt-1 text-amber-300/80">可能的修复:运行 1 次完整的听课 / 作业 / 复习流水线以自动生成节点关系,或在后端调用 <code class="rounded bg-amber-900/50 px-1.5 py-0.5 font-mono">POST /api/migrate</code> 重建图谱。</p>
+            <p class="mt-1 text-[var(--acc-orange)]/80">可能的修复:运行 1 次完整的听课 / 作业 / 复习流水线以自动生成节点关系,或在后端调用 <code class="rounded bg-amber-900/50 px-1.5 py-0.5 font-mono">POST /api/migrate</code> 重建图谱。</p>
           </div>
           <div ref="chartRef" class="h-[560px] w-full rounded-xl bg-slate-950/40" />
         </div>

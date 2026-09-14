@@ -1,0 +1,2 @@
+ALTER TABLE chapters ADD COLUMN notes TEXT;
+

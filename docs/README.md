@@ -6,6 +6,7 @@
 
 | 文档 | 内容 |
 | --- | --- |
+| [V6_LEARNING_ENGINE_IMPLEMENTATION_PLAN.md](V6_LEARNING_ENGINE_IMPLEMENTATION_PLAN.md) | V6 顶层边界、数据结构、迁移、16 节点契约与 Phase 1–6 补丁任务书 |
 | [PRODUCT.md](PRODUCT.md) | 产品概览：功能范围、业务流、角色与页面 |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 技术架构：模块划分、DAG/Worker、数据模型、可靠性设计 |
 | [OPERATIONS.md](OPERATIONS.md) | 运维手册：启动/备份/恢复/迁移/排障 |
