@@ -40,6 +40,10 @@ const ROLE_LABEL: Record<string, string> = {
   student_simulator: '学生视角', note_writer: '笔记写作',
   solution_explainer: '解题讲解', error_analyst: '错因分析',
   review_writer: '复习写作', self_test_writer: '自测题生成',
+  // V6 Phase 2：全量分段理解（每段一次调用，需长上下文）
+  segment_understanding: '分段理解',
+  // V6 Phase 2 增强：分段边界规划（读懂全文后标出知识点边界与切点）
+  segment_boundary_planner: '分段边界规划',
 }
 const CAPABILITY_LABEL: Record<string, string> = {
   text: '文本', vision: '视觉', multimodal: '多模态', ocr: 'OCR',

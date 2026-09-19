@@ -48,12 +48,13 @@ class TestFreshDatabase(DatabaseTestBase):
     def test_schema_version(self):
         db.init_db()
         # 0016/0017 落地 V6 Phase 1、0018 落地 Phase 2、0019 落地 Phase 3、
-        # 0020 落地 Phase 4（Evidence V2：content_claims / claim_sources）后最大版本为 21
-        self.assertEqual(db.schema_version(), 23)
+        # 0020 落地 Phase 4（Evidence V2：content_claims / claim_sources）、
+        # 0024 落地分段边界建议账、0025 落地段内引用覆盖观测后最大版本为 25
+        self.assertEqual(db.schema_version(), 25)
         versions = sorted(r["version"] for r in db.fetch_all(
             "SELECT version FROM schema_migrations"))
         self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-                                    16, 17, 18, 19, 20, 21, 22, 23])
+                                    16, 17, 18, 19, 20, 21, 22, 23, 24, 25])
         # PRAGMA user_version 应同步到最新迁移
         uv = db.fetch_one("PRAGMA user_version")
         # fetch_one 对 PRAGMA 返回的是元组/Row；归一为 int
@@ -61,7 +62,7 @@ class TestFreshDatabase(DatabaseTestBase):
             uv_int = int(uv.get("user_version", 0))
         else:
             uv_int = int(uv[0] if uv else 0)
-        self.assertEqual(uv_int, 23)
+        self.assertEqual(uv_int, 25)
 
 
     def test_foreign_key_check_after_fresh_init(self):
@@ -177,6 +178,84 @@ class TestWriteSemantics(DatabaseTestBase):
         self.assertEqual(len(db.fetch_all("SELECT * FROM courses")), 80)
 
 
+class TestMigrationApplyStrictness(unittest.TestCase):
+    """迁移应用必须 fail-fast：失败绝不能留下版本号。
+
+    历史回归：``_apply_migration`` 曾有 ``strict=False`` 宽松模式，遇到
+    ``ALTER TABLE <不存在表>`` 会「跳过该语句但仍写入版本号」，于是迁移被标记为
+    已应用，而目标列**永远不会被加上**。后续任何写入该列的语句都报
+    ``no such column``，且重启也不会重试（版本号已在账本里）。
+
+    这类「假应用」极难定位：run 只是静默 degraded，segment 状态卡在 running。
+    """
+
+    @staticmethod
+    def _conn():
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(db.SCHEMA_MIGRATIONS_DDL)
+        conn.commit()
+        return conn
+
+    def _applied(self, conn, version: int) -> int:
+        return int(conn.execute(
+            "SELECT COUNT(*) AS n FROM schema_migrations WHERE version=?",
+            (version,)).fetchone()["n"])
+
+    def test_missing_target_table_raises_and_records_nothing(self):
+        conn = self._conn()
+        try:
+            mig = {
+                "version": 9999,
+                "name": "9999_fake_alter",
+                "checksum": "x" * 64,
+                "sql": ("ALTER TABLE definitely_not_there "
+                        "ADD COLUMN c INTEGER NOT NULL DEFAULT 0;"),
+            }
+            with self.assertRaises(sqlite3.OperationalError):
+                db._apply_migration(conn, mig)
+            self.assertEqual(self._applied(conn, 9999), 0,
+                             "失败的迁移绝不能写入版本号（否则永远不会重试）")
+        finally:
+            conn.close()
+
+    def test_missing_column_reference_raises(self):
+        """迁移里引用不存在的列同样必须失败回滚。"""
+        conn = self._conn()
+        try:
+            conn.execute("CREATE TABLE t (a INTEGER)")
+            conn.commit()
+            mig = {"version": 9998, "name": "9998_fake_dml", "checksum": "y" * 64,
+                   "sql": "INSERT INTO t (a, b) VALUES (1, 2);"}
+            with self.assertRaises(sqlite3.OperationalError):
+                db._apply_migration(conn, mig)
+            self.assertEqual(self._applied(conn, 9998), 0)
+        finally:
+            conn.close()
+
+    def test_ledger_only_still_advances_ledger(self):
+        """ledger_only 语义不变：只推进账本，不执行 DDL（历史 v7 夹具路径）。"""
+        conn = self._conn()
+        try:
+            mig = {"version": 9997, "name": "9997", "checksum": "z" * 64,
+                   "sql": "CREATE TABLE whatever (a INTEGER);"}
+            db._apply_migration(conn, mig, ledger_only=True)
+            self.assertEqual(self._applied(conn, 9997), 1)
+            self.assertIsNone(
+                conn.execute("SELECT name FROM sqlite_master WHERE name='whatever'"
+                             ).fetchone(),
+                "ledger_only 不应执行 DDL")
+        finally:
+            conn.close()
+
+    def test_no_strict_parameter_anymore(self):
+        """防止 ``strict=False`` 被重新引入 —— 它唯一的用处就是制造「假应用」。"""
+        import inspect
+        sig = inspect.signature(db._apply_migration)
+        self.assertNotIn("strict", sig.parameters,
+                         "strict 宽松模式会让失败的迁移被标记为已应用")
+
+
 class TestLegacyShadowMigration(unittest.TestCase):
     """方案 2.3：真影子迁移（含去重、blob 回填、校验、原子替换）。"""
 
@@ -239,7 +318,7 @@ class TestLegacyShadowMigration(unittest.TestCase):
         self.assertEqual(report["copied"]["chapters"]["deduped"], 1)
         # 校验迁移后的库
         db.configure_db(legacy)
-        self.assertEqual(db.schema_version(), 23)
+        self.assertEqual(db.schema_version(), 25)
         self.assertEqual(db.fetch_all("PRAGMA foreign_key_check"), [])
         # 重复章节被合并，lesson.chapter_id 已重映射到保留的章节 id=1
         lesson = db.fetch_one("SELECT chapter_id FROM lessons")

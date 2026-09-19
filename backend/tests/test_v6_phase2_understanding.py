@@ -1051,13 +1051,13 @@ class TestPhase2Migrations(V6Phase2Base):
     """0018 fresh install / v17→v18 升级 / 外键。"""
 
     def test_fresh_install_v19(self):
-        self.assertEqual(self.db.schema_version(), 23)
+        self.assertEqual(self.db.schema_version(), 25)
         self.assertEqual(self.db.fetch_all("PRAGMA foreign_key_check"), [])
         tables = {r["name"] for r in self.db.fetch_all(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         for t in ("lesson_segments", "segment_source_spans", "segment_understandings",
                   "lesson_understandings", "segment_reuse_index", "cognitive_maps",
-                  "content_claims", "claim_sources"):
+                  "content_claims", "claim_sources", "segment_boundary_plans"):
             self.assertIn(t, tables)
 
     def test_upgrade_v18_to_v19_preserves_data(self):

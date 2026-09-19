@@ -10,7 +10,7 @@ import re
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from ..dag import SchemaValidationError
+from ..dag import EmptyModelResponseError, SchemaValidationError
 from ..reasoning import extract_json
 
 
@@ -213,6 +213,41 @@ class MergeUnderstandingOut(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# V6 Phase 2 增强：分段边界规划（节点 05.5 plan_segment_boundaries）
+#
+# 模型只做一件事：把材料切成「完整知识点」，并给出建议的段边界。
+# 输出**只有 ordinal 整数区间**，不含原文、不含字符偏移 —— ordinal 天然是
+# span 粒度，因此不会切在 span 中间（``segment_source_spans`` 引用的是
+# ``source_span_id``，系统表达不了「半个 span」）。
+#
+# 注意：本契约的输出是**建议**，必须经 ``boundaries.validate_boundaries``
+# 校验后才会被 ``segment_lesson`` 采用；校验不过即回退结构边界。
+# ---------------------------------------------------------------------------
+class V6KnowledgeSpanOut(BaseModel):
+    """一个知识点覆盖的 span 序号区间。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = ""
+    kind: str = "concept"
+    start_ordinal: int = Field(ge=1)
+    end_ordinal: int = Field(ge=1)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+class SegmentBoundariesOut(BaseModel):
+    """节点 05.5 分段边界规划输出契约。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    knowledge_units: list[V6KnowledgeSpanOut] = Field(default_factory=list)
+    #: 在这些 ordinal **之后**切段。必须严格递增，且每个值都是某个知识点的
+    #: ``end_ordinal``（否则切点落在知识点内部，违背「不腰斩知识点」的目标）。
+    breaks: list[int] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
 # V6 Phase 3：Cognitive Layer（节点 09 student_simulator）
 #
 # 模型只提出「学生可能如何理解/混淆/记忆已有课堂内容」的候选认知项；
@@ -368,7 +403,19 @@ def _normalize_model_data(data, model_cls: type[BaseModel]):
 
 
 def parse_model_output(model_cls: type[BaseModel], content: str, node: str = "") -> dict:
-    """extract_json + Pydantic 校验。失败抛 SchemaValidationError（带节点名与原因）。"""
+    """extract_json + Pydantic 校验。
+
+    三类失败分开报，因为对策不同：
+    * **空响应** → ``EmptyModelResponseError``：模型什么都没说，重试才有意义；
+    * **非 JSON** → ``SchemaValidationError``：格式问题，先修复请求再换模型；
+    * **字段不符** → ``SchemaValidationError``：带 Pydantic 错误明细。
+    """
+    if not (content or "").strip():
+        # 把空响应记成 schema 错误会有两个后果：DAG 先发一次**毫无意义的修复
+        # 请求**（对象是空气），而且错误信息只剩一句空荡荡的
+        # 「模型输出不是合法 JSON: 」，既看不出是空响应也拿不到模型名。
+        raise EmptyModelResponseError(
+            f"{node or model_cls.__name__}: 模型返回空响应（网关 200 但 content 为空）")
     data = extract_json(content)
     if data is None:
         raise SchemaValidationError(

@@ -119,7 +119,7 @@ class TestLearningLoop(EvidenceBase):
 
 class TestMigrations(EvidenceBase):
     def test_schema_23_and_tables(self):
-        self.assertEqual(self.db.schema_version(), 23)
+        self.assertEqual(self.db.schema_version(), 25)
         tables = {r["name"] for r in self.db.fetch_all(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertTrue({"learning_quality_states", "note_revisions", "knowledge_units",

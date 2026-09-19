@@ -284,10 +284,11 @@ class TestFakeFixtures(unittest.TestCase):
         )
         validate_all_fixtures_at_import()
         self.assertEqual(len(CONTRACT_TABLE), len(known_contracts()))
-        self.assertEqual(len(CONTRACT_TABLE), 16)
+        self.assertEqual(len(CONTRACT_TABLE), 17)
         self.assertIn("lesson/segment_understanding", CONTRACT_TABLE)
         self.assertIn("lesson/merge_understanding", CONTRACT_TABLE)
         self.assertIn("lesson/student_simulator", CONTRACT_TABLE)
+        self.assertIn("lesson/segment_boundaries", CONTRACT_TABLE)
 
 
 # ===========================================================================

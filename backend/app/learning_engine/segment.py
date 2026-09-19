@@ -51,6 +51,12 @@ MAX_OVERLAP_SPANS = 3
 #: 分段时优先使用的自然边界（时间空洞 / 幻灯片页 / 讲义页）。
 NATURAL_GAP_MS = 120_000
 
+#: 自然边界生效所需的最低填充率（占该段容量的比例）。
+#: 旧值硬编码 0.5 过于保守：遇到「换幻灯片 / 换来源」这类明显结构分界时，
+#: 只要当前段还没装到一半就不会在此成段，切点因此被推迟到「恰好装不下的
+#: 地方」—— 这正是「切点与语义无关」的主因。下调后结构边界更容易生效。
+NATURAL_BOUNDARY_MIN_FILL = 0.25
+
 #: prompt 固定开销的保守估计（system prompt + schema + Source ID 清单 + 外壳）。
 #: 仅用于测试/调用方做「预算是否还装得下内容」的粗算；真实校验一律走
 #: ``verify_segment_budget`` 对最终 messages 的复算。
@@ -216,11 +222,20 @@ def _empty_overhead_tokens() -> int:
 
 def plan_segments(domain_id: int, *, model_profile_id: Optional[str] = None,
                   context_window: Optional[int] = None,
-                  token_budget: Optional[int] = None) -> dict[str, Any]:
+                  token_budget: Optional[int] = None,
+                  preferred_breaks: Optional[list[int]] = None) -> dict[str, Any]:
     """计算分段方案（纯函数式：不写库），返回 draft 列表与预算信息。
 
     ``token_budget`` 可显式覆盖输入预算（用于测试与运维排查；正常路径由模型
     上下文窗口派生）。它**只影响分段粒度**，不影响「哪些 span 必须进入理解」。
+
+    ``preferred_breaks`` 是上游分段规划（节点 05.5 ``plan_segment_boundaries``）
+    给出的建议切点（span ordinal 列表）。它只决定「优先在哪切」，**不决定
+    「必须那么切」**：最终仍受预算硬约束，且仍需过 ``fit_segment_plan_to_budget``。
+    校验不过时调用方传 ``None``，退回纯结构边界逻辑。
+
+    注意：材料总量能整体装进预算时走 ``single_pass``（设计约定，见模块 docstring
+    「全部内容能进入上下文 → single_pass」），此时建议切点不生效。
     """
     spans = canonical_spans(domain_id)
     budget, window, reserved_output = _model_input_budget(model_profile_id, context_window)
@@ -290,18 +305,22 @@ def plan_segments(domain_id: int, *, model_profile_id: Optional[str] = None,
                 "total_tokens": total_tokens, "drafts": [draft],
                 "unassigned_source_ids": [], "overlap_trimmed": 0}
 
-    # ---- 分段的确定性打包：保序 + 预算（含 prompt 开销）+ 自然边界优先 ----
+    # ---- 分段的确定性打包：保序 + 预算（含 prompt 开销）+ 边界优先 ----
+    # 切点优先级：上游语义建议 > 课堂结构边界（时间空洞 / 换页 / 换来源）
+    # > 纯 token 预算。三者都尊重，但前两者能让段边界落在语义/结构上，
+    # 而不是「恰好装不下的地方」。
+    preferred = {int(b) for b in (preferred_breaks or [])}
     drafts: list[SegmentDraft] = []
     current: list[dict] = []
     used = 0
     capacity = 0
     for span in spans:
         tokens = int(span.get("token_count") or 0)
+        force_break = int(span["ordinal"]) in preferred
         if current and (used + tokens > capacity
+                        or force_break
                         or (_is_natural_boundary(current[-1], span)
-                            and used >= capacity * 0.5)):
-            # 自然边界（时间空洞 / 换页 / 换来源）在用量过半时优先成段，
-            # 使分段同时尊重「课堂结构」与「token 预算」，而不是纯 token 切分。
+                            and used >= capacity * NATURAL_BOUNDARY_MIN_FILL)):
             drafts.append(SegmentDraft(
                 ordinal=len(drafts) + 1, primary=current, overlap=[],
                 strategy=PlanStrategy.SEGMENTED_MAP_MERGE.value,
@@ -595,13 +614,19 @@ def segment_plan_summary(domain_id: int) -> dict[str, Any]:
         "error": r["error"],
         "model_used": None,
         "duration_ms": None,
+        # 段内引用覆盖（观测）：模型实际引用了多少段内 primary span。
+        # 段仍照旧记账为 processed，这里只回答「模型真的注意到多少内容」。
+        "referenced_primary_count": None,
+        "ref_coverage": None,
+        "unreferenced_source_ids": [],
         "created_at": r.get("created_at"),
         "updated_at": r.get("updated_at"),
     } for r in rows]
     # 每段的理解状态 / 模型 / 耗时（供审计界面展示）
     if rows:
         su_rows = db.fetch_all(
-            "SELECT segment_id, status, model_used, source_ref_count, created_at, updated_at "
+            "SELECT segment_id, status, model_used, source_ref_count, created_at, updated_at, "
+            " primary_span_count, referenced_primary_count, unreferenced_source_ids "
             "FROM segment_understandings WHERE domain_id=?", (domain_id,))
         su_by_seg = {int(r["segment_id"]): dict(r) for r in su_rows}
         for draft in drafts:
@@ -611,6 +636,16 @@ def segment_plan_summary(domain_id: int) -> dict[str, Any]:
             draft["understanding_status"] = su.get("status")
             draft["model_used"] = su.get("model_used")
             draft["source_ref_count"] = su.get("source_ref_count")
+            draft["referenced_primary_count"] = su.get("referenced_primary_count")
+            primary_n = int(su.get("primary_span_count") or 0)
+            if primary_n > 0:
+                draft["ref_coverage"] = round(
+                    int(su.get("referenced_primary_count") or 0) / primary_n, 4)
+            try:
+                draft["unreferenced_source_ids"] = json.loads(
+                    su.get("unreferenced_source_ids") or "[]")
+            except Exception:
+                draft["unreferenced_source_ids"] = []
             draft["duration_ms"] = _duration_ms(su.get("created_at"), su.get("updated_at"))
     return {
         "segment_count": len(drafts),

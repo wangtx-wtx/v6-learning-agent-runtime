@@ -53,6 +53,12 @@ REASON_SEGMENT_NOT_REACHED = "segment_not_reached"
 #: segment understanding，任何 canonical 非噪声 span 未进入理解都必须 degraded。
 SEMANTIC_RATE_FLOOR = 1.0
 
+#: 段内引用覆盖率告警线（**诊断用，不参与门禁**）。
+#: 低于该比例说明该段虽然「成功」，但模型几乎没引用段内内容 —— 长上下文下的
+#: 注意力衰减（中间迷失）的典型表现。课堂材料里过渡性内容本就不会被引用，
+#: 因此这里取一个宽松值，只用于把可疑段暴露给人工复核，而不是卡门禁。
+LOW_REF_COVERAGE_RATIO = 0.3
+
 
 def semantic_rate_floor() -> float:
     """语义处理率下限。Phase 2 起恒为 ``SEMANTIC_RATE_FLOOR``（1.0）。
@@ -509,6 +515,8 @@ def compute_coverage(domain_id: int) -> dict[str, Any]:
 
     # segment 侧（Phase 2）：primary segment 是否全部成功
     segment_stats = _segment_stats(domain_id, run_id)
+    # 段内引用覆盖率（观测）：把「段成功但模型几乎没引用段内内容」暴露出来
+    ref_coverage = _segment_ref_coverage(domain_id)
 
     return {
         "run_id": run_id,
@@ -558,6 +566,8 @@ def compute_coverage(domain_id: int) -> dict[str, Any]:
         "source_refs_invalid": refs_invalid,
         # segments
         **segment_stats,
+        # 段内引用覆盖率（观测，不参与门禁）
+        **ref_coverage,
         "silent_drop_span_ids": silent_ids,
         "unprocessed_reasons": unprocessed_reasons,
     }
@@ -606,6 +616,61 @@ def _table_exists(name: str) -> bool:
     row = db.fetch_one(
         "SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name=?", (name,))
     return bool(row)
+
+
+def _segment_ref_coverage(domain_id: int) -> dict[str, Any]:
+    """段内引用覆盖率聚合（**观测，不参与门禁**）。
+
+    现行语义下「段成功 ⇒ 该段全部 primary span 记账为 processed」，覆盖率只能
+    证明该段被调用过。本函数额外统计模型**实际引用**的段内 primary span 占比，
+    把「中间迷失」（模型只引用首尾、中段被忽略）暴露成可定位问题。
+
+    只统计 ``succeeded`` 的段：未成功的段没有引用数据，把它们算成 0 会让
+    「段失败」与「段成功但引用少」混为一谈。
+    """
+    empty = {
+        "segment_ref_coverage_min": 0.0,
+        "segment_ref_coverage_avg": 0.0,
+        "low_ref_coverage_count": 0,
+        "low_ref_coverage_segments": [],
+    }
+    if not _table_exists("segment_understandings") or not _table_exists("lesson_segments"):
+        return empty
+    rows = db.fetch_all(
+        "SELECT ls.ordinal, su.primary_span_count, su.referenced_primary_count, "
+        " su.unreferenced_source_ids FROM segment_understandings su "
+        "JOIN lesson_segments ls ON ls.id = su.segment_id "
+        "WHERE su.domain_id=? AND su.status='succeeded' ORDER BY ls.ordinal",
+        (domain_id,))
+    ratios: list[float] = []
+    low: list[dict] = []
+    for r in rows:
+        total = int(r["primary_span_count"] or 0)
+        if total <= 0:
+            continue
+        got = int(r["referenced_primary_count"] or 0)
+        ratio = got / total
+        ratios.append(ratio)
+        if ratio < LOW_REF_COVERAGE_RATIO:
+            try:
+                unref = json.loads(r["unreferenced_source_ids"] or "[]")
+            except Exception:
+                unref = []
+            low.append({
+                "ordinal": int(r["ordinal"] or 0),
+                "primary_span_count": total,
+                "referenced_primary_count": got,
+                "ratio": round(ratio, 4),
+                "unreferenced_sample": [str(x) for x in unref][:10],
+            })
+    if not ratios:
+        return empty
+    return {
+        "segment_ref_coverage_min": round(min(ratios), 4),
+        "segment_ref_coverage_avg": round(sum(ratios) / len(ratios), 4),
+        "low_ref_coverage_count": len(low),
+        "low_ref_coverage_segments": low,
+    }
 
 
 def evaluate_gate(metrics: dict[str, Any]) -> tuple[str, Optional[str], list[str]]:
@@ -765,6 +830,10 @@ def _record_coverage_audit(domain_id: int, report_run_id: int | None) -> Materia
         segment_structures_total=metrics.get("segment_structures_total", 0),
         merged_structures_total=metrics.get("merged_structures_total", 0),
         structures_dropped=metrics.get("structures_dropped", 0),
+        segment_ref_coverage_min=metrics.get("segment_ref_coverage_min", 0.0),
+        segment_ref_coverage_avg=metrics.get("segment_ref_coverage_avg", 0.0),
+        low_ref_coverage_count=metrics.get("low_ref_coverage_count", 0),
+        low_ref_coverage_segments=metrics.get("low_ref_coverage_segments", []),
         legacy_candidate_rate=metrics["legacy_candidate_rate"],
         timeline_gap_count=metrics["timeline_gap_count"],
         semantic_rate_floor=SEMANTIC_RATE_FLOOR,

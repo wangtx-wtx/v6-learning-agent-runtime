@@ -19,6 +19,7 @@ backend/data/uploads/
 backend/data/obsidian_vault/
 backend/data/artifacts/
 backend/data/quarantine/
+backend/data/converted/
 backend/data/.instance.lock
 
 # --- Runtime and verification residue ---
@@ -48,3 +49,4 @@ Thumbs.db
 FULL_CODE_EXPORT.txt
 ChatGPT对话后续工作汇报_*.md
 backend/tmp_verify_issues.py
+backend/.zero_token_report.json

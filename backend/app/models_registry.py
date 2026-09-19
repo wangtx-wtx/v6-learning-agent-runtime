@@ -64,6 +64,9 @@ ROLE_MODELS: dict[str, list[str]] = {
     "lesson_structurer": ["qwen3_flash", "deepseek_v4_free"],
     # V6 Phase 2：全量分段理解（map）。用长上下文模型承载整段材料。
     "segment_understanding": ["qwen3_flash", "deepseek_v4_free", "glm_flash"],
+    # V6 Phase 2 增强：分段边界规划（节点 05.5）。只需长上下文 + 稳定 JSON，
+    # 输出只有 ordinal 区间，体量极小。
+    "segment_boundary_planner": ["qwen3_flash", "deepseek_v4_free", "glm_flash"],
     "student_simulator": ["deepseek_v4_free", "qwen3_flash", "glm_flash"],
     "note_writer": ["deepseek_v4_free", "qwen3_flash", "glm_flash"],
     "critic": ["glm_flash", "qwen3_flash"],

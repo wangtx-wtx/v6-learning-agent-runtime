@@ -51,6 +51,7 @@ def _load_schema_classes():
         OcrOut, VisionOut, AnalystOut, CrossCheckOut,
         ReviewWriterOut, SelfTestOut,
         SegmentUnderstandingOut, MergeUnderstandingOut, StudentSimulatorOut,
+        SegmentBoundariesOut,
     )
     return {
         "lesson/lesson_outline": ("lesson_outline", LessonOutlineOut),
@@ -74,6 +75,10 @@ def _load_schema_classes():
         # V6 Phase 3：认知分析同样按输入生成（无认知风险材料必须返回空 items）
         "lesson/student_simulator":     ("lesson_student_simulator",
                                         StudentSimulatorOut, "student_simulator"),
+        # V6 Phase 2 增强：分段边界规划。fake 需按输入的「共 N 条」生成合法区间，
+        # 否则建议永远过不了校验、端到端测试只能覆盖 fallback 路径。
+        "lesson/segment_boundaries":    ("lesson_segment_boundaries",
+                                        SegmentBoundariesOut, "segment_boundaries"),
     }
 
 
@@ -334,10 +339,56 @@ def _dynamic_merge_understanding(messages: list[dict]) -> dict:
     }
 
 
+#: prompt 里的材料规模声明行（`共 N 条，总 token 估算 M。`）。
+_COUNT_LINE = re.compile(r"共\s*(\d+)\s*条")
+#: fake 边界建议的默认粒度：每个知识点覆盖多少个 span。
+#: 必须 >= boundaries.MIN_SPANS_PER_KU（默认 3），否则会触发 L1 变成 low_quality。
+_FAKE_KU_SPAN_GROUP = 4
+
+
+def _dynamic_segment_boundaries(messages: list[dict]) -> dict:
+    """按输入生成分段边界 fixture（fake 模式专用）。
+
+    从 prompt 的「共 N 条」解析材料规模，再按固定粒度切分，保证生成结果能通过
+    ``boundaries.validate_boundaries`` 的全部硬约束（区间连续、切点落在知识点
+    末尾、不跨段）与防偷懒下限（L1/L2）。
+
+    这样 fake 模式可以覆盖「建议被采用」的完整路径，而不是永远走 fallback ——
+    否则端到端测试根本验证不到 preferred_breaks 的真实行为。
+    """
+    text = "\n".join(str(m.get("content") or "") for m in (messages or []))
+    m = _COUNT_LINE.search(text)
+    max_ordinal = int(m.group(1)) if m else 0
+    if max_ordinal <= 0:
+        # 解析不出规模：返回空建议，调用方会走 fallback（合法结果，不报错）。
+        return {"knowledge_units": [], "breaks": [],
+                "notes": ["fake: 未解析到材料规模"]}
+
+    kus: list[dict] = []
+    start = 1
+    idx = 0
+    while start <= max_ordinal:
+        end = min(start + _FAKE_KU_SPAN_GROUP - 1, max_ordinal)
+        idx += 1
+        kus.append({
+            "name": f"fake 知识点 {idx}",
+            "kind": "concept",
+            "start_ordinal": start,
+            "end_ordinal": end,
+            "confidence": 0.6,
+        })
+        start = end + 1
+    # 切点落在每个知识点结束处，且不含最后一个（否则会产生空段）。
+    breaks = [k["end_ordinal"] for k in kus[:-1]]
+    return {"knowledge_units": kus, "breaks": breaks,
+            "notes": ["fake fixture：按固定粒度切分"]}
+
+
 _DYNAMIC_FIXTURE_BUILDERS = {
     "segment_understanding": _dynamic_segment_understanding,
     "merge_understanding": _dynamic_merge_understanding,
     "student_simulator": _dynamic_student_simulator,
+    "segment_boundaries": _dynamic_segment_boundaries,
 }
 
 

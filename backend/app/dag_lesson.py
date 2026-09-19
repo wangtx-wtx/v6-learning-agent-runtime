@@ -686,6 +686,47 @@ async def plan_coverage_node(ctx: DAGContext, model: str) -> dict:
     return {"enabled": True, **plan}
 
 
+async def plan_segment_boundaries_node(ctx: DAGContext, model: str) -> dict:
+    """05.5 plan_segment_boundaries：分段边界规划（可选优化，失败软降级）。
+
+    让一个长上下文模型先读完全部材料，标出知识点边界与建议切点，供节点 06
+    在保证「每段至少一个完整知识点」的前提下装箱。
+
+    本节点**不是必需链路**：任何失败都转成 ``status='fallback'``，由
+    ``segment_lesson`` 用结构边界兜底，绝不中断整个 run。取消例外 ——
+    取消必须穿透，否则 run 会停在 running。
+
+    返回结构见 ``boundaries.plan_segment_boundaries``。
+    """
+    from .learning_engine import config as v6cfg
+    from .learning_engine.boundaries import plan_segment_boundaries
+
+    if not v6cfg.engine_enabled():
+        return {"enabled": False, "skipped": True}
+    domain_id = getattr(ctx, "domain_id", None)
+    if not domain_id:
+        return {"enabled": True, "skipped": True, "status": "fallback"}
+
+    # 上界必须与节点 06 装箱用的是同一个值（都由首选理解模型派生）。
+    planning_model = ctx.resolve_model("segment_understanding") or None
+    try:
+        result = await plan_segment_boundaries(
+            int(domain_id), int(ctx.run_id or 0), model or "",
+            planning_model_profile_id=planning_model)
+    except BaseException as exc:  # noqa: BLE001
+        import asyncio
+
+        from .dag import RunCancelledError
+        if isinstance(exc, (asyncio.CancelledError, RunCancelledError)):
+            raise                       # 取消必须穿透
+        if not isinstance(exc, Exception):
+            raise                       # KeyboardInterrupt 等不吞
+        logger.warning("分段边界规划失败，回退结构边界: %s", exc)
+        result = {"status": "fallback", "detail": str(exc)[:300],
+                  "segment_count": 0, "ku_count": 0, "breaks": []}
+    return {"enabled": True, "domain_id": int(domain_id), **result}
+
+
 async def segment_lesson_node(ctx: DAGContext, model: str) -> dict:
     """06 segment_lesson：把全部 canonical 非噪声 span 分成 primary segments。"""
     from .learning_engine import config as v6cfg
@@ -702,8 +743,15 @@ async def segment_lesson_node(ctx: DAGContext, model: str) -> dict:
     # 按当前首选理解模型的真实上下文规划；旧实现固定按 32K 默认档案，导致长上下文
     # 模型也被不必要地拆成多次调用。fallback 候选会在节点 07 重新核对并按需重建。
     planning_model = ctx.resolve_model("segment_understanding") or None
+    # 上游语义建议（节点 05.5）：仅当校验通过时才采用；否则传 None 走结构边界
+    # 回退。建议只决定「优先在哪切」，最终仍受预算硬约束与 fit_segment_plan_to_budget。
+    boundary = ctx.outputs.get("plan_segment_boundaries") or {}
+    preferred = None
+    if boundary.get("status") == "succeeded":
+        preferred = [int(b) for b in (boundary.get("breaks") or [])] or None
     try:
-        plan = plan_segments(int(domain_id), model_profile_id=planning_model)
+        plan = plan_segments(int(domain_id), model_profile_id=planning_model,
+                             preferred_breaks=preferred)
     except SegmentationError as e:
         # 单个 span 超过上下文预算：不允许丢弃材料，直接失败
         raise BusinessError(f"分段失败：{e}")
@@ -724,6 +772,8 @@ async def segment_lesson_node(ctx: DAGContext, model: str) -> dict:
         "primary_span_total": total_primary,
         "input_budget_tokens": plan["budget"],
         "planning_model_profile_id": planning_model,
+        "boundary_status": boundary.get("status", "absent"),
+        "preferred_breaks_used": len(preferred or []),
         "total_tokens": plan["total_tokens"],
         "unassigned_count": len(plan["unassigned_source_ids"]),
         "ledger_pending": pending.get("pending", 0),
@@ -1079,8 +1129,13 @@ def build_lesson_dag() -> DAG:
                         depends_on=["deduplicate_materials"], kind="local"))
         dag.add(DAGNode("plan_coverage", "local", plan_coverage_node,
                         depends_on=["build_source_map"], kind="local"))
+        dag.add(DAGNode("plan_segment_boundaries", "segment_boundary_planner",
+                        plan_segment_boundaries_node,
+                        preferred_models=["qwen3_flash", "deepseek_v4_free"],
+                        fallback_models=["glm_flash"],
+                        depends_on=["plan_coverage"]))
         dag.add(DAGNode("segment_lesson", "local", segment_lesson_node,
-                        depends_on=["plan_coverage"], kind="local"))
+                        depends_on=["plan_segment_boundaries"], kind="local"))
         dag.add(DAGNode("understand_segments", "segment_understanding", understand_segments_node,
                         preferred_models=["qwen3_flash", "deepseek_v4_free"],
                         fallback_models=["glm_flash"],

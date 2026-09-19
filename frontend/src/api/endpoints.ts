@@ -498,6 +498,10 @@ export interface RunSegment {
   duration_ms?: number | null
   source_ref_count?: number
   understanding_status?: string
+  /** 段内引用覆盖（观测）：模型实际引用的 primary span 数与占比 */
+  referenced_primary_count?: number | null
+  ref_coverage?: number | null
+  unreferenced_source_ids?: string[]
 }
 
 export interface SegmentsView {
@@ -545,6 +549,51 @@ export interface UnderstandingView {
   domain_id: number
   lesson_understanding: LessonUnderstandingView | null
   segment_understandings: SegmentUnderstandingView[]
+}
+
+/** 节点 05.5 分段边界建议：模型标出的一个知识点（span ordinal 区间）。 */
+export interface SegmentBoundaryKnowledgeUnit {
+  name: string
+  kind: string
+  start_ordinal: number
+  end_ordinal: number
+}
+
+/** 超出段上界的知识点（无解情况：保持完整就必然超预算）。 */
+export interface SegmentBoundaryOversizedKu {
+  name?: string
+  kind?: string
+  start_ordinal?: number
+  end_ordinal?: number
+  tokens?: number
+  limit?: number
+}
+
+export interface SegmentBoundariesView {
+  engine: V6EngineInfo
+  run_id: number
+  domain_id: number
+  /** succeeded | low_quality | fallback | failed | pending（非 succeeded 一律已回退结构边界） */
+  status: string
+  model_used: string
+  prompt_version: string
+  input_hash: string
+  span_count: number
+  total_tokens: number
+  max_segment_tokens: number
+  segment_count: number
+  ku_count: number
+  oversized_ku_count: number
+  attempts: number
+  breaks: number[]
+  knowledge_units: SegmentBoundaryKnowledgeUnit[]
+  hard_violations: string[]
+  soft_violations: string[]
+  oversized_ku: SegmentBoundaryOversizedKu[]
+  detail: string
+  created_at?: string | null
+  updated_at?: string | null
+  truncated: Record<string, boolean>
 }
 
 
@@ -791,6 +840,8 @@ export const LessonWorkflowApi = {
   materialDomain: (runId: number) => api.get<MaterialDomainView>(`/runs/${runId}/material-domain`),
   coverage: (runId: number) => api.get<CoverageView>(`/runs/${runId}/coverage`),
   segments: (runId: number) => api.get<SegmentsView>(`/runs/${runId}/segments`),
+  segmentBoundaries: (runId: number) =>
+    api.get<SegmentBoundariesView>(`/runs/${runId}/segment-boundaries`),
   understanding: (runId: number) => api.get<UnderstandingView>(`/runs/${runId}/understanding`),
   cognitiveMap: (runId: number) => api.get<CognitiveMapView>(`/runs/${runId}/cognitive-map`),
   evidenceV2: (runId: number) => api.get<EvidenceV2View>(`/runs/${runId}/evidence-v2`),

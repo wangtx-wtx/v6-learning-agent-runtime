@@ -54,8 +54,31 @@ def _parse_pdf(path: str) -> list[tuple]:
 
 
 def _parse_pptx(path: str) -> list[tuple]:
+    """解析 .pptx；旧版二进制 .ppt 先经 PowerPoint COM 转换再解析。
+
+    python-pptx 只认 OOXML（.pptx，ZIP 容器）。PowerPoint 97-2003 的 .ppt 是
+    OLE2 复合文档，``Presentation()`` 直接抛 ``PackageNotFoundError`` —— 而
+    ``file_types.PARSEABLE_KINDS`` 一直声称支持 ``ppt``，于是这类材料长期
+    表现为「上传成功、解析永久 failed」，且 ``parse_error`` 只有一句
+    ``Package not found``，误导人去查文件是否存在（文件明明在 uploads 里）。
+
+    只在**确认是 OLE2** 时才转换：真损坏的文件保留 python-pptx 的原始错误，
+    不把「文件坏了」伪装成「转换器坏了」。
+    """
     from pptx import Presentation
-    prs = Presentation(path)
+    from pptx.exc import PackageNotFoundError
+
+    source = Path(path)
+    try:
+        prs = Presentation(str(source))
+    except PackageNotFoundError:
+        from . import config as _cfg
+        from .services.office_convert import convert_legacy_ppt, is_ole2
+
+        if not is_ole2(source):
+            raise
+        prs = Presentation(str(convert_legacy_ppt(source, _cfg.CONVERTED_DIR)))
+
     out = []
     for i, slide in enumerate(prs.slides, 1):
         lines = []

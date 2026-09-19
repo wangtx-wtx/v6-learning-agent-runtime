@@ -843,9 +843,9 @@ class TestMigrationsAndIntegrity(V6Base):
                          # Phase 2（0018）
                          "lesson_segments", "segment_source_spans",
                          "segment_understandings", "lesson_understandings",
-                         "segment_reuse_index"):
+                         "segment_reuse_index", "segment_boundary_plans"):
             self.assertIn(expected, tables)
-        self.assertEqual(self.db.schema_version(), 23)
+        self.assertEqual(self.db.schema_version(), 25)
 
     def test_foreign_key_check_clean(self):
         mat = self.make_material("a.txt", HEAD_MARK)

@@ -38,6 +38,19 @@ class SchemaValidationError(Exception):
     """模型输出不符合预期 schema。先做一次修复请求，仍失败再切换模型。"""
 
 
+class EmptyModelResponseError(Exception):
+    """网关返回成功，但 content 为空 —— 模型什么都没说。
+
+    与 ``SchemaValidationError`` 是两类问题：那是「模型说了话但格式不对」，
+    可以靠一次修复请求救回来；这里没有可修复的对象，因此**不**参与 schema
+    修复流程，按普通异常处理（逐候选模型尝试）。
+
+    单独建类是为了可诊断：run #13 里空响应被归入 schema 错误，报出来的是
+    ``模型输出不是合法 JSON: ``（冒号后空无一物），既看不出是空响应，
+    也拿不到模型名与 token 用量。
+    """
+
+
 class AuthError(Exception):
     """401 / 403 鉴权错误。直接失败，不重试、不换模型。"""
 

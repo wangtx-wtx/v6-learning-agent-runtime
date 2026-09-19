@@ -55,6 +55,10 @@ const chapters = ref<Chapter[]>([])
 const lessons = ref<Lesson[]>([])
 const loadingMeta = ref(false)
 const metaError = ref('')
+// 凭证有效性判定：loadMeta 的三个请求都过 Token 鉴权，成功即凭证有效。
+// serverInfo.mobile_token_required 只表示"服务端启用了鉴权"（白名单路径，
+// 与调用方是否带有效 token 无关），不能单独作为警告依据。
+const metaLoaded = ref(false)
 
 // 表单
 const courseId = ref<number | ''>('')
@@ -154,10 +158,12 @@ async function loadMeta() {
     courses.value = cs || []
     chapters.value = chs || []
     lessons.value = ls || []
+    metaLoaded.value = true
     if (courses.value.length && !courseId.value) {
       courseId.value = courses.value[0].id
     }
   } catch (e: any) {
+    metaLoaded.value = false
     metaError.value = e?.message || String(e) || '加载失败'
   } finally {
     loadingMeta.value = false
@@ -665,9 +671,12 @@ function setManualToken() {
           </div>
         </div>
 
-        <p v-if="serverInfo.mobile_token_required" class="mt-2 rounded bg-amber-950/30 p-2 text-xs text-[var(--acc-orange)]">
+        <p v-if="serverInfo.mobile_token_required && !metaLoaded" class="mt-2 rounded bg-amber-950/30 p-2 text-xs text-[var(--acc-orange)]">
           ⚠ 当前已启用 Token 鉴权。请在电脑端「远程上传凭证」页生成带 <code>?token=</code> 的专属链接,
           或在本页下方「凭证」区手动输入 token。
+        </p>
+        <p v-else-if="serverInfo.mobile_token_required && metaLoaded" class="mt-2 rounded bg-emerald-950/30 p-2 text-xs text-emerald-400">
+          ✓ Token 鉴权已启用，凭证有效，可正常上传。
         </p>
         <p v-else class="mt-2 text-xs text-slate-500">
           手机需安装 Tailscale App 且登录同一账号;Funnel 模式需在 URL 后加 <code>?token=xxx</code>。

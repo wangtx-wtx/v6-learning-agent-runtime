@@ -7,3 +7,4 @@ python-pptx>=0.6.21
 pypdf>=3.17
 numpy>=1.26
 jieba==0.42.1  # V5.6.3: 锁定小版本（核心检索依赖；缺失时降级 char_fallback）
+pywin32>=306; sys_platform == "win32"  # 旧版二进制 .ppt 经 PowerPoint COM 转换（services/office_convert.py）

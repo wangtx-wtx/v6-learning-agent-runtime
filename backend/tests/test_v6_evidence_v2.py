@@ -600,7 +600,7 @@ class TestEvidenceContractsAndSchema(EvidenceBase):
     """0020 结构、契约枚举、CHECK 一致性。"""
 
     def test_schema_v21_and_tables(self):
-        self.assertEqual(self.db.schema_version(), 23)
+        self.assertEqual(self.db.schema_version(), 25)
         tables = {r["name"] for r in self.db.fetch_all(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         for t in ("content_claims", "claim_sources"):
@@ -725,7 +725,7 @@ class TestEvidenceContractsAndSchema(EvidenceBase):
             files = _migration_files()
             for mig in files:
                 if mig["version"] <= 20:
-                    _apply_migration(conn, mig, ledger_only=False, strict=True)
+                    _apply_migration(conn, mig, ledger_only=False)
             sync_user_version(conn)
             self.assertEqual(int(conn.execute("PRAGMA user_version").fetchone()[0]), 20)
             conn.execute("INSERT INTO courses (name, code) VALUES ('升级前课程','PRE')")
@@ -748,7 +748,7 @@ class TestEvidenceContractsAndSchema(EvidenceBase):
                 "SELECT COUNT(*) FROM content_claims").fetchone()[0]
             for mig in files:
                 if mig["version"] == 21:
-                    _apply_migration(conn, mig, ledger_only=False, strict=True)
+                    _apply_migration(conn, mig, ledger_only=False)
             sync_user_version(conn)
             self.assertEqual(int(conn.execute("PRAGMA user_version").fetchone()[0]), 21)
             cols = {r[1] for r in conn.execute("PRAGMA table_info(content_claims)")}

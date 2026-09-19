@@ -375,49 +375,30 @@ class TestRestoreSnapshotValidation(unittest.TestCase):
         except Exception: pass
 
     def _create_snapshot(self, *, set_user_version_to: int, max_migration: int,
-                          use_real_checksums: bool = True) -> Path:
-        """构造测试快照。
+                         use_real_checksums: bool = True) -> Path:
+        """构造测试快照 = **真实的 v<max_migration> 旧备份**。
 
-        use_real_checksums=True（默认）：从 migrations 目录读取真实 SHA-256
-        checksum，确保 ensure_schema 的篡改校验能通过。这是 C.3 要求的真实测试。
+        用真实迁移把库建成完整结构，再单独设置 ``user_version``。
+
+        历史回归：早期实现只写 ``schema_migrations`` 账本行（外加一个空
+        ``model_calls``），表结构是空壳。当时 ``_apply_migration`` 有宽松模式，
+        会把 ``ALTER TABLE <缺表>`` 静默跳过，所以空壳也能"升级成功"。现在宽松
+        模式已移除（失败必须 fail-fast、不写版本号），空壳会在前向迁移时如实
+        失败 —— 那正是我们要的行为，因此夹具必须造真实快照。
+
+        ``use_real_checksums`` 保留仅为兼容既有调用签名；账本 checksum 一律由
+        ``_apply_migration`` 写入真实值。
         """
-        # 读取真实 checksum（与 database._migration_files 一致：read_text(utf-8) + encode）
-        real_checksums: dict[int, str] = {}
-        if use_real_checksums:
-            import hashlib
-            migrations_dir = _ROOT / "migrations"
-            for p in sorted(migrations_dir.glob("*.sql")):
-                try:
-                    v = int(p.stem.split("_", 1)[0])
-                    sql = p.read_text(encoding="utf-8")
-                    real_checksums[v] = hashlib.sha256(
-                        sql.encode("utf-8")).hexdigest()
-                except (ValueError, OSError):
-                    continue
         conn = sqlite3_mod().connect(str(self.snap))
         try:
             conn.execute(
-                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, "
+                "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, "
                 "name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)"
             )
-            for v in range(1, max_migration + 1):
-                checksum = real_checksums.get(v, "x" * 64)
-                # 文件名风格与 _migration_files 解析一致：'0001_baseline'
-                name = f"{v:04d}_{self._migration_name(v)}"
-                conn.execute(
-                    "INSERT INTO schema_migrations (version, name, checksum, applied_at) "
-                    "VALUES (?, ?, ?, '2026-01-01')",
-                    (v, name, checksum),
-                )
-            # V5.6.4: 0009 迁移 ALTER model_calls；快存必须先建空表
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS model_calls ("
-                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                "created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')), "
-                "model TEXT NOT NULL DEFAULT '', "
-                "tokens_in INTEGER NOT NULL DEFAULT 0, "
-                "tokens_out INTEGER NOT NULL DEFAULT 0)"
-            )
+            conn.commit()
+            for mig in db._migration_files():
+                if mig["version"] <= max_migration:
+                    db._apply_migration(conn, mig)
             conn.execute(f"PRAGMA user_version={set_user_version_to}")
             conn.commit()
         finally:
@@ -474,14 +455,14 @@ class TestRestoreSnapshotValidation(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             rmod.validate_snapshot(self.snap)
         self.assertIn("user_version", str(ctx.exception))
-        # 3) 通过 upgrade 升级到当前最新迁移版本（0021 后为 21）
-        result = rmod.upgrade_snapshot_user_version(self.snap, 23, dry_run=False)
+        # 3) 通过 upgrade 升级到当前最新迁移版本（0025 后为 25）
+        result = rmod.upgrade_snapshot_user_version(self.snap, 25, dry_run=False)
         self.assertFalse(result["dry_run"])
         self.assertIsNotNone(result["upgraded"])
         # 4) 升级后副本应能通过 validate（ensure_schema 自动写回真实 checksum）
         upgraded = Path(result["upgraded"])
         info = rmod.validate_snapshot(upgraded)
-        self.assertEqual(info["schema_version"], 23)
+        self.assertEqual(info["schema_version"], 25)
         # 5) 升级后副本与原快照内容不同
         self.assertNotEqual(self.snap.read_bytes(), upgraded.read_bytes())
 
@@ -528,14 +509,14 @@ class TestRestoreSnapshotValidation(unittest.TestCase):
         # 2) 构造 v7 旧备份
         self._create_snapshot(set_user_version_to=0, max_migration=7)
         # 3) dry_run 升级（绝不应写目标库 / 不应写永久副本）
-        result = rmod.upgrade_snapshot_user_version(self.snap, 23, dry_run=True)
+        result = rmod.upgrade_snapshot_user_version(self.snap, 25, dry_run=True)
         self.assertTrue(result["dry_run"])
         self.assertIsNone(result["upgraded"])
         # 4) 目标库字节不变
         target_sha_after = hashlib.sha256(target.read_bytes()).hexdigest()
         self.assertEqual(target_sha_before, target_sha_after)
-        # 5) 不应出现 .upgraded_to_v19.db
-        upgraded_files = list(self.snap.parent.glob("*.upgraded_to_v19*"))
+        # 5) 不应出现 .upgraded_to_v25.db
+        upgraded_files = list(self.snap.parent.glob("*.upgraded_to_v25*"))
         self.assertEqual(upgraded_files, [])
 
 

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ArtifactsApi, CapabilitiesApi, ChaptersApi, CoursesApi, LessonWorkflowApi, LessonsApi, MaterialsApi, RunsApi } from '../api/endpoints'
-import type { Chapter, CognitiveMapView, Course, CoverageView, EvidenceV2View, Lesson, Material, MaterialDomainView, QualityStateView, SegmentsView, SourceSpanView, UnderstandingView, WorkflowRun } from '../api/endpoints'
+import type { Chapter, CognitiveMapView, Course, CoverageView, EvidenceV2View, Lesson, Material, MaterialDomainView, QualityStateView, SegmentBoundariesView, SegmentsView, SourceSpanView, UnderstandingView, WorkflowRun } from '../api/endpoints'
 import PageHeader from './widgets/PageHeader.vue'
 import States from './widgets/States.vue'
 import StatusBadge from './widgets/StatusBadge.vue'
@@ -52,6 +52,8 @@ const domainView = ref<MaterialDomainView | null>(null)
 const coverageView = ref<CoverageView | null>(null)
 const segmentsView = ref<SegmentsView | null>(null)
 const understandingView = ref<UnderstandingView | null>(null)
+// 节点 05.5：分段边界建议（知识点地图 / 校验结论 / 是否已回退结构边界）
+const boundaryView = ref<SegmentBoundariesView | null>(null)
 const cognitiveView = ref<CognitiveMapView | null>(null)
 // V6 Phase 4：Evidence V2（只读审计）
 const evidenceView = ref<EvidenceV2View | null>(null)
@@ -68,16 +70,18 @@ const spanError = ref('')
 async function loadCoverage(id: number) {
   coverageError.value = ''
   // 旧运行（V5 或 V6 之前的 run）没有这些数据：404 属于正常语义，不当作错误提示。
-  const [d, c, s, u] = await Promise.allSettled([
+  const [d, c, s, u, b] = await Promise.allSettled([
     LessonWorkflowApi.materialDomain(id),
     LessonWorkflowApi.coverage(id),
     LessonWorkflowApi.segments(id),
     LessonWorkflowApi.understanding(id),
+    LessonWorkflowApi.segmentBoundaries(id),
   ])
   domainView.value = d.status === 'fulfilled' ? d.value : null
   coverageView.value = c.status === 'fulfilled' ? c.value : null
   segmentsView.value = s.status === 'fulfilled' ? s.value : null
   understandingView.value = u.status === 'fulfilled' ? u.value : null
+  boundaryView.value = b.status === 'fulfilled' ? b.value : null
   try {
     cognitiveView.value = await LessonWorkflowApi.cognitiveMap(id)
   } catch {
@@ -153,6 +157,22 @@ function originLabel(o: string) {
 }
 
 const segments = computed(() => segmentsView.value?.segments || [])
+
+// ---- 节点 05.5：分段边界建议（语义边界 → 结构边界回退必须如实展示）----
+const BOUNDARY_STATUS_TEXT: Record<string, string> = {
+  succeeded: '已采用语义边界',
+  low_quality: '已回退结构边界（建议质量不足）',
+  fallback: '已回退结构边界（未取得建议）',
+  failed: '已回退结构边界（规划异常）',
+  pending: '规划中',
+}
+const boundaryKus = computed(() => boundaryView.value?.knowledge_units || [])
+const boundaryOversized = computed(() => boundaryView.value?.oversized_ku || [])
+const boundaryViolations = computed(() => [
+  ...(boundaryView.value?.hard_violations || []),
+  ...(boundaryView.value?.soft_violations || []),
+])
+const boundaryAdopted = computed(() => boundaryView.value?.status === 'succeeded')
 const lessonUnderstanding = computed(() => understandingView.value?.lesson_understanding || null)
 const lessonKnowledgeUnits = computed<Array<Record<string, any>>>(() =>
   (lessonUnderstanding.value?.understanding?.knowledge_units as Array<Record<string, any>>) || [])
@@ -173,6 +193,15 @@ function fmtDuration(ms: unknown): string {
 }
 
 const coverageMetrics = computed(() => coverageView.value?.report?.metrics || null)
+
+// ---- 段内引用覆盖率（观测，不参与门禁）----
+// 段「成功」⇒ 该段全部 primary span 记账为 processed，覆盖率无法反映模型是否
+// 真的注意到段内内容。这两个指标把长上下文下的注意力衰减暴露出来。
+const LOW_REF_COVERAGE = 0.3
+const lowRefCoverage = computed<Array<Record<string, any>>>(() =>
+  (coverageMetrics.value?.low_ref_coverage_segments as Array<Record<string, any>>) || [])
+const refCoverageAvg = computed(() =>
+  coverageMetrics.value?.segment_ref_coverage_avg as number | undefined)
 const gate = computed(() => coverageView.value?.report?.gate || null)
 const degradedReason = computed(() => coverageView.value?.report?.degradation_reason || '')
 
@@ -673,6 +702,23 @@ onMounted(async () => {
             </ul>
           </div>
 
+          <!-- Phase 2 增强：段内引用覆盖率告警（诊断，不阻断门禁） -->
+          <div v-if="lowRefCoverage.length" class="mt-4">
+            <p class="stat-label" style="color: var(--acc-orange)">
+              低引用覆盖段（{{ lowRefCoverage.length }}）— 段「成功」但模型几乎没引用段内内容
+              <span v-if="refCoverageAvg != null" class="card-muted">（全段平均 {{ Math.round(refCoverageAvg * 100) }}%）</span>
+            </p>
+            <ul class="mt-1 text-xs" style="color: var(--acc-orange)">
+              <li v-for="s in lowRefCoverage" :key="s.ordinal">
+                第 {{ s.ordinal }} 段：引用 {{ s.referenced_primary_count }}/{{ s.primary_span_count }}
+                （{{ Math.round((s.ratio || 0) * 100) }}%）
+                <span v-if="(s.unreferenced_sample || []).length" class="card-muted">
+                  · 未被引用：{{ (s.unreferenced_sample || []).join(', ') }}
+                </span>
+              </li>
+            </ul>
+          </div>
+
           <div v-if="coverageView?.unprocessed_reasons?.length" class="mt-4">
             <p class="stat-label">未处理原因列表（点击展开明细）</p>
             <div class="mt-2 flex flex-wrap gap-2">
@@ -790,13 +836,99 @@ onMounted(async () => {
           <div>
             <h3 class="card-title">全量课堂理解（V6 Phase 2）</h3>
             <p class="card-muted">
-              segment_lesson → understand_segments → merge_lesson_understanding。
-              全部 canonical 非噪声 span 必须恰好进入一个 primary segment，并在合并结果中被消费。
+              plan_segment_boundaries（可选）→ segment_lesson → understand_segments →
+              merge_lesson_understanding。全部 canonical 非噪声 span 必须恰好进入一个
+              primary segment，并在合并结果中被消费。
             </p>
           </div>
           <button type="button" class="btn btn-secondary" :disabled="!currentRunId"
                   @click="currentRunId && loadCoverage(currentRunId)">刷新理解</button>
         </div>
+
+        <!-- 节点 05.5：分段边界建议（分段之前的知识点地图与校验结论） -->
+        <template v-if="boundaryView">
+          <div class="mt-4">
+            <div class="section-head">
+              <div>
+                <h3 class="card-title">分段边界建议</h3>
+                <p class="card-muted">
+                  让长上下文模型先读完全部材料，标出知识点边界与建议切点；
+                  经程序校验后交给分段器。校验不通过即回退结构边界（不阻断运行）。
+                </p>
+              </div>
+              <span class="chip" :class="boundaryAdopted ? 'chip-green' : 'chip-amber'">
+                {{ BOUNDARY_STATUS_TEXT[boundaryView.status] || boundaryView.status }}
+              </span>
+            </div>
+
+            <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <div class="card-soft">
+                <p class="stat-label">识别知识点</p>
+                <p class="stat-value">{{ num(boundaryView.ku_count) }}</p>
+                <p class="card-muted">建议段数：{{ num(boundaryView.segment_count) }}</p>
+              </div>
+              <div class="card-soft">
+                <p class="stat-label">建议切点</p>
+                <p class="stat-value">{{ num((boundaryView.breaks || []).length) }}</p>
+                <p class="card-muted">严格落在知识点结束处</p>
+              </div>
+              <div class="card-soft">
+                <p class="stat-label">段上界</p>
+                <p class="stat-value">{{ num(boundaryView.max_segment_tokens) }}</p>
+                <p class="card-muted">
+                  材料共 {{ num(boundaryView.total_tokens) }} tokens / {{ num(boundaryView.span_count) }} spans
+                </p>
+              </div>
+              <div class="card-soft">
+                <p class="stat-label">规划模型</p>
+                <p class="stat-value text-xs">{{ boundaryView.model_used || '—' }}</p>
+                <p class="card-muted">prompt {{ boundaryView.prompt_version }} · 尝试 {{ boundaryView.attempts }} 轮</p>
+              </div>
+            </div>
+
+            <p v-if="boundaryView.detail" class="card-muted mt-3">结论：{{ boundaryView.detail }}</p>
+
+            <div v-if="boundaryViolations.length" class="mt-3">
+              <p class="stat-label" style="color: var(--acc-orange)">校验未通过项（已回退结构边界）</p>
+              <ul class="mt-1 text-xs" style="color: var(--acc-orange)">
+                <li v-for="(v, i) in boundaryViolations" :key="i">{{ v }}</li>
+              </ul>
+            </div>
+
+            <div v-if="boundaryOversized.length" class="mt-3">
+              <p class="stat-label" style="color: var(--acc-orange)">
+                超出段上界的知识点（保持完整即必然超预算，此处质量未保证）
+              </p>
+              <ul class="mt-1 text-xs" style="color: var(--acc-orange)">
+                <li v-for="(o, i) in boundaryOversized" :key="i">
+                  {{ o.name }}（#{{ o.start_ordinal }}–{{ o.end_ordinal }}，约 {{ num(o.tokens) }} tokens / 上界 {{ num(o.limit) }}）
+                </li>
+              </ul>
+            </div>
+
+            <div v-if="boundaryKus.length" class="mt-4 overflow-x-auto">
+              <p class="stat-label">
+                知识点地图（{{ boundaryKus.length }}<template v-if="boundaryView.truncated?.knowledge_units">，已截断</template>）
+              </p>
+              <table class="data-table mt-2">
+                <thead>
+                  <tr><th>#</th><th>知识点</th><th>类型</th><th>span 区间</th><th>覆盖数</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(ku, i) in boundaryKus" :key="i">
+                    <td>{{ i + 1 }}</td>
+                    <td>{{ ku.name || '（未命名）' }}</td>
+                    <td class="text-xs">{{ ku.kind || '—' }}</td>
+                    <td class="text-xs">#{{ ku.start_ordinal }} – #{{ ku.end_ordinal }}</td>
+                    <td>{{ Math.max(ku.end_ordinal - ku.start_ordinal + 1, 0) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p class="card-muted mt-2 text-xs">input_hash {{ boundaryView.input_hash }}</p>
+          </div>
+        </template>
 
         <template v-if="segmentsView">
           <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -837,7 +969,7 @@ onMounted(async () => {
             <table class="data-table mt-2">
               <thead>
                 <tr>
-                  <th>#</th><th>状态</th><th>primary spans</th><th>Source ID 范围</th>
+                  <th>#</th><th>状态</th><th>primary spans</th><th>引用覆盖</th><th>Source ID 范围</th>
                   <th>模型</th><th>重试</th><th>耗时</th><th>操作</th>
                 </tr>
               </thead>
@@ -849,6 +981,15 @@ onMounted(async () => {
                     <td>
                       {{ seg.primary_span_count }}
                       <span v-if="seg.overlap_span_count" class="card-muted">(+{{ seg.overlap_span_count }} overlap)</span>
+                    </td>
+                    <td>
+                      <template v-if="seg.ref_coverage != null">
+                        <span :style="seg.ref_coverage < LOW_REF_COVERAGE ? 'color: var(--acc-orange)' : ''">
+                          {{ Math.round(seg.ref_coverage * 100) }}%
+                        </span>
+                        <span class="card-muted">（{{ seg.referenced_primary_count }}/{{ seg.primary_span_count }}）</span>
+                      </template>
+                      <span v-else class="card-muted">—</span>
                     </td>
                     <td class="text-xs">
                       {{ seg.primary_source_ids[0] || '—' }}
@@ -867,10 +1008,10 @@ onMounted(async () => {
                     </td>
                   </tr>
                   <tr v-if="seg.error">
-                    <td colspan="8" class="text-xs" style="color: var(--acc-red)">{{ seg.error }}</td>
+                    <td colspan="9" class="text-xs" style="color: var(--acc-red)">{{ seg.error }}</td>
                   </tr>
                   <tr v-if="expandedSegmentId === seg.segment_id">
-                    <td colspan="8">
+                    <td colspan="9">
                       <p class="card-muted">
                         input_hash {{ seg.input_hash }}
                         <template v-if="segmentUnderstanding(seg.segment_id)">
@@ -883,6 +1024,14 @@ onMounted(async () => {
                       <p class="flex flex-wrap gap-1">
                         <span v-for="sid in seg.primary_source_ids" :key="sid" class="chip">{{ sid }}</span>
                       </p>
+                      <template v-if="(seg.unreferenced_source_ids || []).length">
+                        <p class="stat-label mt-3" style="color: var(--acc-orange)">
+                          未被模型引用（{{ (seg.unreferenced_source_ids || []).length }}）— 该段「成功」但这些内容未被注意到
+                        </p>
+                        <p class="flex flex-wrap gap-1">
+                          <span v-for="sid in seg.unreferenced_source_ids" :key="sid" class="chip">{{ sid }}</span>
+                        </p>
+                      </template>
                       <template v-if="segmentUnderstanding(seg.segment_id)">
                         <p class="stat-label mt-3">本段知识点</p>
                         <ul class="mt-1 text-xs">
@@ -923,7 +1072,7 @@ onMounted(async () => {
           </div>
         </template>
         <p v-else class="card-muted">
-          等待 segment_lesson / understand_segments / merge_understanding 节点完成。
+          等待 plan_segment_boundaries / segment_lesson / understand_segments / merge_understanding 节点完成。
         </p>
       </section>
 

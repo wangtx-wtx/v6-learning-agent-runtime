@@ -373,6 +373,17 @@ class MaterialCoverageReport(StrictModel):
     merged_structures_total: int = Field(default=0, ge=0)
     structures_dropped: int = Field(default=0, ge=0)
 
+    # ---- Phase 2 增强：段内引用覆盖率（**观测，不参与门禁**）----
+    # 段成功 ⇒ 该段全部 primary span 仍照旧记账为 processed，覆盖率语义不变。
+    # 这四个字段额外回答「模型真的注意到多少段内内容」，用于把长上下文下的
+    # 注意力衰减（中间迷失）从黑盒变成可定位的问题。
+    # 刻意不纳入 evaluate_gate：课堂材料里大量过渡性内容本就不会被引用，
+    # 按引用率卡门禁会让几乎所有 run 误降级。
+    segment_ref_coverage_min: float = 0.0
+    segment_ref_coverage_avg: float = 0.0
+    low_ref_coverage_count: int = Field(default=0, ge=0)
+    low_ref_coverage_segments: list[dict[str, Any]] = Field(default_factory=list)
+
     #: 旧 V5 生成链候选窗口的真实消费率（仅作对照，不参与门禁）。
     legacy_candidate_rate: float = 0.0
     timeline_gap_count: int = Field(default=0, ge=0)

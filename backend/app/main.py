@@ -960,6 +960,33 @@ async def get_run_coverage(run_id: int):
     }
 
 
+@app.get("/api/runs/{run_id}/segment-boundaries")
+async def get_run_segment_boundaries(run_id: int):
+    """Phase 2 增强：分段边界建议（知识点地图 + 校验结论 + 是否降级）。
+
+    语义：
+    * run 不存在 / 未建立 Material Domain → 404
+    * 旧库无表、或本次运行尚未产生建议 → 404（前端按「无此数据」处理）
+    * ``status`` 非 ``succeeded`` 表示已回退结构边界，前端必须如实展示，
+      不得把它渲染成「分段失败」。
+
+    安全边界（与 material-domain / coverage 同口径）：只返回 ordinal 区间与
+    校验结论，不返回材料原文、不返回任何文件系统路径。
+    """
+    run = query_one("SELECT id, workflow FROM workflow_runs WHERE id=?", (run_id,))
+    if not run:
+        raise HTTPException(404, "run 不存在")
+    domain = query_one("SELECT id FROM material_domains WHERE run_id=?", (run_id,))
+    if not domain:
+        raise HTTPException(404, "该运行未建立 Material Domain")
+    from .learning_engine.boundaries import get_boundary_view
+    view = get_boundary_view(int(domain["id"]))
+    if view is None:
+        raise HTTPException(404, "该运行没有分段边界建议（V6 未启用或建议尚未产生）")
+    return {"engine": _v6_engine_info(), "run_id": run_id,
+            "domain_id": int(domain["id"]), **view}
+
+
 @app.get("/api/runs/{run_id}/segments")
 async def get_run_segments(run_id: int):
     """Phase 2：segment 清单（顺序 / 每段 Source ID / 状态 / 模型 / 重试 / 耗时）。"""

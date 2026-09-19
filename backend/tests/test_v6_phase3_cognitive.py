@@ -477,7 +477,7 @@ class TestCognitiveApi(CognitiveBase):
 
 class TestCognitiveMigrations(CognitiveBase):
     def test_phase3_tables_exist(self):
-        self.assertEqual(self.db.schema_version(), 23)
+        self.assertEqual(self.db.schema_version(), 25)
         tables = {r["name"] for r in self.db.fetch_all(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         for t in ("cognitive_maps", "cognitive_items", "cognitive_item_sources",

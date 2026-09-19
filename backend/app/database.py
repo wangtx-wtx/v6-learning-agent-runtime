@@ -96,34 +96,26 @@ def _split_statements(sql: str) -> list[str]:
 
 
 def _apply_migration(conn: sqlite3.Connection, mig: dict,
-                     ledger_only: bool = False, strict: bool = True) -> None:
+                     ledger_only: bool = False) -> None:
     """在单个事务中应用一个迁移并记录版本。失败整体回滚并向上抛出（拒绝启动）。
 
-    两种「宽松模式」用于**测试/夹具用的极简快照**（只有迁移账本，没有完整业务表）：
+    ``ledger_only=True``：库里除 ``schema_migrations`` 外没有任何业务表 —— 所有
+    DDL 都无处可施，整体跳过、只推进账本（历史 v7 夹具路径）。
 
-    * ``ledger_only=True``：库里除 ``schema_migrations`` 外没有任何表 —— 所有 DDL
-      都无处可施，整体跳过、只推进账本（历史 v7 夹具路径）。
-    * ``strict=False``：``ALTER TABLE <不存在表>`` 这类「目标表缺失」错误按「该
-      语句在极简快照下不适用」处理并跳过；**其它任何错误仍然抛出**。
+    **任何语句失败都不写版本号**（整体 ROLLBACK）。历史教训：早期版本有一个
+    ``strict=False`` 宽松模式，遇到 ``ALTER TABLE <不存在表>`` 会「跳过该语句但
+    仍然写入版本号」，于是迁移被标记为已应用，而目标列**永远不会被加上**，
+    后续任何写入该列的语句都报 ``no such column``；更糟的是重启也不会重试
+    （版本号已在账本里）。
 
-    **全新库与真实库一律使用 ``strict=True``**：任何 DDL 失败都必须让迁移失败，
-    绝不能静默留下缺表。
+    与其静默半完成，不如 fail-fast：库处于异常状态时本就不该继续启动。
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
         for stmt in _split_statements(mig["sql"]):
             if ledger_only:
                 continue
-            try:
-                conn.execute(stmt)
-            except sqlite3.OperationalError as e:
-                message = str(e).lower()
-                if not strict and ("no such table" in message or "no such column" in message):
-                    logger.warning(
-                        "迁移 %s 的语句在极简快照下不适用，已跳过: %s",
-                        mig["version"], str(e)[:160])
-                    continue
-                raise
+            conn.execute(stmt)
         conn.execute(
             "INSERT INTO schema_migrations (version, name, checksum, applied_at) "
             "VALUES (?, ?, ?, datetime('now','localtime'))",
@@ -189,9 +181,9 @@ def ensure_schema(conn: sqlite3.Connection) -> dict:
 
     user_tables = tables - {"schema_migrations"}
     if not user_tables and not applied:
-        # 全新库：严格模式，任何 DDL 失败都必须让迁移失败
+        # 全新库：任何 DDL 失败都必须让迁移失败（fail-fast，不写版本号）
         for mig in files:
-            _apply_migration(conn, mig, ledger_only=False, strict=True)
+            _apply_migration(conn, mig, ledger_only=False)
         conn.commit()
         # V5.5.1 收尾 B.3: 全新库也必须在传入的连接上同步 user_version
         sync_user_version(conn)
@@ -212,9 +204,10 @@ def ensure_schema(conn: sqlite3.Connection) -> dict:
                 "检测到仅含迁移账本的极简快照（无业务表）：%s 个迁移只推进版本账本，"
                 "跳过 DDL", len(pending))
         for mig in pending:
-            # 非严格模式：极简快照缺少 ALTER TABLE 的目标表时跳过该语句。
-            # 真实升级库的所有表都存在，因此该分支不会被触发。
-            _apply_migration(conn, mig, ledger_only=ledger_only, strict=False)
+            # 严格应用：任何 DDL 失败都抛出并回滚（版本号不写入），让服务
+            # fail-fast，而不是静默留下缺失的列/表 —— 那种「假应用」之后即使
+            # 重启也不会重试，最终表现为难以定位的写入失败。
+            _apply_migration(conn, mig, ledger_only=ledger_only)
         conn.commit()
         logger.info("前向迁移完成: %s", [m["version"] for m in pending])
     # V5.5.1 收尾 B.3: sync_user_version 必须作用于 ensure_schema 传入的

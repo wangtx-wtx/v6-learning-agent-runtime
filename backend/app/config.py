@@ -68,6 +68,10 @@ if ENV == "test":
     QUARANTINE_DIR = DATA_DIR / "quarantine"
     OBSIDIAN_VAULT_ROOT = DATA_DIR / "obsidian_vault"
     ARTIFACTS_DIR = DATA_DIR / "artifacts"
+    # 旧版二进制 .ppt 经 PowerPoint COM 转换后的 .pptx 落在这里
+    # （见 services/office_convert.py）。刻意放在 uploads 之外：它是派生产物，
+    # 不是用户材料，不能被材料列表/清空逻辑当成原始上传。
+    CONVERTED_DIR = DATA_DIR / "converted"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 else:
     # development / production：兼容旧 V5_DATA_ROOT（默认正式 backend/data）
@@ -78,10 +82,13 @@ else:
     QUARANTINE_DIR = Path(os.environ.get("V5_QUARANTINE_DIR", str(DATA_DIR / "quarantine"))).resolve()
     OBSIDIAN_VAULT_ROOT = Path(os.environ.get("V5_OBSIDIAN_VAULT", str(DATA_DIR / "obsidian_vault"))).resolve()
     ARTIFACTS_DIR = Path(os.environ.get("V5_ARTIFACTS_DIR", str(DATA_DIR / "artifacts"))).resolve()
-    for _d in (DATA_DIR, UPLOAD_DIR, BACKUP_DIR, QUARANTINE_DIR, OBSIDIAN_VAULT_ROOT, ARTIFACTS_DIR):
+    CONVERTED_DIR = Path(os.environ.get("V5_CONVERTED_DIR", str(DATA_DIR / "converted"))).resolve()
+    for _d in (DATA_DIR, UPLOAD_DIR, BACKUP_DIR, QUARANTINE_DIR, OBSIDIAN_VAULT_ROOT,
+               ARTIFACTS_DIR, CONVERTED_DIR):
         _d.mkdir(parents=True, exist_ok=True)
 
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+CONVERTED_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def assert_not_production(path: str | Path | None = None,

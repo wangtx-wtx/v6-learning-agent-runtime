@@ -31,7 +31,7 @@ import re
 from typing import Any, Optional
 
 from .. import database as db
-from ..dag import RunCancelledError
+from ..dag import EmptyModelResponseError, RunCancelledError
 from . import config as engine_config
 from .contracts import (
     SCHEMA_VERSION,
@@ -54,6 +54,10 @@ MERGE_BATCH_SIZE = 12
 
 #: 并发上限（不引入第二套队列：仅限制本节点内部并发）。
 DEFAULT_SEGMENT_CONCURRENCY = 2
+
+#: 单段落库时最多保留多少个「未被模型引用」的 Source ID（供人工定位）。
+#: 超量截断：这只是诊断线索，不应把一行记录撑大。
+MAX_UNREFERENCED_STORED = 50
 
 _SOURCE_ID_RE = re.compile(r"^[TPDI]\d{4,6}(?:\.\d{1,2})?$")
 
@@ -105,10 +109,17 @@ def _render_material_blocks(rows: list[dict]) -> str:
     return "\n".join(lines).strip() or "（无材料）"
 
 
-async def understand_one_segment(segment: dict, runs_dir: Optional[dict] = None) -> dict:
+async def understand_one_segment(segment: dict, runs_dir: Optional[dict] = None, *,
+                                 drop_invalid_refs: bool = False) -> dict:
     """对单个 segment 调模型做理解（一次尝试）。
 
-    失败原因（schema 错误 / 非法 Source ID / 网关错误）由调用方决定是否重试。
+    失败原因（schema 错误 / 空响应 / 非法 Source ID / 网关错误）由调用方决定
+    是否重试。
+
+    ``drop_invalid_refs``：引用不存在的 Source ID 时，是失败还是剔除。默认
+    **失败**（严格口径：让该段重试，给模型纠正机会）；调用方在**重试用尽的
+    最后一轮**置 True，把「整段作废」降级为「剔除该引用、保留其余内容」，
+    使一堂课不至于因为一个幻觉 ID 而零产出。
     """
     from ..gateway import gateway
     from ..integrations.prompts import render_prompt
@@ -132,14 +143,36 @@ async def understand_one_segment(segment: dict, runs_dir: Optional[dict] = None)
         response_format={"type": "json_object"},
     )
 
-    data = parse_model_output(SegmentUnderstandingOut, resp.get("content", ""),
-                             f"segment_understanding#{segment['ordinal']}")
-    # ---- 非法 Source ID 立即失败（任务书 §五）----
+    # 空响应单独识别：被 parse_model_output 归入 schema 错误时，报出来的是
+    # 「模型输出不是合法 JSON: 」（冒号后空无一物），既看不出是空响应，
+    # 也拿不到模型名与用量 —— run #13 的 seg#10 就是这样丢掉全部线索的。
+    content = resp.get("content") or ""
+    if not content.strip():
+        raise EmptyModelResponseError(
+            f"segment_understanding#{segment['ordinal']}: 模型返回空响应"
+            f"（model={resp.get('model') or segment.get('_model') or '-'}，"
+            f"tokens_in={resp.get('tokens_in', 0)}，"
+            f"tokens_out={resp.get('tokens_out', 0)}）")
+
+    data = parse_model_output(SegmentUnderstandingOut, content,
+                              f"segment_understanding#{segment['ordinal']}")
+    # ---- 非法 Source ID ----
     bad = sorted({sid for sid in _collect_source_refs(data) if sid not in allowed_set})
     if bad:
-        raise SourceRefViolationError(
-            f"segment {segment['ordinal']} 引用了不存在的 Source ID: {bad}"
-        )
+        if not drop_invalid_refs:
+            # 严格路径（任务书 §五）：引用不存在即该段失败并重试。
+            raise SourceRefViolationError(
+                f"segment {segment['ordinal']} 引用了不存在的 Source ID: {bad}"
+            )
+        # 重试用尽：剔除非法引用后降级继续。**不修复、不猜测** —— 把 T0000
+        # 映射成某个真实 ID 等于替模型伪造引用，比丢掉引用更糟。被剔除的 ID
+        # 随 structured_json 一起落库，证据链据此如实降级（相关知识点失去来源
+        # 标注），而不是静默消失。
+        dropped = _drop_invalid_source_refs(data, allowed_set)
+        logger.warning(
+            "segment %s 重试用尽，剔除 %s 个不存在的 Source ID 后降级继续: %s",
+            segment["ordinal"], len(dropped), dropped[:8])
+        data["_dropped_source_refs"] = dropped
     data["_tokens_in"] = resp.get("tokens_in", 0)
     data["_tokens_out"] = resp.get("tokens_out", 0)
     # _model 统一为**候选模型名**（复用键口径）；gateway 实际返回的模型名另存
@@ -160,6 +193,36 @@ def _collect_source_refs(data: dict) -> list[str]:
                 for sid in item.get("source_refs") or []:
                     refs.append(str(sid).strip())
     return [r for r in refs if r]
+
+
+def _drop_invalid_source_refs(data: dict, allowed: set[str]) -> list[str]:
+    """剔除理解结果中不在 ``allowed`` 内的 Source ID，返回被剔除的 ID。
+
+    与 ``_collect_source_refs`` **严格对称**（同一组字段、同一套剥离规则）。
+    不对称会留下漏洞：收集时看得见、剔除时够不着的非法 ID 会原样落库，
+    变成一条永远查不到出处的证据链。
+    """
+    dropped: set[str] = set()
+
+    def _clean(values) -> list[str]:
+        kept: list[str] = []
+        for sid in values or []:
+            text = str(sid).strip()
+            if not text:
+                continue
+            if text in allowed:
+                kept.append(text)
+            else:
+                dropped.add(text)
+        return kept
+
+    if isinstance(data.get("source_refs"), list):
+        data["source_refs"] = _clean(data["source_refs"])
+    for key in ("knowledge_units", "definitions", "formulas", "derivations", "examples"):
+        for item in data.get(key) or []:
+            if isinstance(item, dict) and isinstance(item.get("source_refs"), list):
+                item["source_refs"] = _clean(item["source_refs"])
+    return sorted(dropped)
 
 
 def _load_spans(span_ids: list[int]) -> list[dict]:
@@ -488,9 +551,13 @@ async def _understand_with_retries(seg: dict, ctx, domain_id: int, run_id: int,
         seg_probe = dict(seg)
         seg_probe["_model"] = effective_model
         _mark_segment(segment_id, SegmentStatus.RUNNING.value, attempt=attempt)
+        # 最后一轮不再因非法 Source ID 整段失败：剔除该引用、降级继续。
+        # 否则一个幻觉 ID（如 run #13 的 T0000）就足以让整堂课零产出。
+        last_attempt = attempt >= SEGMENT_MAX_ATTEMPTS
         try:
             data = await understand_one_segment(
-                seg_probe, {"segment_total": segment_total})
+                seg_probe, {"segment_total": segment_total},
+                drop_invalid_refs=last_attempt)
         except BaseException as exc:  # noqa: BLE001
             # 必须捕获 BaseException：``RunCancelledError`` 继承 BaseException
             # （设计上要穿透节点的 ``except Exception``），若只写
@@ -555,15 +622,48 @@ def _mark_segment(segment_id: int, status: str, *, attempt: int, error: str = ""
     )
 
 
+def compute_segment_ref_coverage(sources: list[dict],
+                                 referenced_ids: list[str]) -> dict:
+    """段内引用覆盖（**观测，不参与门禁**）。
+
+    段成功 ⇒ 该段全部 primary span 仍照旧记账为 processed，覆盖率语义不变。
+    本函数额外回答「模型真的注意到多少段内内容」：长上下文下模型可能只引用开头
+    与结尾，中段被忽略，而 ``semantic_processing_rate`` 仍报 100%。
+
+    刻意**不**把未引用 span 记成 ``not_used``，也**不**纳入 ``evaluate_gate``：
+    课堂材料里大量过渡性内容（「我们来看下一页」）本就不会被引用，按引用率卡
+    门禁会让几乎所有 run 误降级。它是诊断指标，不是门禁条件。
+
+    抽成纯函数是为了可单测 —— 比例算错会让「中间迷失」被误报或漏报。
+    """
+    primary_ids = [str(s.get("source_id")) for s in (sources or [])
+                   if s.get("role") == "primary"]
+    primary_set = set(primary_ids)
+    referenced = [str(sid) for sid in (referenced_ids or []) if str(sid) in primary_set]
+    unreferenced = sorted(primary_set - set(referenced))
+    return {
+        "primary_span_count": len(primary_ids),
+        "referenced_primary_count": len(referenced),
+        "unreferenced_source_ids": unreferenced,
+        "ratio": (len(referenced) / len(primary_ids)) if primary_ids else 0.0,
+    }
+
+
 def _persist_understanding(seg: dict, domain_id: int, run_id: int, data: dict) -> None:
     payload = {k: v for k, v in data.items() if not k.startswith("_")}
-    # 跨 run 复用的「元信息」也要保留在结构体里，便于审计反查来源
-    for meta_key in ("_reused_from_run", "_reused_from_segment"):
+    # 跨 run 复用的「元信息」也要保留在结构体里，便于审计反查来源。
+    # _dropped_source_refs 同理：被剔除的非法引用必须留痕，否则「剔除」
+    # 就退化成了「静默丢弃」—— 那正是本项目明确禁止的。
+    for meta_key in ("_reused_from_run", "_reused_from_segment", "_dropped_source_refs"):
         if meta_key in data:
             payload[meta_key.lstrip("_")] = data[meta_key]
     blob = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     content_hash = "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
     refs = sorted(set(_collect_source_refs(payload)))
+
+    # ---- 段内引用覆盖（观测，不参与门禁；算法见 compute_segment_ref_coverage）----
+    coverage = compute_segment_ref_coverage(seg.get("sources") or [], refs)
+
     # model_used 存 **DAG 候选模型**（data['_model'] 由 _understand_with_retries /
     # _project_reuse 统一写入候选模型名），保证复用键口径稳定。
     candidate = str(data.get("_model") or "")
@@ -571,17 +671,24 @@ def _persist_understanding(seg: dict, domain_id: int, run_id: int, data: dict) -
         conn.execute(
             "INSERT INTO segment_understandings (segment_id, run_id, domain_id, schema_version, "
             " prompt_version, model_used, input_hash, structured_json, content_hash, "
-            " source_ref_count, status, error, attempts, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?, 'succeeded', '', 1, datetime('now','localtime'), "
-            " datetime('now','localtime')) "
+            " source_ref_count, primary_span_count, referenced_primary_count, "
+            " unreferenced_source_ids, status, error, attempts, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'succeeded', '', 1, "
+            " datetime('now','localtime'), datetime('now','localtime')) "
             "ON CONFLICT(segment_id) DO UPDATE SET model_used=excluded.model_used, "
             " run_id=excluded.run_id, domain_id=excluded.domain_id, "
             " input_hash=excluded.input_hash, structured_json=excluded.structured_json, "
             " content_hash=excluded.content_hash, source_ref_count=excluded.source_ref_count, "
+            " primary_span_count=excluded.primary_span_count, "
+            " referenced_primary_count=excluded.referenced_primary_count, "
+            " unreferenced_source_ids=excluded.unreferenced_source_ids, "
             " status='succeeded', error='', attempts=attempts+1, "
             " updated_at=datetime('now','localtime')",
             (int(seg["id"]), run_id, domain_id, SCHEMA_VERSION, SEGMENT_PROMPT_VERSION,
-             candidate, seg.get("input_hash") or "", blob, content_hash, len(refs)),
+             candidate, seg.get("input_hash") or "", blob, content_hash, len(refs),
+             coverage["primary_span_count"], coverage["referenced_primary_count"],
+             json.dumps(coverage["unreferenced_source_ids"][:MAX_UNREFERENCED_STORED],
+                        ensure_ascii=False)),
         )
 
 
